@@ -3,72 +3,111 @@ name: Test
 on:
   push:
   pull_request:
-    branches:
-      - master
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      build-docker-locally:
+        type: boolean
+        description: Force rebuild docker images for CI tests
+        required: false
 
 jobs:
-  test:
+  test-linux:
     runs-on: ubuntu-20.04
-    container:
-      image: electronuserland/builder:14-05.21@sha256:837f5cbec3735ee27eb7105b9646aedd73340bce7d6ea44943a99a105a4dca55
-    env:
-      TEST_FILES: configurationValidationTest,globTest,RepoSlugTest,mainEntryTest,ArtifactPublisherTest,ignoreTest,filesTest,nsisUpdaterTest,extraMetadataTest,linuxPackagerTest,linuxArchiveTest,protonTest
-    steps:
-      - uses: actions/checkout@v2
-      - name: Use Node.js
-        uses: actions/setup-node@v2
-        with:
-          node-version: 14
-      - name: Cache .pnpm-store
-        uses: actions/cache@v2
-        with:
-          path: ~/.pnpm-store
-          key: ${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
-      - name: Install pnpm
-        run: |
-          npm i -g pnpm
-          pnpm config set store-dir ~/.pnpm-store
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm compile
-      - run: pnpm lint
-      - run: pnpm lint-deps
-      - name: Cache ~/.cache/electron
-        uses: actions/cache@v2
-        with:
-          path: ~/.cache/electron
-          key: v-11.0.0-electron
-      - run: node ./test/out/helpers/runTests.js
-  test-windows:
-    runs-on: windows-2019
     strategy:
       matrix:
         testFiles:
-          - filesTest,globTest,installerTest,appxTest,msiTest,portableTest
-          - oneClickInstallerTest,ExtraBuildTest,BuildTest,extraMetadataTest,protonTest,nsisUpdaterTest
+          - ArtifactPublisherTest,BuildTest,ExtraBuildTest,RepoSlugTest,binDownloadTest,configurationValidationTest,filenameUtilTest,filesTest,globTest,ignoreTest,macroExpanderTest,mainEntryTest,urlUtilTest,extraMetadataTest,linuxArchiveTest,linuxPackagerTest,HoistedNodeModuleTest,PublishManagerTest
+          - snapTest,debTest,fpmTest,protonTest
     steps:
-      - uses: actions/checkout@v2
-      - name: Use Node.js
-        uses: actions/setup-node@v2
+      - name: Checkout code repository
+        uses: actions/checkout@v2
         with:
-          node-version: 14
-      - name: Cache .pnpm-store
-        uses: actions/cache@v2
+          fetch-depth: 0
+
+      - name: Setup Tests
+        uses: ./.github/actions/pretest
         with:
-          path: $HOMEPATH/.pnpm-store
-          key: ${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
-      - name: Install pnpm
-        run: |
-          npm i -g pnpm
-          pnpm config set store-dir $HOMEPATH/.pnpm-store
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm compile
-      - name: Cache ~/.cache/electron
-        uses: actions/cache@v2
+          cache-path: ~/.cache/electron
+          cache-key: v-11.0.0-linux-electron
+
+      - name: Lint
+        run: pnpm pretest
+
+      - name: Determine if Dockerfiles changed
+        id: changed-files
+        uses: tj-actions/changed-files@v13
+
+      - name: Dockerfile has changed, rebuild for tests
+        if: ${{ github.event.inputs.build-docker-locally == 'true' }} || contains(steps.changed-files.outputs.all_changed_files, 'Dockerfile') || contains(steps.changed-files.outputs.all_changed_files, 'docker')
+        run: pnpm docker-images
+
+      - name: Run tests in docker image
+        run: pnpm test-linux
+        env:
+          TEST_FILES: ${{ matrix.testFiles }}
+          FORCE_COLOR: 1
+  
+  test-mac:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code repository
+        uses: actions/checkout@v2
+
+      - name: Setup Tests
+        uses: ./.github/actions/pretest
         with:
-          path: $HOMEPATH/.cache/electron
-          key: v-11.0.0-windows-electron
-      - name: test
-        run: node ./test/out/helpers/runTests.js
+          cache-path: ~/Library/Caches/electron
+          cache-key: v-11.0.0-macos-electron
+
+      - name: Test
+        run: pnpm ci:test
+        env:
+          TEST_FILES: masTest,dmgTest,protonTest
+          FORCE_COLOR: 1
+  
+  # Need to separate from other tests because logic is specific to when TOKEN env vars are set
+  test-updater:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code repository
+        uses: actions/checkout@v2
+
+      - name: Setup Tests
+        uses: ./.github/actions/pretest
+        with:
+          cache-path: ~/Library/Caches/electron
+          cache-key: v-11.0.0-update-electron
+
+      - name: Test
+        run: pnpm ci:test
+        env:
+          TEST_FILES: nsisUpdaterTest
+          KEYGEN_TOKEN: ${{ secrets.KEYGEN_TOKEN }}
+          # BITBUCKET_TOKEN: ${{ secrets.BITBUCKET_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          FORCE_COLOR: 1
+
+  test-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        testFiles:
+          - installerTest,appxTest,msiTest,portableTest,assistedInstallerTest,protonTest
+          - oneClickInstallerTest,winCodeSignTest,winPackagerTest,webInstallerTest
+    steps:
+      - name: Checkout code repository
+        uses: actions/checkout@v2
+
+      - name: Setup Tests
+        uses: ./.github/actions/pretest
+        with:
+          cache-key: v-11.0.0-windows-electron
+          cache-path: ~\AppData\Local\electron\Cache
+      
+      - name: Test
+        run: pnpm ci:test
         env:
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           TEST_FILES: ${{ matrix.testFiles }}

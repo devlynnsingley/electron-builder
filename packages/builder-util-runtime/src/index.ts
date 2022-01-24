@@ -14,10 +14,12 @@ export {
   configureRequestUrl,
 } from "./httpExecutor"
 export {
-  BintrayOptions,
   CustomPublishOptions,
   GenericServerOptions,
   GithubOptions,
+  KeygenOptions,
+  BitbucketOptions,
+  SnapStoreOptions,
   PublishConfiguration,
   S3Options,
   SpacesOptions,

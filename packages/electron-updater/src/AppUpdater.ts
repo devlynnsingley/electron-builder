@@ -91,6 +91,15 @@ export abstract class AppUpdater extends EventEmitter {
    */
   requestHeaders: OutgoingHttpHeaders | null = null
 
+  /**
+   *  Shortcut for explicitly adding auth tokens to request headers
+   */
+  addAuthHeader(token: string) {
+    this.requestHeaders = Object.assign({}, this.requestHeaders, {
+      authorization: token,
+    })
+  }
+
   protected _logger: Logger = console
 
   // noinspection JSMethodCanBeStatic,JSUnusedGlobalSymbols
@@ -573,7 +582,7 @@ export abstract class AppUpdater extends EventEmitter {
       // NodeJS URL doesn't decode automatically
       const urlPath = decodeURIComponent(taskOptions.fileInfo.url.pathname)
       if (urlPath.endsWith(`.${taskOptions.fileExtension}`)) {
-        return path.posix.basename(urlPath)
+        return path.basename(urlPath)
       } else {
         // url like /latest, generate name
         return `update.${taskOptions.fileExtension}`

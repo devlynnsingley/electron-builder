@@ -23,7 +23,7 @@ import { addCustomMessageFileInclude, createAddLangsMacro, LangConfigurator } fr
 import { computeLicensePage } from "./nsisLicense"
 import { NsisOptions, PortableOptions } from "./nsisOptions"
 import { NsisScriptGenerator } from "./nsisScriptGenerator"
-import { AppPackageHelper, nsisTemplatesDir, NSIS_PATH, UninstallerReader } from "./nsisUtil"
+import { AppPackageHelper, nsisTemplatesDir, NSIS_PATH, UninstallerReader, NsisTargetOptions } from "./nsisUtil"
 
 const debug = _debug("electron-builder:nsis")
 
@@ -62,6 +62,8 @@ export class NsisTarget extends Target {
     if (deps != null && deps["electron-squirrel-startup"] != null) {
       log.warn('"electron-squirrel-startup" dependency is not required for NSIS')
     }
+
+    NsisTargetOptions.resolve(this.options)
   }
 
   build(appOutDir: string, arch: Arch) {
@@ -189,6 +191,9 @@ export class NsisTarget extends Target {
 
       APP_PACKAGE_NAME: appInfo.name,
     }
+    if (options.debugLogging) {
+      defines.ENABLE_LOGGING = null
+    }
     if (uninstallAppKey !== guid) {
       defines.UNINSTALL_REGISTRY_KEY_2 = `Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${guid}`
     }
@@ -247,12 +252,16 @@ export class NsisTarget extends Target {
 
     this.configureDefinesForAllTypeOfInstaller(defines)
     if (isPortable) {
-      const portableOptions = options as PortableOptions
-      defines.REQUEST_EXECUTION_LEVEL = portableOptions.requestExecutionLevel || "user"
-      defines.UNPACK_DIR_NAME = portableOptions.unpackDirName || (await executeAppBuilder(["ksuid"]))
+      const { unpackDirName, requestExecutionLevel, splashImage } = options as PortableOptions
+      defines.REQUEST_EXECUTION_LEVEL = requestExecutionLevel || "user"
 
-      if (portableOptions.splashImage != null) {
-        defines.SPLASH_IMAGE = path.resolve(packager.projectDir, portableOptions.splashImage)
+      // https://github.com/electron-userland/electron-builder/issues/5764
+      if (typeof unpackDirName === "string" || !unpackDirName) {
+        defines.UNPACK_DIR_NAME = unpackDirName || (await executeAppBuilder(["ksuid"]))
+      }
+
+      if (splashImage != null) {
+        defines.SPLASH_IMAGE = path.resolve(packager.projectDir, splashImage)
       }
     } else {
       await this.configureDefines(oneClick, defines)
@@ -534,6 +543,7 @@ export class NsisTarget extends Target {
 
   private async executeMakensis(defines: any, commands: any, script: string) {
     const args: Array<string> = this.options.warningsAsErrors === false ? [] : ["-WX"]
+    args.push("-INPUTCHARSET", "UTF8")
     for (const name of Object.keys(defines)) {
       const value = defines[name]
       if (value == null) {

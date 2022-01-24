@@ -1,5 +1,5 @@
 import { Arch, log } from "builder-util"
-import { CancellationToken, ProgressCallbackTransform } from "builder-util-runtime"
+import { CancellationToken, ProgressCallbackTransform, PublishProvider } from "builder-util-runtime"
 import { PADDING } from "builder-util/out/log"
 import * as chalk from "chalk"
 import { createReadStream, stat, Stats } from "fs-extra"
@@ -37,7 +37,7 @@ export interface UploadTask {
 export abstract class Publisher {
   protected constructor(protected readonly context: PublishContext) {}
 
-  abstract get providerName(): string
+  abstract get providerName(): PublishProvider
 
   abstract upload(task: UploadTask): Promise<any>
 
@@ -77,14 +77,14 @@ export abstract class HttpPublisher extends Publisher {
     const fileName = (this.useSafeArtifactName ? task.safeArtifactName : null) || basename(task.file)
 
     if (task.fileContent != null) {
-      await this.doUpload(fileName, task.arch || Arch.x64, task.fileContent.length, it => it.end(task.fileContent))
+      await this.doUpload(fileName, task.arch || Arch.x64, task.fileContent.length, it => it.end(task.fileContent), task.file)
       return
     }
 
     const fileStat = await stat(task.file)
 
     const progressBar = this.createProgressBar(fileName, fileStat.size)
-    await this.doUpload(
+    return this.doUpload(
       fileName,
       task.arch || Arch.x64,
       fileStat.size,
@@ -104,7 +104,7 @@ export abstract class HttpPublisher extends Publisher {
     arch: Arch,
     dataLength: number,
     requestProcessor: (request: ClientRequest, reject: (error: Error) => void) => void,
-    file?: string
+    file: string
   ): Promise<any>
 }
 

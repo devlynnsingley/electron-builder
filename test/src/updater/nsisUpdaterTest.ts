@@ -1,4 +1,5 @@
-import { GenericServerOptions, GithubOptions, S3Options, SpacesOptions } from "builder-util-runtime"
+import { BitbucketPublisher } from "app-builder-lib/out/publish/BitbucketPublisher"
+import { BitbucketOptions, GenericServerOptions, GithubOptions, KeygenOptions, S3Options, SpacesOptions } from "builder-util-runtime"
 import { UpdateCheckResult } from "electron-updater"
 import { outputFile } from "fs-extra"
 import { tmpdir } from "os"
@@ -6,6 +7,9 @@ import * as path from "path"
 import { assertThat } from "../helpers/fileAssert"
 import { removeUnstableProperties } from "../helpers/packTester"
 import { createNsisUpdater, trackEvents, validateDownload, writeUpdateConfig } from "../helpers/updaterTestUtil"
+
+// some tests are flaky
+jest.retryTimes(3)
 
 if (process.env.ELECTRON_BUILDER_OFFLINE === "true") {
   fit("Skip ArtifactPublisherTest suite — ELECTRON_BUILDER_OFFLINE is defined", () => {
@@ -43,6 +47,29 @@ test("file url generic", async () => {
     provider: "generic",
     url: "https://develar.s3.amazonaws.com/test",
   })
+  await validateDownload(updater)
+})
+
+test.ifEnv(process.env.KEYGEN_TOKEN)("file url keygen", async () => {
+  const updater = await createNsisUpdater()
+  updater.addAuthHeader(`Bearer ${process.env.KEYGEN_TOKEN}`)
+  updater.updateConfigPath = await writeUpdateConfig<KeygenOptions>({
+    provider: "keygen",
+    product: "43981278-96e7-47de-b8c2-98d59987206b",
+    account: "cdecda36-3ef0-483e-ad88-97e7970f3149",
+  })
+  await validateDownload(updater)
+})
+
+test.ifEnv(process.env.BITBUCKET_TOKEN)("file url bitbucket", async () => {
+  const updater = await createNsisUpdater()
+  const options: BitbucketOptions = {
+    provider: "bitbucket",
+    owner: "mike-m",
+    slug: "electron-builder-test",
+  }
+  updater.addAuthHeader(BitbucketPublisher.convertAppPassword(options.owner, process.env.BITBUCKET_TOKEN!))
+  updater.updateConfigPath = await writeUpdateConfig(options)
   await validateDownload(updater)
 })
 

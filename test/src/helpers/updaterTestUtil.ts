@@ -1,8 +1,8 @@
-import { serializeToYaml, TmpDir, executeAppBuilder } from "builder-util"
-import { BintrayOptions, GenericServerOptions, GithubOptions, S3Options, SpacesOptions, DownloadOptions } from "builder-util-runtime"
+import { serializeToYaml, TmpDir } from "builder-util"
+import { DownloadOptions, AllPublishOptions } from "builder-util-runtime"
 import { AppUpdater, NoOpLogger } from "electron-updater"
 import { MacUpdater } from "electron-updater/out/MacUpdater"
-import { outputFile } from "fs-extra"
+import { outputFile, writeFile } from "fs-extra"
 import * as path from "path"
 import { TestOnlyUpdaterOptions } from "electron-updater/out/AppUpdater"
 import { NsisUpdater } from "electron-updater/out/NsisUpdater"
@@ -12,19 +12,19 @@ import { NodeHttpExecutor } from "builder-util/out/nodeHttpExecutor"
 
 const tmpDir = new TmpDir("updater-test-util")
 
-export async function createTestAppAdapter(version: string = "0.0.1") {
+export async function createTestAppAdapter(version = "0.0.1") {
   return new TestAppAdapter(version, await tmpDir.getTempDir())
 }
 
-export async function createNsisUpdater(version: string = "0.0.1") {
+export async function createNsisUpdater(version = "0.0.1") {
   const testAppAdapter = await createTestAppAdapter(version)
   const result = new NsisUpdater(null, testAppAdapter)
-  await tuneTestUpdater(result)
+  tuneTestUpdater(result)
   return result
 }
 
 // to reduce difference in test mode, setFeedURL is not used to set (NsisUpdater also read configOnDisk to load original publisherName)
-export async function writeUpdateConfig<T extends GenericServerOptions | GithubOptions | BintrayOptions | S3Options | SpacesOptions>(data: T): Promise<string> {
+export async function writeUpdateConfig<T extends AllPublishOptions>(data: T): Promise<string> {
   const updateConfigPath = path.join(await tmpDir.getTempDir({ prefix: "test-update-config" }), "app-update.yml")
   await outputFile(updateConfigPath, serializeToYaml(data))
   return updateConfigPath
@@ -49,7 +49,7 @@ export async function validateDownload(updater: AppUpdater, expectDownloadPromis
     if (updater instanceof MacUpdater) {
       expect(downloadResult).toEqual([])
     } else {
-      await assertThat(path.join(downloadResult!![0])).isFile()
+      await assertThat(path.join(downloadResult![0])).isFile()
     }
   } else {
     // noinspection JSIgnoredPromiseFromCall
@@ -61,18 +61,17 @@ export async function validateDownload(updater: AppUpdater, expectDownloadPromis
 }
 
 export class TestNodeHttpExecutor extends NodeHttpExecutor {
-  download(url: string, destination: string, options: DownloadOptions): Promise<string> {
-    const args = ["download", "--url", url, "--output", destination]
-    if (options != null && options.sha512) {
-      args.push("--sha512", options.sha512)
-    }
-    return executeAppBuilder(args).then(() => destination)
+  async download(url: string, destination: string, options: DownloadOptions): Promise<string> {
+    const obj = new URL(url)
+    const buffer = await this.downloadToBuffer(obj, options)
+    await writeFile(destination, buffer)
+    return buffer.toString()
   }
 }
 
 export const httpExecutor: TestNodeHttpExecutor = new TestNodeHttpExecutor()
 
-export async function tuneTestUpdater(updater: AppUpdater, options?: TestOnlyUpdaterOptions) {
+export function tuneTestUpdater(updater: AppUpdater, options?: TestOnlyUpdaterOptions) {
   ;(updater as any).httpExecutor = httpExecutor
   ;(updater as any)._testOnlyOptions = {
     platform: "win32",

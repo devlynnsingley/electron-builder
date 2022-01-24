@@ -196,6 +196,11 @@ export interface Configuration extends PlatformSpecificBuildOptions {
   readonly framework?: string | null
 
   /**
+   * The function (or path to file or module id) to be [run before pack](#beforepack)
+   */
+  readonly beforePack?: ((context: BeforePackContext) => Promise<any> | any) | string | null
+
+  /**
    * The function (or path to file or module id) to be [run after pack](#afterpack) (but before pack into distributable format and sign).
    */
   readonly afterPack?: ((context: AfterPackContext) => Promise<any> | any) | string | null
@@ -262,7 +267,7 @@ export interface Configuration extends PlatformSpecificBuildOptions {
   readonly removePackageKeywords?: boolean
 }
 
-export interface AfterPackContext {
+interface PackContext {
   readonly outDir: string
   readonly appOutDir: string
   readonly packager: PlatformPackager<any>
@@ -270,6 +275,8 @@ export interface AfterPackContext {
   readonly arch: Arch
   readonly targets: Array<Target>
 }
+export type AfterPackContext = PackContext
+export type BeforePackContext = PackContext
 
 export interface MetadataDirectories {
   /**

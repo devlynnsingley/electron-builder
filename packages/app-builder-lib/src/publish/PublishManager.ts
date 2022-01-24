@@ -1,18 +1,19 @@
 import BluebirdPromise from "bluebird-lst"
 import { Arch, asArray, AsyncTaskManager, InvalidConfigurationError, isEmptyOrSpaces, isPullRequest, log, safeStringifyJson, serializeToYaml } from "builder-util"
 import {
-  BintrayOptions,
   CancellationToken,
   GenericServerOptions,
   getS3LikeProviderBaseUrl,
   GithubOptions,
   githubUrl,
+  KeygenOptions,
+  SnapStoreOptions,
   PublishConfiguration,
   PublishProvider,
+  BitbucketOptions,
 } from "builder-util-runtime"
 import _debug from "debug"
 import { getCiTag, PublishContext, Publisher, PublishOptions, UploadTask } from "electron-publish"
-import { BintrayPublisher } from "./BintrayPublisher"
 import { GitHubPublisher } from "electron-publish/out/gitHubPublisher"
 import { MultiProgress } from "electron-publish/out/multiProgress"
 import S3Publisher from "./s3/s3Publisher"
@@ -27,8 +28,10 @@ import { Packager } from "../packager"
 import { PlatformPackager } from "../platformPackager"
 import { expandMacro } from "../util/macroExpander"
 import { WinPackager } from "../winPackager"
-import { SnapStoreOptions, SnapStorePublisher } from "./SnapStorePublisher"
+import { SnapStorePublisher } from "./SnapStorePublisher"
 import { createUpdateInfoTasks, UpdateInfoFileTask, writeUpdateInfoFiles } from "./updateInfoBuilder"
+import { KeygenPublisher } from "./KeygenPublisher"
+import { BitbucketPublisher } from "./BitbucketPublisher"
 
 const publishForPrWarning =
   "There are serious security concerns with PUBLISH_FOR_PULL_REQUEST=true (see the  CircleCI documentation (https://circleci.com/docs/1.0/fork-pr-builds/) for details)" +
@@ -159,7 +162,7 @@ export class PublishManager implements PublishContext {
     }
 
     const providerName = publisher.providerName
-    if (this.publishOptions.publish === "onTagOrDraft" && getCiTag() == null && !(providerName === "GitHub" || providerName === "Bintray")) {
+    if (this.publishOptions.publish === "onTagOrDraft" && getCiTag() == null && providerName !== "bitbucket" && providerName !== "github") {
       log.info({ file: event.file, reason: "current build is not for a git tag", publishPolicy: "onTagOrDraft" }, `not published to ${providerName}`)
       return
     }
@@ -294,14 +297,14 @@ export function createPublisher(context: PublishContext, version: string, publis
     case "github":
       return new GitHubPublisher(context, publishConfig as GithubOptions, version, options)
 
-    case "bintray":
-      return new BintrayPublisher(context, publishConfig as BintrayOptions, version, options)
-
-    case "generic":
-      return null
+    case "keygen":
+      return new KeygenPublisher(context, publishConfig as KeygenOptions, version)
 
     case "snapStore":
       return new SnapStorePublisher(context, publishConfig as SnapStoreOptions)
+
+    case "generic":
+      return null
 
     default: {
       const clazz = requireProviderClass(provider, packager)
@@ -315,11 +318,11 @@ function requireProviderClass(provider: string, packager: Packager): any | null 
     case "github":
       return GitHubPublisher
 
-    case "bintray":
-      return BintrayPublisher
-
     case "generic":
       return null
+
+    case "keygen":
+      return KeygenPublisher
 
     case "s3":
       return S3Publisher
@@ -329,6 +332,9 @@ function requireProviderClass(provider: string, packager: Packager): any | null 
 
     case "spaces":
       return SpacesPublisher
+
+    case "bitbucket":
+      return BitbucketPublisher
 
     default: {
       const name = `electron-publisher-${provider}`
@@ -417,8 +423,14 @@ async function resolvePublishConfigurations(
     let serviceName: PublishProvider | null = null
     if (!isEmptyOrSpaces(process.env.GH_TOKEN) || !isEmptyOrSpaces(process.env.GITHUB_TOKEN)) {
       serviceName = "github"
+    } else if (!isEmptyOrSpaces(process.env.KEYGEN_TOKEN)) {
+      serviceName = "keygen"
+    } else if (!isEmptyOrSpaces(process.env.BITBUCKET_TOKEN)) {
+      serviceName = "bitbucket"
     } else if (!isEmptyOrSpaces(process.env.BT_TOKEN)) {
-      serviceName = "bintray"
+      throw new Error(
+        "Bintray has been sunset and is no longer supported by electron-builder. Ref: https://jfrog.com/blog/into-the-sunset-bintray-jcenter-gocenter-and-chartcenter/"
+      )
     }
 
     if (serviceName != null) {
@@ -468,7 +480,7 @@ async function getResolvedPublishConfig(
   options: PublishConfiguration,
   arch: Arch | null,
   errorIfCannot: boolean
-): Promise<PublishConfiguration | GithubOptions | BintrayOptions | null> {
+): Promise<PublishConfiguration | GithubOptions | BitbucketOptions | null> {
   options = { ...options }
   expandPublishConfig(options, platformPackager, packager, arch)
 
@@ -499,13 +511,20 @@ async function getResolvedPublishConfig(
     return options
   }
 
+  if (provider === "keygen") {
+    return {
+      ...options,
+      platform: platformPackager?.platform.name,
+    } as KeygenOptions
+  }
+
   const isGithub = provider === "github"
-  if (!isGithub && provider !== "bintray") {
+  if (!isGithub && provider !== "bitbucket") {
     return options
   }
 
-  let owner = isGithub ? (options as GithubOptions).owner : (options as BintrayOptions).owner
-  let project = isGithub ? (options as GithubOptions).repo : (options as BintrayOptions).package
+  let owner = isGithub ? (options as GithubOptions).owner : (options as BitbucketOptions).owner
+  let project = isGithub ? (options as GithubOptions).repo : (options as BitbucketOptions).slug
 
   if (isGithub && owner == null && project != null) {
     const index = project.indexOf("/")
@@ -554,6 +573,6 @@ async function getResolvedPublishConfig(
     return { owner, repo: project, ...options } as GithubOptions
   } else {
     //tslint:disable-next-line:no-object-literal-type-assertion
-    return { owner, package: project, ...options } as BintrayOptions
+    return { owner, slug: project, ...options } as BitbucketOptions
   }
 }
