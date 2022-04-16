@@ -36,13 +36,13 @@
     "@types/is-ci": "^2.0.0",
     "@types/semver": "^6.0.2",
     "app-builder-bin": "3.4.5",
-    "archiver": "^3.1.1",
+    "archiver": "^4.0.2",
     "async-exit-hook": "^2.0.1",
     "bluebird-lst": "^1.0.9",
     "chalk": "^2.4.2",
     "chromium-pickle-js": "^0.2.0",
     "debug": "^4.1.1",
-    "ejs": "^2.7.1",
+    "ejs": "^3.1.6",
     "fs-extra": "^8.1.0",
     "hosted-git-info": "^3.0.2",
     "iconv-lite": "^0.5.0",
@@ -65,8 +65,8 @@
     "sumchecker": "^3.0.0",
     "temp-file": "^3.3.4",
     "tunnel-agent": "^0.6.0",
-    "update-notifier": "^3.0.1",
-    "yargs": "^14.2.0"
+    "update-notifier": "^4.0.0",
+    "yargs": "^15.0.1"
   },
   "devDependencies": {
     "@babel/core": "^7.6.4",
