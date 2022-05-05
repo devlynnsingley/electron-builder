@@ -1,4 +1,4 @@
-FROM buildpack-deps:jammy-curl
+FROM buildpack-deps:21.10-curl
 
 ENV DEBIAN_FRONTEND noninteractive
 
