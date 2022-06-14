@@ -1,14 +1,13 @@
 import { BlockMap } from "builder-util-runtime/out/blockMapApi"
 import { close, fstat, open, read } from "fs-extra"
 import { DifferentialDownloader } from "./DifferentialDownloader"
-
-const pako = require("pako")
+import { inflateRawSync } from "zlib"
 
 export class FileWithEmbeddedBlockMapDifferentialDownloader extends DifferentialDownloader {
-  async download() {
+  async download(): Promise<void> {
     const packageInfo = this.blockAwareFileInfo
-    const fileSize = packageInfo.size!!
-    const offset = fileSize - (packageInfo.blockMapSize!! + 4)
+    const fileSize = packageInfo.size!
+    const offset = fileSize - (packageInfo.blockMapSize! + 4)
     this.fileMetadataBuffer = await this.readRemoteBytes(offset, fileSize - 1)
     const newBlockMap = readBlockMap(this.fileMetadataBuffer.slice(0, this.fileMetadataBuffer.length - 4))
     await this.doDownload(await readEmbeddedBlockMapData(this.options.oldFile), newBlockMap)
@@ -16,7 +15,7 @@ export class FileWithEmbeddedBlockMapDifferentialDownloader extends Differential
 }
 
 function readBlockMap(data: Buffer): BlockMap {
-  return JSON.parse(pako.inflateRaw(data, {to: "string"}))
+  return JSON.parse(inflateRawSync(data).toString())
 }
 
 async function readEmbeddedBlockMapData(file: string): Promise<BlockMap> {
@@ -31,8 +30,7 @@ async function readEmbeddedBlockMapData(file: string): Promise<BlockMap> {
     await close(fd)
 
     return readBlockMap(dataBuffer)
-  }
-  catch (e) {
+  } catch (e) {
     await close(fd)
     throw e
   }

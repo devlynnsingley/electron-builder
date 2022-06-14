@@ -1,5 +1,5 @@
 /.vscode/
-/node_modules/
+node_modules
 *.log
 
 /.idea/compiler.xml
@@ -11,15 +11,11 @@
 
 .DS_Store
 
-/packages/*/out/
-/out/
-# to not exclude .js.snap (jest snapshots)
-/test/out/**/*.js
-/test/out/**/*.map
+out/
 /test/test-report.xml
 
+/packages/dmg-builder/vendor/
 /packages/electron-builder/README.md
-#/packages/app-builder-lib/scheme.json
 
 /scripts/jsdoc/out/
 /scripts/renderer/out/
@@ -27,6 +23,7 @@
 electron-builder-*.d.ts
 
 /site/
-/docs/
 
-__publish.sh
+tsconfig.tsbuildinfo
+
+.pnpm-store/

@@ -4,7 +4,7 @@ import { AppInfo } from "../appInfo"
 export function expandMacro(pattern: string, arch: string | null | undefined, appInfo: AppInfo, extra: any = {}, isProductNameSanitized = true): string {
   if (arch == null) {
     pattern = pattern
-    // tslint:disable-next-line:no-invalid-template-strings
+      // tslint:disable-next-line:no-invalid-template-strings
       .replace("-${arch}", "")
       // tslint:disable-next-line:no-invalid-template-strings
       .replace(" ${arch}", "")
@@ -14,10 +14,10 @@ export function expandMacro(pattern: string, arch: string | null | undefined, ap
       .replace("/${arch}", "")
   }
 
-  return pattern.replace(/\${([_a-zA-Z./*]+)}/g, (match, p1): string => {
+  return pattern.replace(/\${([_a-zA-Z./*+]+)}/g, (match, p1): string => {
     switch (p1) {
       case "productName":
-        return isProductNameSanitized ? appInfo.productFilename : appInfo.productName
+        return isProductNameSanitized ? appInfo.sanitizedProductName : appInfo.productName
 
       case "arch":
         if (arch == null) {
@@ -26,12 +26,13 @@ export function expandMacro(pattern: string, arch: string | null | undefined, ap
         }
         return arch
 
-      case "author":
+      case "author": {
         const companyName = appInfo.companyName
         if (companyName == null) {
           throw new InvalidConfigurationError(`cannot expand pattern "${pattern}": author is not specified`, "ERR_ELECTRON_BUILDER_AUTHOR_UNSPECIFIED")
         }
         return companyName
+      }
 
       case "platform":
         return process.platform
@@ -39,7 +40,7 @@ export function expandMacro(pattern: string, arch: string | null | undefined, ap
       case "channel":
         return appInfo.channel || "latest"
 
-      default:
+      default: {
         if (p1 in appInfo) {
           return (appInfo as any)[p1]
         }
@@ -56,10 +57,10 @@ export function expandMacro(pattern: string, arch: string | null | undefined, ap
         const value = extra[p1]
         if (value == null) {
           throw new InvalidConfigurationError(`cannot expand pattern "${pattern}": macro ${p1} is not defined`, "ERR_ELECTRON_BUILDER_MACRO_NOT_DEFINED")
-        }
-        else {
+        } else {
           return value
         }
+      }
     }
   })
 }

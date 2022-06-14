@@ -14,7 +14,7 @@ export interface MacConfiguration extends PlatformSpecificBuildOptions {
 
   /**
    * The target package type: list of `default`, `dmg`, `mas`, `mas-dev`, `pkg`, `7z`, `zip`, `tar.xz`, `tar.lz`, `tar.gz`, `tar.bz2`, `dir`. Defaults to `default` (dmg and zip for Squirrel.Mac).
-  */
+   */
   readonly target?: Array<MacOsTargetName | TargetConfiguration> | MacOsTargetName | TargetConfiguration | null
 
   /**
@@ -44,6 +44,13 @@ export interface MacConfiguration extends PlatformSpecificBuildOptions {
   readonly entitlementsInherit?: string | null
 
   /**
+   * Path to login helper entitlement file.
+   * When using App Sandbox, the the `com.apple.security.inherit` key that is normally in the inherited entitlements cannot be inherited since the login helper is a standalone executable.
+   * Defaults to the value provided for `entitlements`. This option only applies when signing with `entitlements` provided.
+   */
+  readonly entitlementsLoginHelper?: string | null
+
+  /**
    * The path to the provisioning profile to use when signing, absolute or relative to the app root.
    */
   readonly provisioningProfile?: string | null
@@ -69,6 +76,36 @@ export interface MacConfiguration extends PlatformSpecificBuildOptions {
    * @default ${appBundleIdentifier}.helper
    */
   readonly helperBundleId?: string | null
+
+  /**
+   * The bundle identifier to use in the Renderer helper's plist.
+   * @default ${appBundleIdentifier}.helper.Renderer
+   */
+  readonly helperRendererBundleId?: string | null
+
+  /**
+   * The bundle identifier to use in the Plugin helper's plist.
+   * @default ${appBundleIdentifier}.helper.Plugin
+   */
+  readonly helperPluginBundleId?: string | null
+
+  /**
+   * The bundle identifier to use in the GPU helper's plist.
+   * @default ${appBundleIdentifier}.helper.GPU
+   */
+  readonly helperGPUBundleId?: string | null
+
+  /**
+   * The bundle identifier to use in the EH helper's plist.
+   * @default ${appBundleIdentifier}.helper.EH
+   */
+  readonly helperEHBundleId?: string | null
+
+  /**
+   * The bundle identifier to use in the NP helper's plist.
+   * @default ${appBundleIdentifier}.helper.NP
+   */
+  readonly helperNPBundleId?: string | null
 
   /**
    * Whether to sign app for development or for distribution.
@@ -122,6 +159,39 @@ export interface MacConfiguration extends PlatformSpecificBuildOptions {
    * @default false
    */
   readonly gatekeeperAssess?: boolean
+
+  /**
+   * Whether to let electron-osx-sign verify the contents or not.
+   * @default true
+   */
+  readonly strictVerify?: Array<string> | string | boolean
+
+  /**
+   * Regex or an array of regex's that signal skipping signing a file.
+   */
+  readonly signIgnore?: Array<string> | string | null
+
+  /**
+   * Specify the URL of the timestamp authority server
+   */
+  readonly timestamp?: string | null
+
+  /**
+   * Whether to merge ASAR files for different architectures or not.
+   *
+   * This option has no effect unless building for "universal" arch.
+   * @default true
+   */
+  readonly mergeASARs?: boolean
+
+  /**
+   * Minimatch pattern of paths that are allowed to be present in one of the
+   * ASAR files, but not in the other.
+   *
+   * This option has no effect unless building for "universal" arch and applies
+   * only if `mergeASARs` is `true`.
+   */
+  readonly singleArchFiles?: string
 }
 
 export interface DmgOptions extends TargetSpecificOptions {

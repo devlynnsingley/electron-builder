@@ -1,7 +1,10 @@
 declare module jest {
   interface It {
     ifNotWindows: jest.It
+
     ifMac: jest.It
+    ifNotMac: jest.It
+
     ifWindows: jest.It
     ifNotCi: jest.It
     ifCi: jest.It
@@ -14,6 +17,8 @@ declare module jest {
     ifLinuxOrDevMac: jest.It
 
     ifAll: jest.It
+    
+    ifEnv: (envVar: any) => jest.It
   }
 
   interface Describe {

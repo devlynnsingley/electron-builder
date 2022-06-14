@@ -17,7 +17,7 @@
 	          StrCpy $packageUrl "$packageUrl/${APP_32_NAME}"
 	        ${endif}
 		    !else
-	        ${if} ${IsNativeAMD64} == true
+	        ${if} ${IsNativeAMD64}
 	          StrCpy $packageUrl "$packageUrl/${APP_64_NAME}"
 	        ${else}
 	          StrCpy $packageUrl "$packageUrl/${APP_32_NAME}"
@@ -31,7 +31,7 @@
     !endif
   !endif
 
-  ${if} ${IsNativeARM64} 
+  ${if} ${IsNativeARM64}
     StrCpy $packageArch "ARM64"
   ${elseif} ${IsNativeAMD64}
     StrCpy $packageArch "64"
@@ -56,7 +56,7 @@
   ${if} $0 == "Cancelled"
     quit
   ${elseif} $0 != "OK"
-    Messagebox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Unable to download application package from $packageUrl (status: $0).$\r$\n$\r$\nPlease check you Internet connection and retry." IDRETRY download
+    Messagebox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Unable to download application package from $packageUrl (status: $0).$\r$\n$\r$\nPlease check your internet connection and retry." IDRETRY download
     Quit
   ${endif}
 

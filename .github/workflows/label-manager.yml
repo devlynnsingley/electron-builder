@@ -1,0 +1,14 @@
+[![Test](https://github.com/electron-userland/electron-builder/actions/workflows/test.yaml/badge.svg)](https://github.com/electron-userland/electron-builder/actions/workflows/test.yaml)on: issues
+name: Create Default Labels
+jobs:
+  labels:
+    name: DefaultLabelsActions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: lannonbr/issue-label-manager-action@3.0.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          delete: false # will delete any labels that aren't in the .github/labels.json (this is set to false by default)

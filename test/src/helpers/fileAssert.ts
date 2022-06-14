@@ -1,5 +1,5 @@
 import { exists, statOrNull } from "builder-util/out/fs"
-import { promises as fs } from "fs"
+import * as fs from "fs/promises"
 import * as path from "path"
 
 // http://joel-costigliola.github.io/assertj/
@@ -7,9 +7,10 @@ export function assertThat(actual: any): Assertions {
   return new Assertions(actual)
 }
 
+const appVersion = require(path.join(__dirname, "../../../packages/app-builder-lib/package.json")).version
+
 class Assertions {
-  constructor(private actual: any) {
-  }
+  constructor(private actual: any) {}
 
   containsAll<T>(expected: Iterable<T>) {
     expect(this.actual.slice().sort()).toEqual(Array.from(expected).slice().sort())
@@ -60,16 +61,14 @@ class Assertions {
     let result: any
     try {
       result = await this.actual
-    }
-    catch (e) {
+    } catch (e) {
       actualError = e
     }
 
     let m
     if (actualError == null) {
       m = result
-    }
-    else {
+    } else {
       m = (actualError as NodeJS.ErrnoException).code || actualError.message
 
       if (m.includes("HttpError: ") && m.indexOf("\n") > 0) {
@@ -80,19 +79,18 @@ class Assertions {
         m = m.substring(0, m.indexOf(","))
       }
 
-      m = m.replace(/\((C:)?(\/|\\)[^(]+(\/|\\)([^(\/\\]+)\)/g, `(<path>/$4)`)
-      m = m.replace(/"(C:)?(\/|\\)[^"]+(\/|\\)([^"\/\\]+)"/g, `"<path>/$4"`)
-      m = m.replace(/'(C:)?(\/|\\)[^']+(\/|\\)([^'\/\\]+)'/g, `'<path>/$4'`)
+      m = m.replace(appVersion, "<appVersion>")
+      m = m.replace(/\((C:)?([\/\\])[^(]+([\/\\])([^(\/\\]+)\)/g, `(<path>/$4)`)
+      m = m.replace(/"(C:)?([\/\\])[^"]+([\/\\])([^"\/\\]+)"/g, `"<path>/$4"`)
+      m = m.replace(/'(C:)?([\/\\])[^']+([\/\\])([^'\/\\]+)'/g, `'<path>/$4'`)
     }
     try {
       if (customErrorAssert == null) {
         expect(m).toMatchSnapshot()
-      }
-      else {
+      } else {
         customErrorAssert(actualError!!)
       }
-    }
-    catch (matchError) {
+    } catch (matchError) {
       throw new Error(matchError + " " + actualError)
     }
   }

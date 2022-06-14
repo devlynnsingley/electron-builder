@@ -6,7 +6,9 @@ import { Operation, OperationKind } from "./downloadPlanBuilder"
 const DOUBLE_CRLF = Buffer.from("\r\n\r\n")
 
 enum ReadState {
-  INIT, HEADER, BODY
+  INIT,
+  HEADER,
+  BODY,
 }
 
 export interface PartListDataTask {
@@ -16,7 +18,7 @@ export interface PartListDataTask {
   readonly end: number
 }
 
-export function copyData(task: Operation, out: Writable, oldFileFd: number, reject: (error: Error) => void, resolve: () => void) {
+export function copyData(task: Operation, out: Writable, oldFileFd: number, reject: (error: Error) => void, resolve: () => void): void {
   const readStream = createReadStream("", {
     fd: oldFileFd,
     autoClose: false,
@@ -27,7 +29,7 @@ export function copyData(task: Operation, out: Writable, oldFileFd: number, reje
   readStream.on("error", reject)
   readStream.once("end", resolve)
   readStream.pipe(out, {
-    end: false
+    end: false,
   })
 }
 
@@ -41,7 +43,14 @@ export class DataSplitter extends Writable {
 
   private readonly boundaryLength: number
 
-  constructor(private readonly out: Writable, private readonly options: PartListDataTask, private readonly partIndexToTaskIndex: Map<number, number>, boundary: string, private readonly partIndexToLength: Array<number>, private readonly finishHandler: () => any) {
+  constructor(
+    private readonly out: Writable,
+    private readonly options: PartListDataTask,
+    private readonly partIndexToTaskIndex: Map<number, number>,
+    boundary: string,
+    private readonly partIndexToLength: Array<number>,
+    private readonly finishHandler: () => any
+  ) {
     super()
 
     this.boundaryLength = boundary.length + 4 /* size of \r\n-- */
@@ -49,20 +58,18 @@ export class DataSplitter extends Writable {
     this.ignoreByteCount = this.boundaryLength - 2
   }
 
-  get isFinished() {
+  get isFinished(): boolean {
     return this.partIndex === this.partIndexToLength.length
   }
 
   // noinspection JSUnusedGlobalSymbols
-  _write(data: Buffer, encoding: string, callback: (error?: Error) => void) {
+  _write(data: Buffer, encoding: string, callback: (error?: Error) => void): void {
     if (this.isFinished) {
       console.error(`Trailing ignored data: ${data.length} bytes`)
       return
     }
 
-    this.handleData(data)
-      .then(callback)
-      .catch(callback)
+    this.handleData(data).then(callback).catch(callback)
   }
 
   private async handleData(chunk: Buffer): Promise<undefined> {
@@ -76,8 +83,7 @@ export class DataSplitter extends Writable {
       const toIgnore = Math.min(this.ignoreByteCount, chunk.length)
       this.ignoreByteCount -= toIgnore
       start = toIgnore
-    }
-    else if (this.remainingPartDataCount > 0) {
+    } else if (this.remainingPartDataCount > 0) {
       const toRead = Math.min(this.remainingPartDataCount, chunk.length)
       this.remainingPartDataCount -= toRead
       await this.processPartData(chunk, 0, toRead)
@@ -103,25 +109,22 @@ export class DataSplitter extends Writable {
     while (true) {
       if (this.readState === ReadState.BODY) {
         this.readState = ReadState.INIT
-      }
-      else {
+      } else {
         this.partIndex++
 
         let taskIndex = this.partIndexToTaskIndex.get(this.partIndex)
         if (taskIndex == null) {
           if (this.isFinished) {
             taskIndex = this.options.end
-          }
-          else {
+          } else {
             throw newError("taskIndex is null", "ERR_DATA_SPLITTER_TASK_INDEX_IS_NULL")
           }
         }
 
-        const prevTaskIndex = this.partIndex === 0 ? this.options.start : (this.partIndexToTaskIndex.get(this.partIndex - 1)!! + 1 /* prev part is download, next maybe copy */)
+        const prevTaskIndex = this.partIndex === 0 ? this.options.start : this.partIndexToTaskIndex.get(this.partIndex - 1)! + 1 /* prev part is download, next maybe copy */
         if (prevTaskIndex < taskIndex) {
           await this.copyExistingData(prevTaskIndex, taskIndex)
-        }
-        else if (prevTaskIndex > taskIndex) {
+        } else if (prevTaskIndex > taskIndex) {
           throw newError("prevTaskIndex must be < taskIndex", "ERR_DATA_SPLITTER_TASK_INDEX_ASSERT_FAILED")
         }
 
@@ -156,9 +159,9 @@ export class DataSplitter extends Writable {
     }
   }
 
-  private copyExistingData(index: number, end: number) {
+  private copyExistingData(index: number, end: number): Promise<void> {
     return new Promise((resolve, reject) => {
-      const w = () => {
+      const w = (): void => {
         if (index === end) {
           resolve()
           return
@@ -189,8 +192,7 @@ export class DataSplitter extends Writable {
     const partialChunk = readOffset === 0 ? chunk : chunk.slice(readOffset)
     if (this.headerListBuffer == null) {
       this.headerListBuffer = partialChunk
-    }
-    else {
+    } else {
       this.headerListBuffer = Buffer.concat([this.headerListBuffer, partialChunk])
     }
     return -1
@@ -198,7 +200,7 @@ export class DataSplitter extends Writable {
 
   private actualPartLength = 0
 
-  private onPartEnd() {
+  private onPartEnd(): void {
     const expectedLength = this.partIndexToLength[this.partIndex - 1]
     if (this.actualPartLength !== expectedLength) {
       throw newError(`Expected length: ${expectedLength} differs from actual: ${this.actualPartLength}`, "ERR_DATA_SPLITTER_LENGTH_MISMATCH")
@@ -218,8 +220,7 @@ export class DataSplitter extends Writable {
     const out = this.out
     if (out.write(start === 0 && data.length === end ? data : data.slice(start, end))) {
       return Promise.resolve()
-    }
-    else {
+    } else {
       return new Promise((resolve, reject) => {
         out.on("error", reject)
         out.once("drain", () => {

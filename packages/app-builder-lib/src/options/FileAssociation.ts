@@ -1,9 +1,9 @@
 /**
  * File associations.
  *
- * macOS (corresponds to [CFBundleDocumentTypes](https://developer.apple.com/library/content/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html#//apple_ref/doc/uid/20001431-101685)) and NSIS only.
+ * macOS (corresponds to [CFBundleDocumentTypes](https://developer.apple.com/library/content/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html#//apple_ref/doc/uid/20001431-101685)), NSIS, and MSI only.
  *
- * On Windows works only if [nsis.perMachine](https://electron.build/configuration/configuration#NsisOptions-perMachine) is set to `true`.
+ * On Windows (NSIS) works only if [nsis.perMachine](https://electron.build/configuration/configuration#NsisOptions-perMachine) is set to `true`.
  */
 export interface FileAssociation {
   /**
@@ -29,7 +29,7 @@ export interface FileAssociation {
   /**
    * The path to icon (`.icns` for MacOS and `.ico` for Windows), relative to `build` (build resources directory). Defaults to `${firstExt}.icns`/`${firstExt}.ico` (if several extensions specified, first is used) or to application icon.
    *
-   * Not supported on Linux, file issue if need (default icon will be `x-office-document`).
+   * Not supported on Linux, file issue if need (default icon will be `x-office-document`). Not supported on MSI.
    */
   readonly icon?: string | null
 
@@ -43,4 +43,10 @@ export interface FileAssociation {
    * *macOS-only* Whether the document is distributed as a bundle. If set to true, the bundle directory is treated as a file. Corresponds to `LSTypeIsPackage`.
    */
   readonly isPackage?: boolean
+
+  /**
+   * *macOS-only* The app’s rank with respect to the type. The value can be `Owner`, `Default`, `Alternate`, or `None`. Corresponds to `LSHandlerRank`.
+   * @default Default
+   */
+  readonly rank?: string
 }

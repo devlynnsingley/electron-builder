@@ -1,9 +1,7 @@
 {
-  "extends": "../../node_modules/ts-babel/tsconfig-base.json",
+  "extends": "../../tsconfig-base.json",
   "compilerOptions": {
-    "outDir": "out",
-    "module": "commonjs",
-    "skipLibCheck": true
+    "outDir": "out"
   },
   "declaration": false,
   "include": [

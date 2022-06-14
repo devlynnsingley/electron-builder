@@ -1,9 +1,7 @@
 import { exec } from "builder-util"
 import { PlatformPackager } from "app-builder-lib"
-import { exists } from "builder-util/out/fs"
 import { executeFinally } from "builder-util/out/promise"
 import * as path from "path"
-import { TmpDir } from "temp-file"
 
 export { DmgTarget } from "./dmg"
 
@@ -38,13 +36,10 @@ export async function attachAndExecute(dmgPath: string, readWrite: boolean, task
 export async function detach(name: string) {
   try {
     await exec("hdiutil", ["detach", "-quiet", name])
-  }
-  catch (e) {
+  } catch (e) {
     await new Promise((resolve, reject) => {
       setTimeout(() => {
-        exec("hdiutil", ["detach", "-force", name])
-          .then(resolve)
-          .catch(reject)
+        exec("hdiutil", ["detach", "-force", name]).then(resolve).catch(reject)
       }, 1000)
     })
   }
@@ -54,31 +49,21 @@ export async function computeBackground(packager: PlatformPackager<any>): Promis
   const resourceList = await packager.resourceList
   if (resourceList.includes("background.tiff")) {
     return path.join(packager.buildResourcesDir, "background.tiff")
-  }
-  else if (resourceList.includes("background.png")) {
+  } else if (resourceList.includes("background.png")) {
     return path.join(packager.buildResourcesDir, "background.png")
-  }
-  else {
+  } else {
     return path.join(getDmgTemplatePath(), "background.tiff")
   }
 }
 
-export async function transformBackgroundFileIfNeed(file: string, tmpDir: TmpDir): Promise<string> {
-  if (file.endsWith(".tiff") || file.endsWith(".TIFF")) {
-    return file
-  }
-
-  const retinaFile = file.replace(/\.([a-z]+)$/, "@2x.$1")
-  if (await exists(retinaFile)) {
-    const tiffFile = await tmpDir.getTempFile({suffix: ".tiff"})
-    await exec("tiffutil", ["-cathidpicheck", file, retinaFile, "-out", tiffFile])
-    return tiffFile
-  }
-
-  return file
-}
-
 /** @internal */
 export function serializeString(data: string) {
-  return '  $"' + data.match(/.{1,32}/g)!!.map(it => it.match(/.{1,4}/g)!!.join(" ")).join('"\n  $"') + '"'
+  return (
+    '  $"' +
+    data
+      .match(/.{1,32}/g)!
+      .map(it => it.match(/.{1,4}/g)!.join(" "))
+      .join('"\n  $"') +
+    '"'
+  )
 }
