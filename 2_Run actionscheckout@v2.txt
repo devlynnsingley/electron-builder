@@ -1,0 +1,73 @@
+2022-03-16T07:26:44.5478160Z ##[group]Run actions/checkout@v2
+2022-03-16T07:26:44.5478671Z with:
+2022-03-16T07:26:44.5479036Z   repository: Emnmer1/Dev-Ex-Machita
+2022-03-16T07:26:44.5479788Z   token: ***
+2022-03-16T07:26:44.5480098Z   ssh-strict: true
+2022-03-16T07:26:44.5480436Z   persist-credentials: true
+2022-03-16T07:26:44.5480829Z   clean: true
+2022-03-16T07:26:44.5481111Z   fetch-depth: 1
+2022-03-16T07:26:44.5481408Z   lfs: false
+2022-03-16T07:26:44.5481698Z   submodules: false
+2022-03-16T07:26:44.5482005Z ##[endgroup]
+2022-03-16T07:26:44.8442362Z Syncing repository: Emnmer1/Dev-Ex-Machita
+2022-03-16T07:26:44.8444956Z ##[group]Getting Git version info
+2022-03-16T07:26:44.8446109Z Working directory is '/home/runner/work/Dev-Ex-Machita/Dev-Ex-Machita'
+2022-03-16T07:26:44.8447398Z [command]/usr/bin/git version
+2022-03-16T07:26:44.8515705Z git version 2.35.1
+2022-03-16T07:26:44.8539754Z ##[endgroup]
+2022-03-16T07:26:44.8547068Z Deleting the contents of '/home/runner/work/Dev-Ex-Machita/Dev-Ex-Machita'
+2022-03-16T07:26:44.8550698Z ##[group]Initializing the repository
+2022-03-16T07:26:44.8556079Z [command]/usr/bin/git init /home/runner/work/Dev-Ex-Machita/Dev-Ex-Machita
+2022-03-16T07:26:44.8639628Z hint: Using 'master' as the name for the initial branch. This default branch name
+2022-03-16T07:26:44.8640425Z hint: is subject to change. To configure the initial branch name to use in all
+2022-03-16T07:26:44.8640992Z hint: of your new repositories, which will suppress this warning, call:
+2022-03-16T07:26:44.8641417Z hint: 
+2022-03-16T07:26:44.8641956Z hint: 	git config --global init.defaultBranch <name>
+2022-03-16T07:26:44.8642365Z hint: 
+2022-03-16T07:26:44.8642902Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2022-03-16T07:26:44.8643554Z hint: 'development'. The just-created branch can be renamed via this command:
+2022-03-16T07:26:44.8644012Z hint: 
+2022-03-16T07:26:44.8644444Z hint: 	git branch -m <name>
+2022-03-16T07:26:44.8659291Z Initialized empty Git repository in /home/runner/work/Dev-Ex-Machita/Dev-Ex-Machita/.git/
+2022-03-16T07:26:44.8672752Z [command]/usr/bin/git remote add origin https://github.com/Emnmer1/Dev-Ex-Machita
+2022-03-16T07:26:44.8726538Z ##[endgroup]
+2022-03-16T07:26:44.8727452Z ##[group]Disabling automatic garbage collection
+2022-03-16T07:26:44.8731575Z [command]/usr/bin/git config --local gc.auto 0
+2022-03-16T07:26:44.8907365Z ##[endgroup]
+2022-03-16T07:26:44.8929169Z ##[group]Setting up auth
+2022-03-16T07:26:44.8930794Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2022-03-16T07:26:44.8966405Z [command]/usr/bin/git submodule foreach --recursive git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :
+2022-03-16T07:26:44.9389106Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2022-03-16T07:26:44.9433462Z [command]/usr/bin/git submodule foreach --recursive git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :
+2022-03-16T07:26:44.9779011Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2022-03-16T07:26:44.9841509Z ##[endgroup]
+2022-03-16T07:26:44.9842450Z ##[group]Fetching the repository
+2022-03-16T07:26:44.9853491Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --progress --no-recurse-submodules --depth=1 origin +6cfd6ede11f20980d2dfb887647f38f52ab36376:refs/remotes/origin/main
+2022-03-16T07:26:45.3811912Z remote: Enumerating objects: 7, done.        
+2022-03-16T07:26:45.3887516Z remote: Counting objects:  14% (1/7)        
+2022-03-16T07:26:45.3887965Z remote: Counting objects:  28% (2/7)        
+2022-03-16T07:26:45.3888265Z remote: Counting objects:  42% (3/7)        
+2022-03-16T07:26:45.3888590Z remote: Counting objects:  57% (4/7)        
+2022-03-16T07:26:45.3889849Z remote: Counting objects:  71% (5/7)        
+2022-03-16T07:26:45.3890462Z remote: Counting objects:  85% (6/7)        
+2022-03-16T07:26:45.3891171Z remote: Counting objects: 100% (7/7)        
+2022-03-16T07:26:45.3891491Z remote: Counting objects: 100% (7/7), done.        
+2022-03-16T07:26:45.3891839Z remote: Compressing objects:  20% (1/5)        
+2022-03-16T07:26:45.3892166Z remote: Compressing objects:  40% (2/5)        
+2022-03-16T07:26:45.3892468Z remote: Compressing objects:  60% (3/5)        
+2022-03-16T07:26:45.3892782Z remote: Compressing objects:  80% (4/5)        
+2022-03-16T07:26:45.3893084Z remote: Compressing objects: 100% (5/5)        
+2022-03-16T07:26:45.3894053Z remote: Compressing objects: 100% (5/5), done.        
+2022-03-16T07:26:45.3895571Z remote: Total 7 (delta 0), reused 0 (delta 0), pack-reused 0        
+2022-03-16T07:26:45.3949131Z From https://github.com/Emnmer1/Dev-Ex-Machita
+2022-03-16T07:26:45.3949807Z  * [new ref]         6cfd6ede11f20980d2dfb887647f38f52ab36376 -> origin/main
+2022-03-16T07:26:45.3988854Z ##[endgroup]
+2022-03-16T07:26:45.3989433Z ##[group]Determining the checkout info
+2022-03-16T07:26:45.3990831Z ##[endgroup]
+2022-03-16T07:26:45.3991286Z ##[group]Checking out the ref
+2022-03-16T07:26:45.3997349Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2022-03-16T07:26:45.4058000Z Switched to a new branch 'main'
+2022-03-16T07:26:45.4062144Z branch 'main' set up to track 'origin/main'.
+2022-03-16T07:26:45.4066875Z ##[endgroup]
+2022-03-16T07:26:45.4122761Z [command]/usr/bin/git log -1 --format='%H'
+2022-03-16T07:26:45.4159787Z '6cfd6ede11f20980d2dfb887647f38f52ab36376'

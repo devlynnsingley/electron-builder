@@ -1,0 +1,135 @@
+2022-03-16T07:26:35.5729694Z Requested labels: ubuntu-latest
+2022-03-16T07:26:35.5729758Z Job defined at: Emnmer1/Dev-Ex-Machita/.github/workflows/Notblank.yml@refs/heads/main
+2022-03-16T07:26:35.5729795Z Waiting for a runner to pick up this job...
+2022-03-16T07:26:35.9345490Z Job is waiting for a hosted runner to come online.
+2022-03-16T07:26:39.2218837Z Job is about to start running on the hosted runner: GitHub Actions 2 (hosted)
+2022-03-16T07:26:43.1309012Z Current runner version: '2.288.1'
+2022-03-16T07:26:43.1342313Z ##[group]Operating System
+2022-03-16T07:26:43.1342945Z Ubuntu
+2022-03-16T07:26:43.1343297Z 20.04.4
+2022-03-16T07:26:43.1343635Z LTS
+2022-03-16T07:26:43.1344043Z ##[endgroup]
+2022-03-16T07:26:43.1344458Z ##[group]Virtual Environment
+2022-03-16T07:26:43.1344886Z Environment: ubuntu-20.04
+2022-03-16T07:26:43.1345299Z Version: 20220227.1
+2022-03-16T07:26:43.1345903Z Included Software: https://github.com/actions/virtual-environments/blob/ubuntu20/20220227.1/images/linux/Ubuntu2004-Readme.md
+2022-03-16T07:26:43.1346793Z Image Release: https://github.com/actions/virtual-environments/releases/tag/ubuntu20%2F20220227.1
+2022-03-16T07:26:43.1347385Z ##[endgroup]
+2022-03-16T07:26:43.1347773Z ##[group]Virtual Environment Provisioner
+2022-03-16T07:26:43.1348227Z 1.0.0.0-main-20220307-1
+2022-03-16T07:26:43.1348571Z ##[endgroup]
+2022-03-16T07:26:43.1349851Z ##[group]GITHUB_TOKEN Permissions
+2022-03-16T07:26:43.1351188Z Actions: write
+2022-03-16T07:26:43.1360756Z Checks: write
+2022-03-16T07:26:43.1361331Z Contents: write
+2022-03-16T07:26:43.1361728Z Deployments: write
+2022-03-16T07:26:43.1362152Z Discussions: write
+2022-03-16T07:26:43.1362485Z Issues: write
+2022-03-16T07:26:43.1362876Z Metadata: read
+2022-03-16T07:26:43.1363305Z Packages: write
+2022-03-16T07:26:43.1363657Z Pages: write
+2022-03-16T07:26:43.1364052Z PullRequests: write
+2022-03-16T07:26:43.1364436Z RepositoryProjects: write
+2022-03-16T07:26:43.1364881Z SecurityEvents: write
+2022-03-16T07:26:43.1365230Z Statuses: write
+2022-03-16T07:26:43.1365686Z ##[endgroup]
+2022-03-16T07:26:43.1370817Z Secret source: Actions
+2022-03-16T07:26:43.1371400Z Prepare workflow directory
+2022-03-16T07:26:43.2406946Z Prepare all required actions
+2022-03-16T07:26:43.2660123Z Getting action download info
+2022-03-16T07:26:43.4823000Z Download action repository 'actions/checkout@v2' (SHA:ec3a7ce113134d7a93b817d10a8272cb61118579)
+2022-03-16T07:26:44.5478206Z ##[group]Run actions/checkout@v2
+2022-03-16T07:26:44.5478676Z with:
+2022-03-16T07:26:44.5479041Z   repository: Emnmer1/Dev-Ex-Machita
+2022-03-16T07:26:44.5479794Z   token: ***
+2022-03-16T07:26:44.5480103Z   ssh-strict: true
+2022-03-16T07:26:44.5480441Z   persist-credentials: true
+2022-03-16T07:26:44.5480833Z   clean: true
+2022-03-16T07:26:44.5481115Z   fetch-depth: 1
+2022-03-16T07:26:44.5481413Z   lfs: false
+2022-03-16T07:26:44.5481702Z   submodules: false
+2022-03-16T07:26:44.5482010Z ##[endgroup]
+2022-03-16T07:26:44.8442427Z Syncing repository: Emnmer1/Dev-Ex-Machita
+2022-03-16T07:26:44.8444980Z ##[group]Getting Git version info
+2022-03-16T07:26:44.8446120Z Working directory is '/home/runner/work/Dev-Ex-Machita/Dev-Ex-Machita'
+2022-03-16T07:26:44.8447407Z [command]/usr/bin/git version
+2022-03-16T07:26:44.8515749Z git version 2.35.1
+2022-03-16T07:26:44.8539789Z ##[endgroup]
+2022-03-16T07:26:44.8547116Z Deleting the contents of '/home/runner/work/Dev-Ex-Machita/Dev-Ex-Machita'
+2022-03-16T07:26:44.8550803Z ##[group]Initializing the repository
+2022-03-16T07:26:44.8556091Z [command]/usr/bin/git init /home/runner/work/Dev-Ex-Machita/Dev-Ex-Machita
+2022-03-16T07:26:44.8639685Z hint: Using 'master' as the name for the initial branch. This default branch name
+2022-03-16T07:26:44.8640431Z hint: is subject to change. To configure the initial branch name to use in all
+2022-03-16T07:26:44.8640998Z hint: of your new repositories, which will suppress this warning, call:
+2022-03-16T07:26:44.8641422Z hint: 
+2022-03-16T07:26:44.8641962Z hint: 	git config --global init.defaultBranch <name>
+2022-03-16T07:26:44.8642370Z hint: 
+2022-03-16T07:26:44.8642907Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2022-03-16T07:26:44.8643559Z hint: 'development'. The just-created branch can be renamed via this command:
+2022-03-16T07:26:44.8644017Z hint: 
+2022-03-16T07:26:44.8644449Z hint: 	git branch -m <name>
+2022-03-16T07:26:44.8659348Z Initialized empty Git repository in /home/runner/work/Dev-Ex-Machita/Dev-Ex-Machita/.git/
+2022-03-16T07:26:44.8672769Z [command]/usr/bin/git remote add origin https://github.com/Emnmer1/Dev-Ex-Machita
+2022-03-16T07:26:44.8726573Z ##[endgroup]
+2022-03-16T07:26:44.8727459Z ##[group]Disabling automatic garbage collection
+2022-03-16T07:26:44.8731584Z [command]/usr/bin/git config --local gc.auto 0
+2022-03-16T07:26:44.8907417Z ##[endgroup]
+2022-03-16T07:26:44.8929191Z ##[group]Setting up auth
+2022-03-16T07:26:44.8930804Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2022-03-16T07:26:44.8966447Z [command]/usr/bin/git submodule foreach --recursive git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :
+2022-03-16T07:26:44.9389176Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2022-03-16T07:26:44.9433550Z [command]/usr/bin/git submodule foreach --recursive git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :
+2022-03-16T07:26:44.9779074Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2022-03-16T07:26:44.9841561Z ##[endgroup]
+2022-03-16T07:26:44.9842458Z ##[group]Fetching the repository
+2022-03-16T07:26:44.9853531Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --progress --no-recurse-submodules --depth=1 origin +6cfd6ede11f20980d2dfb887647f38f52ab36376:refs/remotes/origin/main
+2022-03-16T07:26:45.3811944Z remote: Enumerating objects: 7, done.        
+2022-03-16T07:26:45.3887569Z remote: Counting objects:  14% (1/7)        
+2022-03-16T07:26:45.3887969Z remote: Counting objects:  28% (2/7)        
+2022-03-16T07:26:45.3888268Z remote: Counting objects:  42% (3/7)        
+2022-03-16T07:26:45.3888596Z remote: Counting objects:  57% (4/7)        
+2022-03-16T07:26:45.3889861Z remote: Counting objects:  71% (5/7)        
+2022-03-16T07:26:45.3890840Z remote: Counting objects:  85% (6/7)        
+2022-03-16T07:26:45.3891175Z remote: Counting objects: 100% (7/7)        
+2022-03-16T07:26:45.3891495Z remote: Counting objects: 100% (7/7), done.        
+2022-03-16T07:26:45.3891843Z remote: Compressing objects:  20% (1/5)        
+2022-03-16T07:26:45.3892170Z remote: Compressing objects:  40% (2/5)        
+2022-03-16T07:26:45.3892471Z remote: Compressing objects:  60% (3/5)        
+2022-03-16T07:26:45.3892786Z remote: Compressing objects:  80% (4/5)        
+2022-03-16T07:26:45.3893088Z remote: Compressing objects: 100% (5/5)        
+2022-03-16T07:26:45.3894066Z remote: Compressing objects: 100% (5/5), done.        
+2022-03-16T07:26:45.3895583Z remote: Total 7 (delta 0), reused 0 (delta 0), pack-reused 0        
+2022-03-16T07:26:45.3949184Z From https://github.com/Emnmer1/Dev-Ex-Machita
+2022-03-16T07:26:45.3949812Z  * [new ref]         6cfd6ede11f20980d2dfb887647f38f52ab36376 -> origin/main
+2022-03-16T07:26:45.3988890Z ##[endgroup]
+2022-03-16T07:26:45.3989468Z ##[group]Determining the checkout info
+2022-03-16T07:26:45.3990839Z ##[endgroup]
+2022-03-16T07:26:45.3991291Z ##[group]Checking out the ref
+2022-03-16T07:26:45.3997362Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2022-03-16T07:26:45.4058045Z Switched to a new branch 'main'
+2022-03-16T07:26:45.4062172Z branch 'main' set up to track 'origin/main'.
+2022-03-16T07:26:45.4066897Z ##[endgroup]
+2022-03-16T07:26:45.4122803Z [command]/usr/bin/git log -1 --format='%H'
+2022-03-16T07:26:45.4159832Z '6cfd6ede11f20980d2dfb887647f38f52ab36376'
+2022-03-16T07:26:45.4547133Z ##[group]Run echo Hello, world!
+2022-03-16T07:26:45.4547556Z [36;1mecho Hello, world![0m
+2022-03-16T07:26:45.4618283Z shell: /usr/bin/bash -e {0}
+2022-03-16T07:26:45.4618656Z ##[endgroup]
+2022-03-16T07:26:45.4942490Z Hello, world!
+2022-03-16T07:26:45.4980990Z ##[group]Run echo Add other actions to build,
+2022-03-16T07:26:45.4981388Z [36;1mecho Add other actions to build,[0m
+2022-03-16T07:26:45.4981710Z [36;1mecho test, and deploy your project.[0m
+2022-03-16T07:26:45.5046968Z shell: /usr/bin/bash -e {0}
+2022-03-16T07:26:45.5047519Z ##[endgroup]
+2022-03-16T07:26:45.5141988Z Add other actions to build,
+2022-03-16T07:26:45.5142316Z test, and deploy your project.
+2022-03-16T07:26:45.5217922Z Post job cleanup.
+2022-03-16T07:26:45.6824234Z [command]/usr/bin/git version
+2022-03-16T07:26:45.6881128Z git version 2.35.1
+2022-03-16T07:26:45.6941774Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2022-03-16T07:26:45.7009967Z [command]/usr/bin/git submodule foreach --recursive git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :
+2022-03-16T07:26:45.7318360Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2022-03-16T07:26:45.7349878Z http.https://github.com/.extraheader
+2022-03-16T07:26:45.7409888Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2022-03-16T07:26:45.7465935Z [command]/usr/bin/git submodule foreach --recursive git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :
+2022-03-16T07:26:45.7971646Z Cleaning up orphan processes
