@@ -6,8 +6,11 @@ import { ResolvedUpdateFileInfo } from "../main"
 import { getChannelFilename, newBaseUrl, newUrlFromBase } from "../util"
 import { parseUpdateInfo, Provider, ProviderRuntimeOptions, resolveFiles } from "./Provider"
 
-const hrefRegExp = /\/tag\/v?([^/]+)$/
+const hrefRegExp = /\/tag\/([^/]+)$/
 
+interface GithubUpdateInfo extends UpdateInfo {
+  tag: string
+}
 export abstract class BaseGitHubProvider<T extends UpdateInfo> extends Provider<T> {
   // so, we don't need to parse port (because node http doesn't support host as url does)
   protected readonly baseUrl: URL
@@ -28,16 +31,16 @@ export abstract class BaseGitHubProvider<T extends UpdateInfo> extends Provider<
   protected computeGithubBasePath(result: string): string {
     // https://github.com/electron-userland/electron-builder/issues/1903#issuecomment-320881211
     const host = this.options.host
-    return host != null && host !== "github.com" && host !== "api.github.com" ? `/api/v3${result}` : result
+    return host !== null && host !== "github.com" && host !== "api.github.com" ? `/api/v3${result}` : result
   }
 }
 
-export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
+export class GitHubProvider extends BaseGitHubProvider<GithubUpdateInfo> {
   constructor(protected readonly options: GithubOptions, private readonly updater: AppUpdater, runtimeOptions: ProviderRuntimeOptions) {
     super(options, "github.com", runtimeOptions)
   }
 
-  async getLatestVersion(): Promise<UpdateInfo> {
+  async getLatestVersion(): Promise<GithubUpdateInfo> {
     const cancellationToken = new CancellationToken()
 
     const feedXml: string = (await this.httpRequest(
@@ -51,16 +54,43 @@ export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
     const feed = parseXml(feedXml)
     // noinspection TypeScriptValidateJSTypes
     let latestRelease = feed.element("entry", false, `No published versions on GitHub`)
-    let version: string | null
+    let tag: string | null = null
     try {
       if (this.updater.allowPrerelease) {
-        // noinspection TypeScriptValidateJSTypes
-        version = hrefRegExp.exec(latestRelease.element("link").attribute("href"))![1]
-      } else {
-        version = await this.getLatestVersionString(cancellationToken)
+        const currentChannel = this.updater?.channel || String(semver.prerelease(this.updater.currentVersion)?.[0]) || null
         for (const element of feed.getElements("entry")) {
           // noinspection TypeScriptValidateJSTypes
-          if (hrefRegExp.exec(element.element("link").attribute("href"))![1] === version) {
+          const hrefElement = hrefRegExp.exec(element.element("link").attribute("href"))!
+
+          // If this is null then something is wrong and skip this release
+          if (hrefElement === null) continue
+
+          // This Release's Tag
+          const hrefTag = hrefElement[1]
+          //Get Channel from this release's tag
+          const hrefChannel = semver.prerelease(hrefTag)?.[0] || null
+
+          const shouldFetchVersion = !currentChannel || ["alpha", "beta"].includes(currentChannel)
+          const isCustomChannel = !["alpha", "beta"].includes(String(hrefChannel))
+          // Allow moving from alpha to beta but not down
+          const channelMismatch = currentChannel === "beta" && hrefChannel === "alpha"
+
+          if (shouldFetchVersion && !isCustomChannel && !channelMismatch) {
+            tag = hrefTag
+            break
+          }
+
+          const isNextPreRelease = hrefChannel && hrefChannel === currentChannel
+          if (isNextPreRelease) {
+            tag = hrefTag
+            break
+          }
+        }
+      } else {
+        tag = await this.getLatestTagName(cancellationToken)
+        for (const element of feed.getElements("entry")) {
+          // noinspection TypeScriptValidateJSTypes
+          if (hrefRegExp.exec(element.element("link").attribute("href"))![1] === tag) {
             latestRelease = element
             break
           }
@@ -70,21 +100,37 @@ export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
       throw newError(`Cannot parse releases feed: ${e.stack || e.message},\nXML:\n${feedXml}`, "ERR_UPDATER_INVALID_RELEASE_FEED")
     }
 
-    if (version == null) {
+    if (tag == null) {
       throw newError(`No published versions on GitHub`, "ERR_UPDATER_NO_PUBLISHED_VERSIONS")
     }
 
-    const channelFile = getChannelFilename(this.getDefaultChannelName())
-    const channelFileUrl = newUrlFromBase(this.getBaseDownloadPath(version, channelFile), this.baseUrl)
-    const requestOptions = this.createRequestOptions(channelFileUrl)
     let rawData: string
-    try {
-      rawData = (await this.executor.request(requestOptions, cancellationToken))!
-    } catch (e) {
-      if (!this.updater.allowPrerelease && e instanceof HttpError && e.statusCode === 404) {
-        throw newError(`Cannot find ${channelFile} in the latest release artifacts (${channelFileUrl}): ${e.stack || e.message}`, "ERR_UPDATER_CHANNEL_FILE_NOT_FOUND")
+    let channelFile = ""
+    let channelFileUrl: any = ""
+    const fetchData = async (channelName: string) => {
+      channelFile = getChannelFilename(channelName)
+      channelFileUrl = newUrlFromBase(this.getBaseDownloadPath(String(tag), channelFile), this.baseUrl)
+      const requestOptions = this.createRequestOptions(channelFileUrl)
+      try {
+        return (await this.executor.request(requestOptions, cancellationToken))!
+      } catch (e) {
+        if (e instanceof HttpError && e.statusCode === 404) {
+          throw newError(`Cannot find ${channelFile} in the latest release artifacts (${channelFileUrl}): ${e.stack || e.message}`, "ERR_UPDATER_CHANNEL_FILE_NOT_FOUND")
+        }
+        throw e
       }
-      throw e
+    }
+
+    try {
+      const channel = this.updater.allowPrerelease ? this.getCustomChannelName(String(semver.prerelease(tag)?.[0] || "latest")) : this.getDefaultChannelName()
+      rawData = await fetchData(channel)
+    } catch (e) {
+      if (this.updater.allowPrerelease) {
+        // Allow fallback to `latest.yml`
+        rawData = await fetchData(this.getDefaultChannelName())
+      } else {
+        throw e
+      }
     }
 
     const result = parseUpdateInfo(rawData, channelFile, channelFileUrl)
@@ -95,10 +141,13 @@ export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
     if (result.releaseNotes == null) {
       result.releaseNotes = computeReleaseNotes(this.updater.currentVersion, this.updater.fullChangelog, feed, latestRelease)
     }
-    return result
+    return {
+      tag: tag,
+      ...result,
+    }
   }
 
-  private async getLatestVersionString(cancellationToken: CancellationToken): Promise<string | null> {
+  private async getLatestTagName(cancellationToken: CancellationToken): Promise<string | null> {
     const options = this.options
     // do not use API for GitHub to avoid limit, only for custom host or GitHub Enterprise
     const url =
@@ -112,7 +161,7 @@ export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
       }
 
       const releaseInfo: GithubReleaseInfo = JSON.parse(rawData)
-      return releaseInfo.tag_name.startsWith("v") ? releaseInfo.tag_name.substring(1) : releaseInfo.tag_name
+      return releaseInfo.tag_name
     } catch (e) {
       throw newError(`Unable to find latest version on GitHub (${url}), please ensure a production release exists: ${e.stack || e.message}`, "ERR_UPDATER_LATEST_VERSION_NOT_FOUND")
     }
@@ -122,13 +171,13 @@ export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
     return `/${this.options.owner}/${this.options.repo}/releases`
   }
 
-  resolveFiles(updateInfo: UpdateInfo): Array<ResolvedUpdateFileInfo> {
+  resolveFiles(updateInfo: GithubUpdateInfo): Array<ResolvedUpdateFileInfo> {
     // still replace space to - due to backward compatibility
-    return resolveFiles(updateInfo, this.baseUrl, p => this.getBaseDownloadPath(updateInfo.version, p.replace(/ /g, "-")))
+    return resolveFiles(updateInfo, this.baseUrl, p => this.getBaseDownloadPath(updateInfo.tag, p.replace(/ /g, "-")))
   }
 
-  private getBaseDownloadPath(version: string, fileName: string): string {
-    return `${this.basePath}/download/${this.options.vPrefixedTagName === false ? "" : "v"}${version}/${fileName}`
+  private getBaseDownloadPath(tag: string, fileName: string): string {
+    return `${this.basePath}/download/${tag}/${fileName}`
   }
 }
 

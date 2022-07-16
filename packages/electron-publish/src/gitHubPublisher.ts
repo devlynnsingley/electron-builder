@@ -31,7 +31,7 @@ export class GitHubPublisher extends HttpPublisher {
 
   private readonly token: string
 
-  readonly providerName = "GitHub"
+  readonly providerName = "github"
 
   private readonly releaseType: "draft" | "prerelease" | "release"
 
@@ -182,6 +182,7 @@ export class GitHubPublisher extends HttpPublisher {
       .doApiRequest(
         configureRequestOptions(
           {
+            protocol: parsedUrl.protocol,
             hostname: parsedUrl.hostname,
             path: parsedUrl.path,
             method: "POST",
@@ -197,7 +198,7 @@ export class GitHubPublisher extends HttpPublisher {
         requestProcessor
       )
       .catch(e => {
-        if (e.statusCode === 422 && e.description != null && e.description.errors != null && e.description.errors[0].code === "already_exists") {
+        if (this.doesErrorMeanAlreadyExists(e)) {
           return this.overwriteArtifact(fileName, release).then(() => this.doUploadFile(attemptNumber, parsedUrl, fileName, dataLength, requestProcessor, release))
         }
 
@@ -214,10 +215,19 @@ export class GitHubPublisher extends HttpPublisher {
       })
   }
 
+  private doesErrorMeanAlreadyExists(e: any) {
+    if (!e.description) {
+      return false
+    }
+    const desc = e.description
+    const descIncludesAlreadyExists =
+      (desc.includes("errors") && desc.includes("already_exists")) || (desc.errors && desc.errors.length >= 1 && desc.errors[0].code === "already_exists")
+    return e.statusCode === 422 && descIncludesAlreadyExists
+  }
+
   private createRelease() {
     return this.githubRequest<Release>(`/repos/${this.info.owner}/${this.info.repo}/releases`, this.token, {
       tag_name: this.tag,
-      name: this.version,
       draft: this.releaseType === "draft",
       prerelease: this.releaseType === "prerelease",
     })
@@ -263,6 +273,7 @@ export class GitHubPublisher extends HttpPublisher {
       httpExecutor.request(
         configureRequestOptions(
           {
+            protocol: baseUrl.protocol,
             hostname: baseUrl.hostname,
             port: baseUrl.port as any,
             path: this.info.host != null && this.info.host !== "github.com" ? `/api/v3${path.startsWith("/") ? path : `/${path}`}` : path,

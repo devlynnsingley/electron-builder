@@ -2,6 +2,18 @@ import { createFromBuffer } from "chromium-pickle-js"
 import { close, open, read, readFile, Stats } from "fs-extra"
 import * as path from "path"
 
+export interface ReadAsarHeader {
+  readonly header: string
+  readonly size: number
+}
+
+export interface NodeIntegrity {
+  algorithm: "SHA256"
+  hash: string
+  blockSize: number
+  blocks: Array<string>
+}
+
 /** @internal */
 export class Node {
   // we don't use Map because later it will be stringified
@@ -16,9 +28,10 @@ export class Node {
   executable?: boolean
 
   link?: string
+
+  integrity?: NodeIntegrity
 }
 
-/** @internal */
 export class AsarFilesystem {
   private offset = 0
 
@@ -66,13 +79,16 @@ export class AsarFilesystem {
     return result
   }
 
-  addFileNode(file: string, dirNode: Node, size: number, unpacked: boolean, stat: Stats): Node {
+  addFileNode(file: string, dirNode: Node, size: number, unpacked: boolean, stat: Stats, integrity?: NodeIntegrity): Node {
     if (size > 4294967295) {
       throw new Error(`${file}: file size cannot be larger than 4.2GB`)
     }
 
     const node = new Node()
     node.size = size
+    if (integrity) {
+      node.integrity = integrity
+    }
     if (unpacked) {
       node.unpacked = true
     } else {
@@ -114,7 +130,7 @@ export class AsarFilesystem {
   }
 }
 
-export async function readAsar(archive: string): Promise<AsarFilesystem> {
+export async function readAsarHeader(archive: string): Promise<ReadAsarHeader> {
   const fd = await open(archive, "r")
   let size: number
   let headerBuf
@@ -135,7 +151,11 @@ export async function readAsar(archive: string): Promise<AsarFilesystem> {
   }
 
   const headerPickle = createFromBuffer(headerBuf)
-  const header = headerPickle.createIterator().readString()
+  return { header: headerPickle.createIterator().readString(), size }
+}
+
+export async function readAsar(archive: string): Promise<AsarFilesystem> {
+  const { header, size } = await readAsarHeader(archive)
   return new AsarFilesystem(archive, JSON.parse(header), size)
 }
 

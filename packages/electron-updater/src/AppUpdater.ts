@@ -1,8 +1,7 @@
 import { AllPublishOptions, asArray, CancellationToken, newError, PublishConfiguration, UpdateInfo, UUID, DownloadOptions, CancellationError } from "builder-util-runtime"
 import { randomBytes } from "crypto"
 import { EventEmitter } from "events"
-import { outputFile } from "fs-extra"
-import { mkdir, readFile, rename, unlink } from "fs/promises"
+import { mkdir, outputFile, readFile, rename, unlink } from "fs-extra"
 import { OutgoingHttpHeaders } from "http"
 import { load } from "js-yaml"
 import { Lazy } from "lazy-val"
@@ -52,6 +51,17 @@ export abstract class AppUpdater extends EventEmitter {
   allowDowngrade = false
 
   /**
+   * Web installer files might not have signature verification, this switch prevents to load them unless it is needed.
+   *
+   * Currently false to prevent breaking the current API, but it should be changed to default true at some point that
+   * breaking changes are allowed.
+   *
+   * @default false
+   */
+
+  disableWebInstaller = false
+
+  /**
    * The current application version.
    */
   readonly currentVersion: SemVer
@@ -90,6 +100,15 @@ export abstract class AppUpdater extends EventEmitter {
    *  The request headers.
    */
   requestHeaders: OutgoingHttpHeaders | null = null
+
+  /**
+   *  Shortcut for explicitly adding auth tokens to request headers
+   */
+  addAuthHeader(token: string) {
+    this.requestHeaders = Object.assign({}, this.requestHeaders, {
+      authorization: token,
+    })
+  }
 
   protected _logger: Logger = console
 
@@ -205,7 +224,11 @@ export abstract class AppUpdater extends EventEmitter {
   /**
    * Asks the server whether there is an update.
    */
-  checkForUpdates(): Promise<UpdateCheckResult> {
+  checkForUpdates(): Promise<UpdateCheckResult | null> {
+    if (!this.isUpdaterActive()) {
+      return Promise.resolve(null)
+    }
+
     let checkForUpdatesPromise = this.checkForUpdatesPromise
     if (checkForUpdatesPromise != null) {
       this._logger.info("Checking for update (already in progress)")
@@ -240,20 +263,15 @@ export abstract class AppUpdater extends EventEmitter {
 
   // noinspection JSUnusedGlobalSymbols
   checkForUpdatesAndNotify(downloadNotification?: DownloadNotification): Promise<UpdateCheckResult | null> {
-    if (!this.isUpdaterActive()) {
-      return Promise.resolve(null)
-    }
-
     return this.checkForUpdates().then(it => {
-      const downloadPromise = it.downloadPromise
-      if (downloadPromise == null) {
+      if (!it?.downloadPromise) {
         if (this._logger.debug != null) {
           this._logger.debug("checkForUpdatesAndNotify called, downloadPromise is null")
         }
         return it
       }
 
-      void downloadPromise.then(() => {
+      void it.downloadPromise.then(() => {
         const notificationContent = AppUpdater.formatDownloadNotification(it.updateInfo.version, this.app.name, downloadNotification)
         new (require("electron").Notification)(notificationContent).show()
       })
@@ -421,7 +439,7 @@ export abstract class AppUpdater extends EventEmitter {
       if (!(e instanceof CancellationError)) {
         try {
           this.dispatchError(e)
-        } catch (nestedError) {
+        } catch (nestedError: any) {
           this._logger.warn(`Cannot dispatch error event: ${nestedError.stack || nestedError}`)
         }
       }
@@ -434,10 +452,11 @@ export abstract class AppUpdater extends EventEmitter {
         updateInfoAndProvider,
         requestHeaders: this.computeRequestHeaders(updateInfoAndProvider.provider),
         cancellationToken,
+        disableWebInstaller: this.disableWebInstaller,
       }).catch(e => {
         throw errorHandler(e)
       })
-    } catch (e) {
+    } catch (e: any) {
       return Promise.reject(errorHandler(e))
     }
   }
@@ -494,7 +513,7 @@ export abstract class AppUpdater extends EventEmitter {
       } else {
         this._logger.warn(`Staging user id file exists, but content was invalid: ${id}`)
       }
-    } catch (e) {
+    } catch (e: any) {
       if (e.code !== "ENOENT") {
         this._logger.warn(`Couldn't read staging user ID, creating a blank one: ${e}`)
       }
@@ -573,7 +592,7 @@ export abstract class AppUpdater extends EventEmitter {
       // NodeJS URL doesn't decode automatically
       const urlPath = decodeURIComponent(taskOptions.fileInfo.url.pathname)
       if (urlPath.endsWith(`.${taskOptions.fileExtension}`)) {
-        return path.posix.basename(urlPath)
+        return path.basename(urlPath)
       } else {
         // url like /latest, generate name
         return `update.${taskOptions.fileExtension}`
@@ -635,6 +654,7 @@ export interface DownloadUpdateOptions {
   readonly updateInfoAndProvider: UpdateInfoAndProvider
   readonly requestHeaders: OutgoingHttpHeaders
   readonly cancellationToken: CancellationToken
+  readonly disableWebInstaller?: boolean
 }
 
 function hasPrereleaseComponents(version: SemVer) {

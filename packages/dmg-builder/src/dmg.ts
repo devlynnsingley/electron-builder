@@ -3,7 +3,7 @@ import { findIdentity, isSignAllowed } from "app-builder-lib/out/codeSign/macCod
 import MacPackager from "app-builder-lib/out/macPackager"
 import { createBlockmap } from "app-builder-lib/out/targets/differentialUpdateInfoBuilder"
 import { executeAppBuilderAsJson } from "app-builder-lib/out/util/appBuilder"
-import { sanitizeFileName } from "app-builder-lib/out/util/sanitizeFileName"
+import { sanitizeFileName } from "app-builder-lib/out/util/filename"
 import { Arch, AsyncTaskManager, exec, getArchSuffix, InvalidConfigurationError, isEmptyOrSpaces, log, spawn, retry } from "builder-util"
 import { CancellationToken } from "builder-util-runtime"
 import { copyDir, copyFile, exists, statOrNull } from "builder-util/out/fs"
@@ -297,11 +297,17 @@ async function customizeDmg(volumePath: string, specification: DmgOptions, packa
   const asyncTaskManager = new AsyncTaskManager(packager.info.cancellationToken)
   env.iconLocations = await computeDmgEntries(specification, volumePath, packager, asyncTaskManager)
   await asyncTaskManager.awaitTasks()
-
-  await exec(process.env.PYTHON_PATH || "/usr/bin/python", [path.join(getDmgVendorPath(), "dmgbuild/core.py")], {
-    cwd: getDmgVendorPath(),
-    env,
-  })
+  const executePython = async (execName: string) => {
+    await exec(process.env.PYTHON_PATH || `/usr/bin/${execName}`, [path.join(getDmgVendorPath(), "dmgbuild/core.py")], {
+      cwd: getDmgVendorPath(),
+      env,
+    })
+  }
+  try {
+    await executePython("python3")
+  } catch (error) {
+    await executePython("python")
+  }
   return packager.packagerOptions.effectiveOptionComputed == null || !(await packager.packagerOptions.effectiveOptionComputed({ volumePath, specification, packager }))
 }
 

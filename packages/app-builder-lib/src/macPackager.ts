@@ -127,6 +127,8 @@ export default class MacPackager extends PlatformPackager<MacConfiguration> {
           arm64AppPath: path.join(arm64AppOutPath, appFile),
           outAppPath: path.join(appOutDir, appFile),
           force: true,
+          mergeASARs: platformSpecificBuildOptions.mergeASARs ?? true,
+          singleArchFiles: platformSpecificBuildOptions.singleArchFiles,
         })
         await fs.rm(x64AppOutDir, { recursive: true, force: true })
         await fs.rm(arm64AppOutPath, { recursive: true, force: true })
@@ -241,7 +243,7 @@ export default class MacPackager extends PlatformPackager<MacConfiguration> {
     let binaries = options.binaries || undefined
     if (binaries) {
       // Accept absolute paths for external binaries, else resolve relative paths from the artifact's app Contents path.
-      const userDefinedBinaries = await Promise.all(
+      binaries = await Promise.all(
         binaries.map(async destination => {
           if (await statOrNull(destination)) {
             return destination
@@ -249,9 +251,7 @@ export default class MacPackager extends PlatformPackager<MacConfiguration> {
           return path.resolve(appPath, destination)
         })
       )
-      // Insert at front to prioritize signing. We still sort by depth next
-      binaries = userDefinedBinaries.concat(binaries)
-      log.info("Signing addtional user-defined binaries: " + JSON.stringify(userDefinedBinaries, null, 1))
+      log.info("Signing addtional user-defined binaries: " + JSON.stringify(binaries, null, 1))
     }
 
     const signOptions: any = {
@@ -396,7 +396,7 @@ export default class MacPackager extends PlatformPackager<MacConfiguration> {
       if (oldIcon != null) {
         await unlinkIfExists(path.join(resourcesPath, oldIcon))
       }
-      const iconFileName = `${appFilename}.icns`
+      const iconFileName = "icon.icns"
       appPlist.CFBundleIconFile = iconFileName
       await copyFile(icon, path.join(resourcesPath, iconFileName))
     }
@@ -453,7 +453,7 @@ export default class MacPackager extends PlatformPackager<MacConfiguration> {
 
 function getCertificateTypes(isMas: boolean, isDevelopment: boolean): CertType[] {
   if (isDevelopment) {
-    return ["Mac Developer", "Apple Development"]
+    return isMas ? ["Mac Developer", "Apple Development"] : ["Developer ID Application"]
   }
-  return isMas ? ["3rd Party Mac Developer Application", "Apple Distribution"] : ["Developer ID Application"]
+  return isMas ? ["Apple Distribution"] : ["Developer ID Application"]
 }

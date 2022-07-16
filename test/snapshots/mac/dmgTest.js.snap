@@ -35,7 +35,7 @@ exports[`background color 3`] = `
 Object {
   "CFBundleDisplayName": "BackgroundColor",
   "CFBundleExecutable": "BackgroundColor",
-  "CFBundleIconFile": "BackgroundColor.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "BackgroundColor",
@@ -94,7 +94,7 @@ exports[`bundleShortVersion 2`] = `
 Object {
   "CFBundleDisplayName": "BundleShortVersion",
   "CFBundleExecutable": "BundleShortVersion",
-  "CFBundleIconFile": "BundleShortVersion.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "BundleShortVersion",
@@ -135,7 +135,14 @@ Object {
       "file": "Test App ßW-1.1.0-mac.zip",
       "safeArtifactName": "TestApp-1.1.0-mac.zip",
       "updateInfo": Object {
-        "blockMapSize": "@blockMapSize",
+        "sha512": "@sha512",
+        "size": "@size",
+      },
+    },
+    Object {
+      "file": "Test App ßW-1.1.0-mac.zip.blockmap",
+      "safeArtifactName": "Test App ßW-1.1.0-mac.zip.blockmap",
+      "updateInfo": Object {
         "sha512": "@sha512",
         "size": "@size",
       },
@@ -148,7 +155,7 @@ exports[`custom background - new way 2`] = `
 Object {
   "CFBundleDisplayName": "Test App ßW",
   "CFBundleExecutable": "Test App ßW",
-  "CFBundleIconFile": "Test App ßW.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "Test App ßW",
@@ -189,7 +196,14 @@ Object {
       "file": "Test App ßW-1.1.0-mac.zip",
       "safeArtifactName": "TestApp-1.1.0-mac.zip",
       "updateInfo": Object {
-        "blockMapSize": "@blockMapSize",
+        "sha512": "@sha512",
+        "size": "@size",
+      },
+    },
+    Object {
+      "file": "Test App ßW-1.1.0-mac.zip.blockmap",
+      "safeArtifactName": "Test App ßW-1.1.0-mac.zip.blockmap",
+      "updateInfo": Object {
         "sha512": "@sha512",
         "size": "@size",
       },
@@ -202,7 +216,7 @@ exports[`disable dmg icon (light), bundleVersion 2`] = `
 Object {
   "CFBundleDisplayName": "Test App ßW",
   "CFBundleExecutable": "Test App ßW",
-  "CFBundleIconFile": "Test App ßW.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "Test App ßW",
@@ -261,7 +275,7 @@ exports[`dmg 2`] = `
 Object {
   "CFBundleDisplayName": "DefaultDmg",
   "CFBundleExecutable": "DefaultDmg",
-  "CFBundleIconFile": "DefaultDmg.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "DefaultDmg",
@@ -380,7 +394,7 @@ exports[`license buttons config 3`] = `
 Object {
   "CFBundleDisplayName": "Test App ßW",
   "CFBundleExecutable": "Test App ßW",
-  "CFBundleIconFile": "Test App ßW.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "Test App ßW",
@@ -441,7 +455,7 @@ exports[`license en 2`] = `
 Object {
   "CFBundleDisplayName": "Test App ßW",
   "CFBundleExecutable": "Test App ßW",
-  "CFBundleIconFile": "Test App ßW.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "Test App ßW",
@@ -502,7 +516,7 @@ exports[`license ja 2`] = `
 Object {
   "CFBundleDisplayName": "Test App ßW",
   "CFBundleExecutable": "Test App ßW",
-  "CFBundleIconFile": "Test App ßW.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "Test App ßW",
@@ -563,7 +577,7 @@ exports[`license rtf 2`] = `
 Object {
   "CFBundleDisplayName": "Test App ßW",
   "CFBundleExecutable": "Test App ßW",
-  "CFBundleIconFile": "Test App ßW.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "Test App ßW",
@@ -624,7 +638,7 @@ exports[`multi language license 2`] = `
 Object {
   "CFBundleDisplayName": "Test App ßW",
   "CFBundleExecutable": "Test App ßW",
-  "CFBundleIconFile": "Test App ßW.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "Test App ßW",
@@ -707,7 +721,7 @@ exports[`no Applications link 3`] = `
 Object {
   "CFBundleDisplayName": "NoApplicationsLink",
   "CFBundleExecutable": "NoApplicationsLink",
-  "CFBundleIconFile": "NoApplicationsLink.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "NoApplicationsLink",
@@ -766,7 +780,7 @@ exports[`no background 2`] = `
 Object {
   "CFBundleDisplayName": "NoBackground",
   "CFBundleExecutable": "NoBackground",
-  "CFBundleIconFile": "NoBackground.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "NoBackground",
@@ -881,7 +895,14 @@ Object {
       "file": "Test App ßW-1.1.0-mac.zip",
       "safeArtifactName": "TestApp-1.1.0-mac.zip",
       "updateInfo": Object {
-        "blockMapSize": "@blockMapSize",
+        "sha512": "@sha512",
+        "size": "@size",
+      },
+    },
+    Object {
+      "file": "Test App ßW-1.1.0-mac.zip.blockmap",
+      "safeArtifactName": "Test App ßW-1.1.0-mac.zip.blockmap",
+      "updateInfo": Object {
         "sha512": "@sha512",
         "size": "@size",
       },
@@ -894,7 +915,7 @@ exports[`retina background as 2 png 2`] = `
 Object {
   "CFBundleDisplayName": "Test App ßW",
   "CFBundleExecutable": "Test App ßW",
-  "CFBundleIconFile": "Test App ßW.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "Test App ßW",
@@ -955,7 +976,7 @@ exports[`unset dmg icon 2`] = `
 Object {
   "CFBundleDisplayName": "Test ß No Volume Icon",
   "CFBundleExecutable": "Test ß No Volume Icon",
-  "CFBundleIconFile": "Test ß No Volume Icon.icns",
+  "CFBundleIconFile": "icon.icns",
   "CFBundleIdentifier": "org.electron-builder.testApp",
   "CFBundleInfoDictionaryVersion": "6.0",
   "CFBundleName": "Test ß No Volume Icon",

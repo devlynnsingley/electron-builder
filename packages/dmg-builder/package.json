@@ -1,6 +1,6 @@
 {
 	"name": "dmg-builder",
-	"version": "22.11.10",
+	"version": "23.0.2",
 	"main": "out/dmgUtil.js",
 	"author": "Vladimir Krivosheev",
 	"license": "MIT",
@@ -28,8 +28,8 @@
 		"dmg-license": "^1.0.9"
 	},
 	"devDependencies": {
-		"@types/fs-extra": "9.0.12",
-		"@types/js-yaml": "4.0.2",
+		"@types/fs-extra": "9.0.13",
+		"@types/js-yaml": "4.0.3",
 		"temp-file": "3.4.0"
 	},
 	"typings": "./out/dmg.d.ts"

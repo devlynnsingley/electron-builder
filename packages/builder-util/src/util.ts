@@ -2,7 +2,8 @@ import { path7za } from "7zip-bin"
 import { appBuilderPath } from "app-builder-bin"
 import { safeStringifyJson } from "builder-util-runtime"
 import * as chalk from "chalk"
-import { ChildProcess, execFile, ExecFileOptions, spawn as _spawn, SpawnOptions } from "child_process"
+import { ChildProcess, execFile, ExecFileOptions, SpawnOptions } from "child_process"
+import { spawn as _spawn } from "cross-spawn"
 import { createHash } from "crypto"
 import _debug from "debug"
 import { dump } from "js-yaml"
@@ -259,7 +260,7 @@ export class ExecError extends Error {
   alreadyLogged = false
 
   constructor(command: string, readonly exitCode: number, out: string, errorOut: string, code = "ERR_ELECTRON_BUILDER_CANNOT_EXECUTE") {
-    super(`${command} exited with code ${code}${formatOut(out, "Output")}${formatOut(errorOut, "Error output")}`)
+    super(`${command} process failed ${code}${formatOut(String(exitCode), "Exit code")}${formatOut(out, "Output")}${formatOut(errorOut, "Error output")}`)
     ;(this as NodeJS.ErrnoException).code = code
   }
 }

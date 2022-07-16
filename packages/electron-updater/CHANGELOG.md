@@ -1,5 +1,192 @@
 ## 4.3.0
 
+## 5.0.0
+
+### Major Changes
+
+- [#6556](https://github.com/electron-userland/electron-builder/pull/6556) [`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222) Thanks [@mmaietta](https://github.com/mmaietta)! - Breaking changes
+  Removing Bintray support since it was sunset. Ref: https://jfrog.com/blog/into-the-sunset-bintray-jcenter-gocenter-and-chartcenter/
+  Fail-fast for windows signature verification failures. Adding `-LiteralPath` to update file path to disregard injected wildcards
+  Force strip path separators for backslashes on Windows during update process
+  Force authentication for local mac squirrel update server
+
+  Fixes:
+  fix(nsis): Adding --INPUTCHARSET to makensis. (#4898 #6232 #6259)
+
+  Adding additional details to error console logging
+
+* [#6575](https://github.com/electron-userland/electron-builder/pull/6575) [`5e381c55`](https://github.com/electron-userland/electron-builder/commit/5e381c556d12ce185bb7ea720380509c1ddc5cf7) Thanks [@devinbinnie](https://github.com/devinbinnie)! - fix: Allow disabling of webinstaller files to avoid confusion with actual installers
+
+- [#6576](https://github.com/electron-userland/electron-builder/pull/6576) [`53467c72`](https://github.com/electron-userland/electron-builder/commit/53467c724dacc11fc270cebaba22f8cf84dff24f) Thanks [@devinbinnie](https://github.com/devinbinnie)! - fix: Update certificate validation on Windows to check full DN
+
+### Minor Changes
+
+- [#6505](https://github.com/electron-userland/electron-builder/pull/6505) [`1de0adbd`](https://github.com/electron-userland/electron-builder/commit/1de0adbd615b3b3d26faeb6a449f522355b36041) Thanks [@KenCorma](https://github.com/KenCorma)! - feat(updater): Add Channel Support for Github with PreRelease
+
+### Patch Changes
+
+- [#6594](https://github.com/electron-userland/electron-builder/pull/6594) [`edc4b030`](https://github.com/electron-userland/electron-builder/commit/edc4b030703ee3929b31608a496798635169f5b1) Thanks [@mmaietta](https://github.com/mmaietta)! - fix(updater): Replacing fs/promises with fs-extra to support legacy versions of Electron that use node 12 and below. Fixes: #6000
+
+* [#6587](https://github.com/electron-userland/electron-builder/pull/6587) [`8746f910`](https://github.com/electron-userland/electron-builder/commit/8746f910d136fb9b531e688d0a646eeb9528adc6) Thanks [@devinbinnie](https://github.com/devinbinnie)! - fix: fixes for server auth for MacUpdater
+
+- [#6589](https://github.com/electron-userland/electron-builder/pull/6589) [`633ee5dc`](https://github.com/electron-userland/electron-builder/commit/633ee5dc292174ed1486c53af93320f20cf02169) Thanks [@devinbinnie](https://github.com/devinbinnie)! - - Removed backtick escaping for Windows code signing as it is unnecessary for Powershell and can cause the script to attempt to access the wrong file
+  - Updated the proxy filename to be more secure (512-bit string)
+
+* [#6616](https://github.com/electron-userland/electron-builder/pull/6616) [`86e6d150`](https://github.com/electron-userland/electron-builder/commit/86e6d1509f9b9c76c559e9c3a12b7a1595fe3ac4) Thanks [@mmaietta](https://github.com/mmaietta)! - fix(updater): Remove checks for app-update.yml when auto-updates are not supported
+
+* Updated dependencies [[`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222)]:
+  - builder-util-runtime@9.0.0
+
+## 5.0.0-alpha.4
+
+### Patch Changes
+
+- [#6616](https://github.com/electron-userland/electron-builder/pull/6616) [`86e6d150`](https://github.com/electron-userland/electron-builder/commit/86e6d1509f9b9c76c559e9c3a12b7a1595fe3ac4) Thanks [@mmaietta](https://github.com/mmaietta)! - fix(updater): Remove checks for app-update.yml when auto-updates are not supported
+
+## 5.0.0-alpha.3
+
+### Patch Changes
+
+- [#6594](https://github.com/electron-userland/electron-builder/pull/6594) [`edc4b030`](https://github.com/electron-userland/electron-builder/commit/edc4b030703ee3929b31608a496798635169f5b1) Thanks [@mmaietta](https://github.com/mmaietta)! - fix(updater): Replacing fs/promises with fs-extra to support legacy versions of Electron that use node 12 and below. Fixes: #6000
+
+* [#6589](https://github.com/electron-userland/electron-builder/pull/6589) [`633ee5dc`](https://github.com/electron-userland/electron-builder/commit/633ee5dc292174ed1486c53af93320f20cf02169) Thanks [@devinbinnie](https://github.com/devinbinnie)! - - Removed backtick escaping for Windows code signing as it is unnecessary for Powershell and can cause the script to attempt to access the wrong file
+  - Updated the proxy filename to be more secure (512-bit string)
+
+## 5.0.0-alpha.2
+
+### Minor Changes
+
+- [#6505](https://github.com/electron-userland/electron-builder/pull/6505) [`1de0adbd`](https://github.com/electron-userland/electron-builder/commit/1de0adbd615b3b3d26faeb6a449f522355b36041) Thanks [@KenCorma](https://github.com/KenCorma)! - feat(updater): Add Channel Support for Github with PreRelease
+
+### Patch Changes
+
+- [#6587](https://github.com/electron-userland/electron-builder/pull/6587) [`8746f910`](https://github.com/electron-userland/electron-builder/commit/8746f910d136fb9b531e688d0a646eeb9528adc6) Thanks [@devinbinnie](https://github.com/devinbinnie)! - fix: fixes for server auth for MacUpdater
+
+## 5.0.0-alpha.1
+
+### Major Changes
+
+- [#6575](https://github.com/electron-userland/electron-builder/pull/6575) [`5e381c55`](https://github.com/electron-userland/electron-builder/commit/5e381c556d12ce185bb7ea720380509c1ddc5cf7) Thanks [@devinbinnie](https://github.com/devinbinnie)! - fix: Allow disabling of webinstaller files to avoid confusion with actual installers
+
+* [#6576](https://github.com/electron-userland/electron-builder/pull/6576) [`53467c72`](https://github.com/electron-userland/electron-builder/commit/53467c724dacc11fc270cebaba22f8cf84dff24f) Thanks [@devinbinnie](https://github.com/devinbinnie)! - fix: Update certificate validation on Windows to check full DN
+
+## 5.0.0-alpha.0
+
+### Major Changes
+
+- [#6556](https://github.com/electron-userland/electron-builder/pull/6556) [`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222) Thanks [@mmaietta](https://github.com/mmaietta)! - Breaking changes
+  Removing Bintray support since it was sunset. Ref: https://jfrog.com/blog/into-the-sunset-bintray-jcenter-gocenter-and-chartcenter/
+  Fail-fast for windows signature verification failures. Adding `-LiteralPath` to update file path to disregard injected wildcards
+  Force strip path separators for backslashes on Windows during update process
+  Force authentication for local mac squirrel update server
+
+  Fixes:
+  fix(nsis): Adding --INPUTCHARSET to makensis. (#4898 #6232 #6259)
+
+  Adding additional details to error console logging
+
+### Patch Changes
+
+- Updated dependencies [[`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222)]:
+  - builder-util-runtime@9.0.0-alpha.0
+
+## 4.6.5
+
+### Patch Changes
+
+- [#6381](https://github.com/electron-userland/electron-builder/pull/6381) [`828fcd37`](https://github.com/electron-userland/electron-builder/commit/828fcd378c2df28763893ef68f92d5b1a72fead3) Thanks [@zhanjinfeng](https://github.com/zhanjinfeng)! - fix: use `uname -a` to get arch instead of 'process.arch' in mac silicon
+
+## 4.6.4
+
+### Patch Changes
+
+- [#6450](https://github.com/electron-userland/electron-builder/pull/6450) [`661a6522`](https://github.com/electron-userland/electron-builder/commit/661a6522520e9ea59549cb7e18986fcfb58e873a) Thanks [@robertpatrick](https://github.com/robertpatrick)! - fix(nsis): fix per-machine installs to properly elevate during silent install/updates
+
+## 4.6.3
+
+### Patch Changes
+
+- [#6395](https://github.com/electron-userland/electron-builder/pull/6395) [`3c38af42`](https://github.com/electron-userland/electron-builder/commit/3c38af4288908abeea1be1f245d9e3db6c62b227) Thanks [@Nokel81](https://github.com/Nokel81)! - Emulate electron.autoUpdater's event lifecycle for AppImageUpdater
+
+## 4.6.2
+
+### Patch Changes
+
+- [#6390](https://github.com/electron-userland/electron-builder/pull/6390) [`a5e8073e`](https://github.com/electron-userland/electron-builder/commit/a5e8073e21b1ff791905cdb4ab011a724533d8c1) Thanks [@Nokel81](https://github.com/Nokel81)! - Fix updating only on demand not working on macOS
+
+- Updated dependencies [[`66ca625f`](https://github.com/electron-userland/electron-builder/commit/66ca625f892329fd7bedf52fddc6659ec83b7cd3)]:
+  - builder-util-runtime@8.9.2
+
+## 4.6.1
+
+### Patch Changes
+
+- Updated dependencies [[`54ee4e72`](https://github.com/electron-userland/electron-builder/commit/54ee4e72c5db859b9a00104179786567a0e977ff)]:
+  - builder-util-runtime@8.9.1
+
+## 4.6.0
+
+### Minor Changes
+
+- [#6228](https://github.com/electron-userland/electron-builder/pull/6228) [`a9453216`](https://github.com/electron-userland/electron-builder/commit/a94532164709a545c0f6551fdc336dbc5377bda8) Thanks [@mmaietta](https://github.com/mmaietta)! - feat: adding Bitbucket publisher and autoupdater
+
+### Patch Changes
+
+- Updated dependencies [[`a9453216`](https://github.com/electron-userland/electron-builder/commit/a94532164709a545c0f6551fdc336dbc5377bda8)]:
+  - builder-util-runtime@8.9.0
+
+## 4.5.2
+
+### Patch Changes
+
+- [#6212](https://github.com/electron-userland/electron-builder/pull/6212) [`0c21cd69`](https://github.com/electron-userland/electron-builder/commit/0c21cd69663a7eebe0687eaba9eea851cc2fea9e) Thanks [@johnnyopao](https://github.com/johnnyopao)! - Fix upgrade flows on intel mac when both x64 and arm64 versions published
+
+## 4.5.1
+
+### Patch Changes
+
+- Updated dependencies [[`7f933d00`](https://github.com/electron-userland/electron-builder/commit/7f933d0004a0a5f808a2a1c71dca7362cab2728e)]:
+  - builder-util-runtime@8.8.1
+
+## 4.5.0
+
+### Minor Changes
+
+- [#6167](https://github.com/electron-userland/electron-builder/pull/6167) [`f45110cb`](https://github.com/electron-userland/electron-builder/commit/f45110cbf66572d5748d21fc24dc26cabd06f35f) Thanks [@mmaietta](https://github.com/mmaietta)! - feat: Adding Keygen as an official publisher/updater for electron-builder (#6167)
+
+### Patch Changes
+
+- Updated dependencies [[`f45110cb`](https://github.com/electron-userland/electron-builder/commit/f45110cbf66572d5748d21fc24dc26cabd06f35f)]:
+  - builder-util-runtime@8.8.0
+
+## 4.4.6
+
+### Patch Changes
+
+- a3c72b24: fix(electron-updater): workaround vite's process.env.\* replacement
+- ca0e8454: fix(electron-updater): `null` object error when MacUpdater attempts to log the server port before it is listening
+
+## 4.4.5
+
+### Patch Changes
+
+- a3f2cd15: fix(electron-updater): default import throws error for fs and path leading to always requiring elevation
+- ae363e51: fix: removing data from error being thrown. It's unnecessary and also unnecessarily large to be passing to the console. Resolves: #6131
+
+## 4.4.4
+
+### Patch Changes
+
+- ae81dfae: fix(electron-updater): small cleanup and add more debug logging for MacUpdater to investigate #6120
+
+## 4.4.3
+
+### Patch Changes
+
+- a4eae34f: Synchronizing CLI and package.json versions. Updating auto-publish values + changeset generation to be more frictionless
+- Updated dependencies [a4eae34f]
+  - builder-util-runtime@8.7.10
+
 ## 4.4.2
 
 ### Patch Changes
