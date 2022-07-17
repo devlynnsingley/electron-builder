@@ -3,14 +3,15 @@ import { findIdentity, isSignAllowed } from "app-builder-lib/out/codeSign/macCod
 import MacPackager from "app-builder-lib/out/macPackager"
 import { createBlockmap } from "app-builder-lib/out/targets/differentialUpdateInfoBuilder"
 import { executeAppBuilderAsJson } from "app-builder-lib/out/util/appBuilder"
-import { Arch, AsyncTaskManager, exec, InvalidConfigurationError, isEmptyOrSpaces, log, spawn } from "builder-util"
+import { Arch, AsyncTaskManager, exec, getArchSuffix, InvalidConfigurationError, isEmptyOrSpaces, log, spawn } from "builder-util"
 import { CancellationToken } from "builder-util-runtime"
 import { copyDir, copyFile, exists, statOrNull } from "builder-util/out/fs"
 import { stat } from "fs-extra"
 import * as path from "path"
 import sanitizeFileName from "sanitize-filename"
+import { TmpDir } from "temp-file"
 import { addLicenseToDmg } from "./dmgLicense"
-import { attachAndExecute, computeBackground, detach, getDmgVendorPath, transformBackgroundFileIfNeed } from "./dmgUtil"
+import { attachAndExecute, computeBackground, detach, getDmgVendorPath } from "./dmgUtil"
 
 export class DmgTarget extends Target {
   readonly options: DmgOptions = this.packager.config.dmg || Object.create(null)
@@ -22,7 +23,7 @@ export class DmgTarget extends Target {
   async build(appPath: string, arch: Arch) {
     const packager = this.packager
     // tslint:disable-next-line:no-invalid-template-strings
-    const artifactName = packager.expandArtifactNamePattern(packager.config.dmg, "dmg", null, "${productName}-" + (packager.platformSpecificBuildOptions.bundleShortVersion || "${version}") + ".${ext}")
+    const artifactName = packager.expandArtifactNamePattern(this.options, "dmg", arch, "${productName}-" + (packager.platformSpecificBuildOptions.bundleShortVersion || "${version}") + "-${arch}.${ext}", true)
     const artifactPath = path.join(this.outDir, artifactName)
     await packager.info.callArtifactBuildStarted({
       targetPresentableName: "DMG",
@@ -30,7 +31,7 @@ export class DmgTarget extends Target {
       arch,
     })
 
-    const volumeName = sanitizeFileName(this.computeVolumeName(this.options.title))
+    const volumeName = sanitizeFileName(this.computeVolumeName(arch, this.options.title))
 
     const tempDmg = await createStageDmg(await packager.getTempFile(".dmg"), appPath, volumeName)
 
@@ -57,7 +58,7 @@ export class DmgTarget extends Target {
       args.push("-imagekey", `zlib-level=${process.env.ELECTRON_BUILDER_COMPRESSION_LEVEL || "9"}`)
     }
     await spawn("hdiutil", addLogLevel(args))
-    if (this.options.internetEnabled) {
+    if (this.options.internetEnabled && parseInt(require("os").release().split(".")[0], 10) < 19) {
       await exec("hdiutil", addLogLevel(["internet-enable"]).concat(artifactPath))
     }
 
@@ -114,15 +115,17 @@ export class DmgTarget extends Target {
     await exec("codesign", args)
   }
 
-  computeVolumeName(custom?: string | null): string {
+  computeVolumeName(arch: Arch, custom?: string | null): string {
     const appInfo = this.packager.appInfo
     const shortVersion = this.packager.platformSpecificBuildOptions.bundleShortVersion || appInfo.version
+    const archString = getArchSuffix(arch)
 
     if (custom == null) {
-      return `${appInfo.productFilename} ${shortVersion}`
+      return `${appInfo.productFilename} ${shortVersion}${archString}`
     }
 
     return custom
+      .replace(/\${arch}/g, archString)
       .replace(/\${shortVersion}/g, shortVersion)
       .replace(/\${version}/g, appInfo.version)
       .replace(/\${name}/g, appInfo.name)
@@ -317,4 +320,19 @@ async function computeDmgEntries(specification: DmgOptions, volumePath: string, 
     }
   }
   return result
+}
+
+async function transformBackgroundFileIfNeed(file: string, tmpDir: TmpDir): Promise<string> {
+  if (file.endsWith(".tiff") || file.endsWith(".TIFF")) {
+    return file
+  }
+
+  const retinaFile = file.replace(/\.([a-z]+)$/, "@2x.$1")
+  if (await exists(retinaFile)) {
+    const tiffFile = await tmpDir.getTempFile({suffix: ".tiff"})
+    await exec("tiffutil", ["-cathidpicheck", file, retinaFile, "-out", tiffFile])
+    return tiffFile
+  }
+
+  return file
 }

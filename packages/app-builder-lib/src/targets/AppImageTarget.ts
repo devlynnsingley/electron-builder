@@ -19,7 +19,7 @@ export default class AppImageTarget extends Target {
   constructor(ignored: string, private readonly packager: LinuxPackager, private readonly helper: LinuxTargetHelper, readonly outDir: string) {
     super("appImage")
 
-    this.desktopEntry = new Lazy<string>(() => helper.computeDesktopEntry(this.options, "AppRun", {
+    this.desktopEntry = new Lazy<string>(() => helper.computeDesktopEntry(this.options, "AppRun --no-sandbox %U", {
       "X-AppImage-Version": `${packager.appInfo.buildVersion}`,
     }))
   }
@@ -46,7 +46,7 @@ export default class AppImageTarget extends Target {
       createStageDir(this, packager, arch),
     ])
     const license = c[3]
-    const stageDir = c[4]
+    const stageDir = c[4]!!
 
     const publishConfig = c[2]
     if (publishConfig != null) {
