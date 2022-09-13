@@ -1,0 +1,2 @@
+Resource,Asset Type,Project Id,Folders,Organization,Policy,Explanation
+"//cloudresourcemanager.googleapis.com/projects/red-abstraction-350109","cloudresourcemanager.Project","red-abstraction-350109",,,"{bindings:[{role:roles/owner,members:[user:emnmer1@gmail.com]}]}",
