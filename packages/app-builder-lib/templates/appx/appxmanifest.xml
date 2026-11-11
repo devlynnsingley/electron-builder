@@ -5,10 +5,9 @@
    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
    xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
-  <!-- use single quotes to avoid double quotes escaping in the publisher value  -->
   <Identity Name="${identityName}"
     ProcessorArchitecture="${arch}"
-    Publisher='${publisher}'
+    Publisher="${publisher}"
     Version="${version}" />
   <Properties>
     <DisplayName>${displayName}</DisplayName>
@@ -22,9 +21,7 @@
   <Dependencies>
     <TargetDeviceFamily Name="Windows.Desktop" MinVersion="${minVersion}" MaxVersionTested="${maxVersionTested}" />
   </Dependencies>
-  <Capabilities>
-    <rescap:Capability Name="runFullTrust"/>
-  </Capabilities>
+  ${capabilities}
   <Applications>
     <Application Id="${applicationId}" Executable="${executable}" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
@@ -33,8 +30,8 @@
        Square150x150Logo="${square150x150Logo}"
        Square44x44Logo="${square44x44Logo}"
        Description="${description}">
-        ${lockScreen}
         ${defaultTile}
+        ${lockScreen}
         ${splashScreen}
       </uap:VisualElements>
       ${extensions}

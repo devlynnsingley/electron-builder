@@ -26,6 +26,14 @@ StrCpy $appExe "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
     FindWindow $0 "#32770" "" $hwndparent $0
     GetDlgItem $0 $0 1000
     SendMessage $0 ${WM_SETTEXT} 0 "STR:$(installing)"
+
+    # SpiderBanner hides the InstFiles page while keyboard focus is still on one of its controls. Pressing Tab then makes the
+    # dialog manager search forever for a control it can no longer see, and the installer stops responding (#7526).
+    # Move focus to the banner's (visible) status text. This also lets screen readers announce it.
+    SendMessage $hwndparent ${WM_NEXTDLGCTL} $0 1
+
+    StrCpy $1 $hwndparent
+		System::Call 'user32::ShutdownBlockReasonCreate(${SYSTYPE_PTR}r1, w "$(installing)")'
   ${endif}
   !insertmacro CHECK_APP_RUNNING
 !else
@@ -46,6 +54,21 @@ ${if} $isTryToKeepShortcuts == "true"
   ${endIf}
 ${endif}
 
+# nsis-web: the app package is copied, verified and, if needed, downloaded before the installed version is uninstalled, so a package
+# that is refused or cannot be downloaded leaves that version in place. Empty for other installers.
+!insertmacro prepareWebPackage
+
+# nsis-web: the app may have been started again while the package was downloaded, check again (see CHECK_APP_RUNNING_AGAIN)
+!ifdef WEB_PACKAGE_PREPARED
+  !ifdef ONE_CLICK
+    !insertmacro CHECK_APP_RUNNING_AGAIN
+  !else
+    ${ifNot} ${UAC_IsInnerInstance}
+      !insertmacro CHECK_APP_RUNNING_AGAIN
+    ${endif}
+  !endif
+!endif
+
 !insertmacro uninstallOldVersion SHELL_CONTEXT
 !insertmacro handleUninstallResult SHELL_CONTEXT
 
@@ -61,6 +84,20 @@ SetOutPath $INSTDIR
 !endif
 
 !insertmacro installApplicationFiles
+
+# Self-identify the install method for the auto-updater (parity with the Linux `package-type` marker).
+# This is the only install-time signal that differs between nsis and nsis-web — the app payload itself is
+# byte-identical (both targets share one app archive). electron-updater reads this to default
+# disableWebInstaller=false for nsis-web installs.
+FileOpen $0 "$INSTDIR\resources\package-type" w
+!ifdef APP_PACKAGE_URL
+  FileWrite $0 "nsis-web"
+!else
+  FileWrite $0 "nsis"
+!endif
+FileClose $0
+ClearErrors
+
 !insertmacro registryAddInstallInfo
 !insertmacro addStartMenuLink $keepShortcuts
 !insertmacro addDesktopLink $keepShortcuts

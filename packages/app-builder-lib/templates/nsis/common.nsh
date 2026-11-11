@@ -3,15 +3,46 @@
 
 BrandingText "${PRODUCT_NAME} ${VERSION}"
 ShowInstDetails nevershow
-SpaceTexts none
 !ifdef BUILD_UNINSTALLER
   ShowUninstDetails nevershow
 !endif
 FileBufSize 64
-Name "${PRODUCT_NAME}"
+
+# Allows for a product name to display properly if it has an ampersand
+# Doesn't affect anything if there is no double ampersand
+!searchreplace DoubleAmpersand "${PRODUCT_NAME}" "&" "&&"
+Name "${PRODUCT_NAME}" "${DoubleAmpersand}"
 
 !define APP_EXECUTABLE_FILENAME "${PRODUCT_FILENAME}.exe"
 !define UNINSTALL_FILENAME "Uninstall ${PRODUCT_FILENAME}.exe"
+
+!macro setSpaceRequired SECTION_ID
+  !ifdef APP_64_UNPACKED_SIZE
+    !ifdef APP_32_UNPACKED_SIZE
+      !ifdef APP_ARM64_UNPACKED_SIZE
+        ${if} ${IsNativeARM64}
+          SectionSetSize ${SECTION_ID} ${APP_ARM64_UNPACKED_SIZE}
+        ${elseif} ${IsNativeAMD64}
+          SectionSetSize ${SECTION_ID} ${APP_64_UNPACKED_SIZE}
+        ${else}
+          SectionSetSize ${SECTION_ID} ${APP_32_UNPACKED_SIZE}
+        ${endif}
+      !else
+        ${if} ${RunningX64}
+          SectionSetSize ${SECTION_ID} ${APP_64_UNPACKED_SIZE}
+        ${else}
+          SectionSetSize ${SECTION_ID} ${APP_32_UNPACKED_SIZE}
+        ${endif}
+      !endif
+    !else
+      SectionSetSize ${SECTION_ID} ${APP_64_UNPACKED_SIZE}
+    !endif
+  !else
+    !ifdef APP_32_UNPACKED_SIZE
+      SectionSetSize ${SECTION_ID} ${APP_32_UNPACKED_SIZE}
+    !endif
+  !endif
+!macroend
 
 !macro check64BitAndSetRegView
   # https://github.com/electron-userland/electron-builder/issues/2420
@@ -19,7 +50,7 @@ Name "${PRODUCT_NAME}"
   ${OrIf} ${IsWinME}
   ${OrIf} ${IsWinXP}
   ${OrIf} ${IsWinVista}
-    MessageBox MB_OK "$(win7Required)"
+    MessageBox MB_OK "$(win7Required)" /SD IDOK
     Quit
   ${EndIf}
 
@@ -36,7 +67,7 @@ Name "${PRODUCT_NAME}"
         SetRegView 64
       ${Else}
         !ifndef APP_32
-          MessageBox MB_OK|MB_ICONEXCLAMATION "$(x64WinRequired)"
+          MessageBox MB_OK|MB_ICONEXCLAMATION "$(x64WinRequired)" /SD IDOK
           Quit
         !endif
       ${EndIf}
@@ -98,4 +129,19 @@ Name "${PRODUCT_NAME}"
   ${endif}
 
   ${StdUtils.ExecShellAsUser} $0 "$launchLink" "open" "$startAppArgs"
+!macroend
+
+!define LogSet "!insertmacro LogSetMacro"
+!macro LogSetMacro SETTING
+  !ifdef ENABLE_LOGGING_ELECTRON_BUILDER
+    SetOutPath $INSTDIR
+    LogSet ${SETTING}
+  !endif
+!macroend
+
+!define LogText "!insertmacro LogTextMacroEB"
+!macro LogTextMacroEB INPUT_TEXT
+  !ifdef ENABLE_LOGGING_ELECTRON_BUILDER
+    LogText ${INPUT_TEXT}
+  !endif
 !macroend

@@ -1,22 +1,9 @@
+import { createPublisher } from "app-builder-lib/internal"
 import { Arch } from "builder-util"
 import { CancellationToken, HttpError, S3Options, SpacesOptions } from "builder-util-runtime"
-import { createPublisher } from "app-builder-lib/out/publish/PublishManager"
-import { PublishContext } from "electron-publish"
-import { GitHubPublisher } from "electron-publish/out/gitHubPublisher"
-import { isCI as isCi } from "ci-info"
+import { BitbucketPublisher, GitHubPublisher, PublishContext } from "electron-publish"
 import * as path from "path"
-
-if (isCi && process.platform === "win32") {
-  fit("Skip ArtifactPublisherTest suite on Windows CI", () => {
-    console.warn("[SKIP] Skip ArtifactPublisherTest suite on Windows CI")
-  })
-}
-
-if (process.env.ELECTRON_BUILDER_OFFLINE === "true") {
-  fit("Skip ArtifactPublisherTest suite — ELECTRON_BUILDER_OFFLINE is defined", () => {
-    console.warn("[SKIP] Skip ArtifactPublisherTest suite — ELECTRON_BUILDER_OFFLINE is defined")
-  })
-}
+import { ExpectStatic } from "vitest"
 
 function getRandomInt(min: number, max: number) {
   return Math.floor(Math.random() * (max - min + 1)) + min
@@ -28,17 +15,17 @@ function versionNumber() {
 
 //noinspection SpellCheckingInspection
 const token = Buffer.from("Y2Y5NDdhZDJhYzJlMzg1OGNiNzQzYzcwOWZhNGI0OTk2NWQ4ZDg3Yg==", "base64").toString()
-const iconPath = path.join(__dirname, "..", "fixtures", "test-app", "build", "icon.icns")
+const iconPath = path.join(import.meta.dirname, "..", "fixtures", "test-app", "build", "icon.icns")
 
 const publishContext: PublishContext = {
   cancellationToken: new CancellationToken(),
   progress: null,
 }
 
-test("GitHub unauthorized", async () => {
+test("GitHub unauthorized", async ({ expect }) => {
   try {
     await new GitHubPublisher(publishContext, { provider: "github", owner: "actperepo", repo: "ecb2", token: "incorrect token" }, versionNumber())._release.value
-  } catch (e) {
+  } catch (e: any) {
     expect(e.message).toMatch(/(Bad credentials|Unauthorized|API rate limit exceeded)/)
     return
   }
@@ -55,11 +42,11 @@ function isApiRateError(e: Error): boolean {
   }
 }
 
-function testAndIgnoreApiRate(name: string, testFunction: () => Promise<any>) {
-  test.skip(name, async () => {
+function testAndIgnoreApiRate(name: string, testFunction: (expect: ExpectStatic) => Promise<any>) {
+  test.skip(name, async ({ expect }) => {
     try {
-      await testFunction()
-    } catch (e) {
+      await testFunction(expect)
+    } catch (e: any) {
       if (isApiRateError(e)) {
         console.warn(e.description.message)
       } else {
@@ -80,30 +67,32 @@ testAndIgnoreApiRate("GitHub upload", async () => {
   }
 })
 
-if (process.env.AWS_ACCESS_KEY_ID != null && process.env.AWS_SECRET_ACCESS_KEY != null) {
-  test("S3 upload", async () => {
-    const publisher = createPublisher(publishContext, "0.0.1", { provider: "s3", bucket: "electron-builder-test" } as S3Options, {}, {} as any)!!
-    await publisher.upload({ file: iconPath, arch: Arch.x64 })
-    // test overwrite
-    await publisher.upload({ file: iconPath, arch: Arch.x64 })
-  })
-}
+test.ifEnv(process.env.AWS_ACCESS_KEY_ID != null && process.env.AWS_SECRET_ACCESS_KEY != null)("S3 upload", async () => {
+  const publisher = await createPublisher(
+    publishContext,
+    "0.0.1",
+    { provider: "s3", bucket: "electron-builder-test", awsCredentials: { source: "env" } } as S3Options,
+    {},
+    {} as any
+  )
+  await publisher!.upload({ file: iconPath, arch: Arch.x64 })
+  // test overwrite
+  await publisher!.upload({ file: iconPath, arch: Arch.x64 })
+})
 
-if (process.env.DO_KEY_ID != null && process.env.DO_SECRET_KEY != null) {
-  test("DO upload", async () => {
-    const configuration: SpacesOptions = {
-      provider: "spaces",
-      name: "electron-builder-test",
-      region: "nyc3",
-    }
-    const publisher = createPublisher(publishContext, "0.0.1", configuration, {}, {} as any)!!
-    await publisher.upload({ file: iconPath, arch: Arch.x64 })
-    // test overwrite
-    await publisher.upload({ file: iconPath, arch: Arch.x64 })
-  })
-}
+test.ifEnv(process.env.DO_KEY_ID != null && process.env.DO_SECRET_KEY != null)("DO upload", async () => {
+  const configuration: SpacesOptions = {
+    provider: "spaces",
+    name: "electron-builder-test",
+    region: "nyc3",
+  }
+  const publisher = await createPublisher(publishContext, "0.0.1", configuration, {}, {} as any)
+  await publisher!.upload({ file: iconPath, arch: Arch.x64 })
+  // test overwrite
+  await publisher!.upload({ file: iconPath, arch: Arch.x64 })
+})
 
-testAndIgnoreApiRate("prerelease", async () => {
+testAndIgnoreApiRate("prerelease", async expect => {
   const publisher = new GitHubPublisher(publishContext, { provider: "github", owner: "actperepo", repo: "ecb2", token, releaseType: "prerelease" }, versionNumber())
   try {
     await publisher.upload({ file: iconPath, arch: Arch.x64 })
@@ -125,4 +114,119 @@ testAndIgnoreApiRate("GitHub upload org", async () => {
   } finally {
     await publisher.deleteRelease()
   }
+})
+
+// Temporarily clear env vars so auth-selection unit tests are deterministic regardless of the ambient environment.
+function withoutEnv<T>(keys: Array<string>, fn: () => T): T {
+  const saved = keys.map(key => [key, process.env[key]] as const)
+  for (const key of keys) {
+    delete process.env[key]
+  }
+  try {
+    return fn()
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) {
+        delete process.env[key]
+      } else {
+        process.env[key] = value
+      }
+    }
+  }
+}
+
+// With a username, the token is sent via HTTP Basic auth (Bitbucket username + app password, or Atlassian email + API token).
+test("Bitbucket auth - username selects HTTP Basic auth", ({ expect }) => {
+  const publisher = new BitbucketPublisher(publishContext, {
+    provider: "bitbucket",
+    owner: "test-owner",
+    slug: "test-repo",
+    username: "user@example.com",
+    token: "api-token-123",
+  })
+  expect((publisher as any).auth).toBe(`Basic ${Buffer.from("user@example.com:api-token-123").toString("base64")}`)
+})
+
+// Without a username, the token is treated as a repository/project/workspace access token and sent via Bearer auth (issue #9995).
+test("Bitbucket auth - no username selects Bearer auth (access token)", ({ expect }) => {
+  withoutEnv(["BITBUCKET_USERNAME"], () => {
+    const publisher = new BitbucketPublisher(publishContext, {
+      provider: "bitbucket",
+      owner: "test-owner",
+      slug: "test-repo",
+      token: "access-token-123",
+    })
+    expect((publisher as any).auth).toBe("Bearer access-token-123")
+  })
+})
+
+// A missing token is a hard configuration error.
+test("Bitbucket auth - missing token throws InvalidConfigurationError", ({ expect }) => {
+  withoutEnv(["BITBUCKET_TOKEN"], () => {
+    expect(
+      () =>
+        new BitbucketPublisher(publishContext, {
+          provider: "bitbucket",
+          owner: "test-owner",
+          slug: "test-repo",
+        })
+    ).toThrow(/Bitbucket token is not set.*https:\/\/www\.electron\.build\/docs\/publish#bitbucket/)
+  })
+})
+
+// The static header builders trim the token and apply the correct scheme.
+test("Bitbucket auth - convertAppPassword and convertAccessToken build the expected headers", ({ expect }) => {
+  expect(BitbucketPublisher.convertAppPassword("alice", " secret ")).toBe(`Basic ${Buffer.from("alice:secret").toString("base64")}`)
+  expect(BitbucketPublisher.convertAccessToken(" access-token-123 ")).toBe("Bearer access-token-123")
+})
+
+const mockRelease = { id: 1, tag_name: "v1.0.0", draft: true, prerelease: false, published_at: "", upload_url: "https://uploads.github.com/{?name}" }
+
+function mockGithubRequest(publisher: GitHubPublisher): { getData: () => any } {
+  let capturedData: any = null
+  ;(publisher as any).githubRequest = (_path: string, _token: string, data: any) => {
+    capturedData = data
+    return Promise.resolve(mockRelease)
+  }
+  return { getData: () => capturedData }
+}
+
+test("GitHub createRelease sends body when releaseBody is set", async ({ expect }) => {
+  const publisher = new GitHubPublisher(publishContext, { provider: "github", owner: "test", repo: "test", token: "__test__" }, "1.0.0", {}, "## Changes\n\n- Feature A")
+  const mock = mockGithubRequest(publisher)
+
+  await (publisher as any).createRelease()
+
+  expect(mock.getData().body).toBe("## Changes\n\n- Feature A")
+  expect(mock.getData().tag_name).toBe("v1.0.0")
+  expect(mock.getData().draft).toBe(true)
+})
+
+test("GitHub createRelease omits body when releaseBody is not set", async ({ expect }) => {
+  const publisher = new GitHubPublisher(publishContext, { provider: "github", owner: "test", repo: "test", token: "__test__" }, "1.0.0")
+  const mock = mockGithubRequest(publisher)
+
+  await (publisher as any).createRelease()
+
+  expect(mock.getData().body).toBeUndefined()
+  expect(mock.getData().name).toBe("1.0.0")
+})
+
+test("GitHub createRelease uses releaseName when set", async ({ expect }) => {
+  const publisher = new GitHubPublisher(publishContext, { provider: "github", owner: "test", repo: "test", token: "__test__" }, "1.0.0", {}, null, "My App v1.0.0")
+  const mock = mockGithubRequest(publisher)
+
+  await (publisher as any).createRelease()
+
+  expect(mock.getData().name).toBe("My App v1.0.0")
+})
+
+test("GitHub createRelease truncates body exceeding limit", async ({ expect }) => {
+  const longBody = "x".repeat(130000)
+  const publisher = new GitHubPublisher(publishContext, { provider: "github", owner: "test", repo: "test", token: "__test__" }, "1.0.0", {}, longBody)
+  const mock = mockGithubRequest(publisher)
+
+  await (publisher as any).createRelease()
+
+  expect(mock.getData().body.length).toBe(100000)
 })

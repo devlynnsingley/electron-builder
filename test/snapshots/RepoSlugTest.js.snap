@@ -1,15 +1,17 @@
-// Jest Snapshot v1, https://goo.gl/fbAQLP
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
 exports[`repo slug from APPVEYOR 1`] = `
-Object {
+{
   "project": "travis-build",
+  "source": "APPVEYOR_REPO_NAME",
   "user": "travis-ci",
 }
 `;
 
 exports[`repo slug from TRAVIS_REPO_SLUG 1`] = `
-Object {
+{
   "project": "travis-build",
+  "source": "TRAVIS_REPO_SLUG",
   "user": "travis-ci",
 }
 `;

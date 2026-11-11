@@ -1,11 +1,18 @@
-import { addValue, Arch, archFromString, deepAssign } from "builder-util"
-import * as chalk from "chalk"
 import { build as _build, Configuration, DIR_TARGET, Packager, PackagerOptions, Platform } from "app-builder-lib"
-import { PublishOptions } from "electron-publish"
+import { addTargetsForPlatform } from "app-builder-lib/internal"
+import { Arch, archFromString, log } from "builder-util"
+import { deepAssign } from "builder-util-runtime"
+import chalk from "chalk"
+import type { PublishOptions } from "electron-publish"
+import { hideBin } from "yargs/helpers"
 import * as yargs from "yargs"
 
 export function createYargs(): yargs.Argv<unknown> {
-  return yargs.parserConfiguration({
+  // In ESM, yargs.default is the factory function; call it to create an instance.
+  // In CJS, yargs.default is already an Argv singleton.
+  const factory = (yargs as any).default ?? yargs
+  const instance = typeof factory?.parserConfiguration === "function" ? factory : factory(hideBin(process.argv))
+  return (instance as unknown as yargs.Argv<unknown>).parserConfiguration({
     "camel-case-expansion": false,
   })
 }
@@ -52,30 +59,12 @@ export function normalizeOptions(args: CliOptions): BuildOptions {
       return result.length === 0 && currentIfNotSpecified ? [archFromString(process.arch)] : result
     }
 
-    let archToType = targets.get(platform)
-    if (archToType == null) {
-      archToType = new Map<Arch, Array<string>>()
-      targets.set(platform, archToType)
-    }
-
-    if (types.length === 0) {
+    addTargetsForPlatform(targets, platform, types, commonArch, archToType => {
       const defaultTargetValue = args.dir ? [DIR_TARGET] : []
       for (const arch of commonArch(args.dir === true)) {
         archToType.set(arch, defaultTargetValue)
       }
-      return
-    }
-
-    for (const type of types) {
-      const suffixPos = type.lastIndexOf(":")
-      if (suffixPos > 0) {
-        addValue(archToType, archFromString(type.substring(suffixPos + 1)), type.substring(0, suffixPos))
-      } else {
-        for (const arch of commonArch(true)) {
-          addValue(archToType, arch, type)
-        }
-      }
-    }
+    })
   }
 
   if (args.mac != null) {
@@ -129,11 +118,27 @@ export function normalizeOptions(args: CliOptions): BuildOptions {
   // https://github.com/electron-userland/electron-builder/issues/2016
   if (Array.isArray(config)) {
     const newConfig: Configuration = {}
+    // a repeated `-c.fileOptions.excludedExts=…` flag (one entry each) is one item per flag here, which deepAssign would let the last
+    // one overwrite: join them into one list, as yargs does when no config file is given
+    const excludedExts = new Map<string, Array<string>>()
     for (const configItem of config) {
       if (typeof configItem === "object") {
+        for (const section of EXCLUDED_EXTS_SECTIONS) {
+          const value = (section === "" ? configItem : configItem?.[section])?.fileOptions?.excludedExts
+          if (value != null) {
+            excludedExts.set(section, [...(excludedExts.get(section) ?? []), ...(Array.isArray(value) ? value : [value])])
+          }
+        }
         deepAssign(newConfig, configItem)
       } else if (typeof configItem === "string") {
         newConfig.extends = configItem
+      }
+    }
+    for (const [section, values] of excludedExts) {
+      const fileOptions = (section === "" ? newConfig : (newConfig as any)[section])?.fileOptions
+      // a fileOptions that is not an object is left for validateConfiguration to report
+      if (values.length > 1 && fileOptions != null && typeof fileOptions === "object" && !Array.isArray(fileOptions)) {
+        fileOptions.excludedExts = values
       }
     }
 
@@ -147,9 +152,32 @@ export function normalizeOptions(args: CliOptions): BuildOptions {
       coerceTypes(config.extraMetadata)
     }
 
-    // ability to disable code sign using -c.mac.identity=null
+    // mac.sign / mac.universal are nested option bags holding booleans and the signing identity
+    // (e.g. sign.identity, sign.hardenedRuntime, universal.mergeASARs). coerceValue recurses into the
+    // objects (so `-c.mac.sign.identity=null` disables code signing) and also handles `-c.mac.sign=null`.
     if (config.mac != null) {
-      coerceValue(config.mac, "identity")
+      coerceValue(config.mac, "sign")
+      coerceValue(config.mac, "universal")
+    }
+
+    // `-c.updateManifest=false` is the signing opt-out and arrives as the string "false"; ajv does not write a
+    // coerced value back out of an `anyOf` branch, so without this the opt-out is silently ignored and the build
+    // fails demanding a signing key. coerceValue recurses into objects, so `-c.updateManifest.signingKeyFile=...`
+    // still works. (`mas` / `masDev` are omitted on purpose - PlatformPackager never reads updateManifest there.)
+    coerceValue(config, "updateManifest")
+    for (const platform of ["mac", "win", "linux"]) {
+      const platformConfig = config[platform]
+      if (platformConfig != null && typeof platformConfig === "object") {
+        coerceValue(platformConfig, "updateManifest")
+      }
+    }
+
+    // `-c.fileOptions.excludedExts=null` arrives as the string "null", which a single-string excludedExts would read as an extension
+    for (const section of EXCLUDED_EXTS_SECTIONS) {
+      const fileOptions = (section === "" ? config : config[section])?.fileOptions
+      if (fileOptions != null && typeof fileOptions === "object" && fileOptions.excludedExts === "null") {
+        fileOptions.excludedExts = null
+      }
     }
 
     // fix Boolean type by coerceTypes
@@ -168,6 +196,9 @@ export function normalizeOptions(args: CliOptions): BuildOptions {
 
   return result as BuildOptions
 }
+
+// the configuration root ("") and the platform sections that hold `fileOptions`
+const EXCLUDED_EXTS_SECTIONS = ["", "mac", "mas", "masDev", "win", "linux"]
 
 function coerceValue(host: any, key: string): void {
   const value = host[key]
@@ -192,11 +223,35 @@ export function coerceTypes(host: any): any {
   return host
 }
 
+/**
+ * `arch: "all"` dropped ia32 in v27. The build stays green and simply produces no 32-bit artifact
+ * (plus an unexpected arm64 one), so the only evidence is a missing file in dist — nothing ties that
+ * back to the upgrade.
+ */
+function warnAboutArchAllExpansion(platforms: Array<Platform>): void {
+  if (!platforms.some(platform => platform !== Platform.MAC)) {
+    return
+  }
+  // once per process — createTargets is called per invocation, not per platform
+  log
+    .once("arch-all-expansion")
+    .warn(
+      { expandsTo: "x64, arm64", previously: "x64, ia32", solution: "request ia32 explicitly (--ia32 / Arch.ia32) with electronVersion <= 43.x if you still ship 32-bit builds" },
+      'arch "all" no longer includes ia32. Electron 44 removed Windows ia32 builds and Linux ia32 zips ended at Electron 19, so the old expansion produced broken builds on current Electron. ' +
+        "See https://www.electron.build/docs/migration/v27-build-changes#arch-all-now-expands-to-x64-and-arm64-32-bit-fails-fast-on-electron-44"
+    )
+}
+
 export function createTargets(platforms: Array<Platform>, type?: string | null, arch?: string | null): Map<Platform, Map<Arch, Array<string>>> {
   const targets = new Map<Platform, Map<Arch, Array<string>>>()
+  if (arch === "all") {
+    warnAboutArchAllExpansion(platforms)
+  }
   for (const platform of platforms) {
     const archs =
-      arch === "all" ? (platform === Platform.MAC ? [Arch.x64, Arch.arm64, Arch.universal] : [Arch.x64, Arch.ia32]) : [archFromString(arch == null ? process.arch : arch)]
+      // BREAKING: since Electron 44 removed Windows ia32 and Linux armv7l builds (and linux-ia32 zips ended at Electron 19),
+      // "all" expands to x64 + arm64 on non-mac platforms instead of x64 + ia32. Request ia32 explicitly to build it (Electron <= 43 only).
+      arch === "all" ? (platform === Platform.MAC ? [Arch.x64, Arch.arm64, Arch.universal] : [Arch.x64, Arch.arm64]) : [archFromString(arch == null ? process.arch : arch)]
     const archToType = new Map<Arch, Array<string>>()
     targets.set(platform, archToType)
 
@@ -222,19 +277,19 @@ export function configureBuildCommand(yargs: yargs.Argv): yargs.Argv {
     .option("mac", {
       group: buildGroup,
       alias: ["m", "o", "macos"],
-      description: `Build for macOS, accepts target list (see ${chalk.underline("https://goo.gl/5uHuzj")}).`,
+      description: `Build for macOS, accepts target list (see ${chalk.underline("https://www.electron.build/mac")}).`,
       type: "array",
     })
     .option("linux", {
       group: buildGroup,
       alias: "l",
-      description: `Build for Linux, accepts target list (see ${chalk.underline("https://goo.gl/4vwQad")})`,
+      description: `Build for Linux, accepts target list (see ${chalk.underline("https://www.electron.build/linux")})`,
       type: "array",
     })
     .option("win", {
       group: buildGroup,
       alias: ["w", "windows"],
-      description: `Build for Windows, accepts target list (see ${chalk.underline("https://goo.gl/jYsTEJ")})`,
+      description: `Build for Windows, accepts target list (see ${chalk.underline("https://www.electron.build/win")})`,
       type: "array",
     })
     .option("x64", {
@@ -270,7 +325,7 @@ export function configureBuildCommand(yargs: yargs.Argv): yargs.Argv {
     .option("publish", {
       group: publishGroup,
       alias: "p",
-      description: `Publish artifacts, see ${chalk.underline("https://goo.gl/tSFycD")}`,
+      description: `Publish artifacts, see ${chalk.underline("https://www.electron.build/publish")}`,
       choices: ["onTag", "onTagOrDraft", "always", "never", undefined as any],
     })
     .option("prepackaged", {
@@ -286,12 +341,14 @@ export function configureBuildCommand(yargs: yargs.Argv): yargs.Argv {
     .option("config", {
       alias: ["c"],
       group: buildGroup,
-      description: "The path to an electron-builder config. Defaults to `electron-builder.yml` (or `json`, or `json5`), see " + chalk.underline("https://goo.gl/YFRJOM"),
+      description:
+        "The path to an electron-builder config. Defaults to `electron-builder.yml` (or `json`, or `json5`, or `js`, or `ts`), see " +
+        chalk.underline("https://www.electron.build/configuration"),
     })
     .group(["help", "version"], "Other:")
     .example("electron-builder -mwl", "build for macOS, Windows and Linux")
     .example("electron-builder --linux deb tar.xz", "build deb and tar.xz for Linux")
-    .example("electron-builder --win --ia32", "build for Windows ia32")
+    .example("electron-builder --win --arm64", "build for Windows arm64")
     .example("electron-builder -c.extraMetadata.foo=bar", "set package.json property `foo` to `bar`")
     .example("electron-builder --config.nsis.unicode=false", "configure unicode options for NSIS")
 }

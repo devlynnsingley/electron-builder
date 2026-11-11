@@ -1,16 +1,38 @@
-import { Arch, AsyncTaskManager, log } from "builder-util"
-import { DIR_TARGET, Platform, Target, TargetSpecificOptions } from "./core"
-import { LinuxConfiguration } from "./options/linuxOptions"
-import { Packager } from "./packager"
-import { PlatformPackager } from "./platformPackager"
-import { RemoteBuilder } from "./remoteBuilder/RemoteBuilder"
-import AppImageTarget from "./targets/AppImageTarget"
-import FlatpakTarget from "./targets/FlatpakTarget"
-import FpmTarget from "./targets/fpm"
-import { LinuxTargetHelper } from "./targets/LinuxTargetHelper"
-import SnapTarget from "./targets/snap"
-import { createCommonTarget } from "./targets/targetFactory"
-import { sanitizeFileName } from "./util/sanitizeFileName"
+import { Arch, log } from "builder-util"
+import { sanitizeFileName } from "builder-util/internal"
+import { Nullish } from "builder-util-runtime"
+import { DIR_TARGET, Platform, Target } from "./core.js"
+import { LinuxConfiguration } from "./options/linuxOptions.js"
+import { Packager } from "./packager.js"
+import { PlatformPackager } from "./platformPackager.js"
+import AppImageTarget from "./targets/linux/appimage/AppImageTarget.js"
+import FlatpakTarget from "./targets/linux/FlatpakTarget.js"
+import FpmTarget from "./targets/linux/FpmTarget.js"
+import { LinuxTargetHelper } from "./targets/linux/LinuxTargetHelper.js"
+import SnapTarget from "./targets/linux/snap/SnapTarget.js"
+import { createCommonTarget } from "./targets/targetFactory.js"
+
+/** Desktop Entry field codes — the DE substitutes these in `Exec`, they are not literal arguments. */
+const DESKTOP_FIELD_CODE = /^%[a-zA-Z]$/
+
+/**
+ * v26 passed a field code through to the .desktop `Exec` key unquoted and skipped appending `%U`.
+ * v27 routes executableArgs through the generated `<executableName>-launcher` script, where they are
+ * single-quoted — so `%F` reaches the app as the literal string "%F" instead of the file list, and
+ * a file-handling app silently stops receiving the files it was opened with.
+ */
+function warnAboutDesktopFieldCodes(executableArgs: Array<string> | Nullish): void {
+  const fieldCodes = (executableArgs ?? []).filter(arg => DESKTOP_FIELD_CODE.test(arg))
+  if (fieldCodes.length === 0) {
+    return
+  }
+  log.warn(
+    { fieldCodes: fieldCodes.join(", "), solution: "remove the field code from executableArgs and set linux.desktop.entry.Exec if you need a custom Exec line" },
+    "linux.executableArgs contains desktop-entry field codes, which are no longer expanded. " +
+      "In v27 executableArgs are injected into the generated *-launcher script and quoted, so these reach your app as literal arguments. " +
+      "See https://www.electron.build/docs/migration/v27-runtime-changes#linux-launcher-entrypoint"
+  )
+}
 
 export class LinuxPackager extends PlatformPackager<LinuxConfiguration> {
   readonly executableName: string
@@ -18,8 +40,10 @@ export class LinuxPackager extends PlatformPackager<LinuxConfiguration> {
   constructor(info: Packager) {
     super(info, Platform.LINUX)
 
-    const executableName = this.platformSpecificBuildOptions.executableName
+    const executableName = this.platformSpecificBuildOptions.executableName ?? info.config.executableName
     this.executableName = executableName == null ? this.appInfo.sanitizedName.toLowerCase() : sanitizeFileName(executableName)
+
+    warnAboutDesktopFieldCodes(this.platformSpecificBuildOptions.executableArgs)
   }
 
   get defaultTarget(): Array<string> {
@@ -35,8 +59,6 @@ export class LinuxPackager extends PlatformPackager<LinuxConfiguration> {
       return helper
     }
 
-    let remoteBuilder: RemoteBuilder | null = null
-
     for (const name of targets) {
       if (name === DIR_TARGET) {
         continue
@@ -45,11 +67,11 @@ export class LinuxPackager extends PlatformPackager<LinuxConfiguration> {
       const targetClass: typeof AppImageTarget | typeof SnapTarget | typeof FlatpakTarget | typeof FpmTarget | null = (() => {
         switch (name) {
           case "appimage":
-            return require("./targets/AppImageTarget").default
+            return AppImageTarget
           case "snap":
-            return require("./targets/snap").default
+            return SnapTarget
           case "flatpak":
-            return require("./targets/FlatpakTarget").default
+            return FlatpakTarget
           case "deb":
           case "rpm":
           case "sh":
@@ -57,7 +79,7 @@ export class LinuxPackager extends PlatformPackager<LinuxConfiguration> {
           case "pacman":
           case "apk":
           case "p5p":
-            return require("./targets/fpm").default
+            return FpmTarget
           default:
             return null
         }
@@ -68,53 +90,9 @@ export class LinuxPackager extends PlatformPackager<LinuxConfiguration> {
           return createCommonTarget(name, outDir, this)
         }
 
-        const target = new targetClass(name, this, getHelper(), outDir)
-        if (process.platform === "win32" || process.env._REMOTE_BUILD) {
-          if (remoteBuilder == null) {
-            remoteBuilder = new RemoteBuilder(this)
-          }
-          // return remoteBuilder.buildTarget(this, arch, appOutDir, this.packager)
-          return new RemoteTarget(target, remoteBuilder)
-        }
-        return target
+        return new targetClass(name, this, getHelper(), outDir)
       })
     }
-  }
-}
-
-class RemoteTarget extends Target {
-  private buildTaskManager = new AsyncTaskManager(this.remoteBuilder.packager.info.cancellationToken)
-
-  get options(): TargetSpecificOptions | null | undefined {
-    return this.target.options
-  }
-
-  get outDir(): string {
-    return this.target.outDir
-  }
-
-  constructor(private readonly target: Target, private readonly remoteBuilder: RemoteBuilder) {
-    super(
-      target.name,
-      true /* all must be scheduled in time (so, on finishBuild RemoteBuilder will have all targets added - so, we must set isAsyncSupported to true (resolved promise is returned)) */
-    )
-  }
-
-  async finishBuild() {
-    await this.buildTaskManager.awaitTasks()
-    await this.remoteBuilder.build()
-  }
-
-  build(appOutDir: string, arch: Arch) {
-    const promise = this.doBuild(appOutDir, arch)
-    this.buildTaskManager.addTask(promise)
-    return promise
-  }
-
-  private async doBuild(appOutDir: string, arch: Arch) {
-    log.info({ target: this.target.name, arch: Arch[arch] }, "scheduling remote build")
-    await this.target.checkOptions()
-    this.remoteBuilder.scheduleBuild(this.target, arch, appOutDir)
   }
 }
 

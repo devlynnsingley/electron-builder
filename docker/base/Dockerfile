@@ -1,9 +1,16 @@
-FROM buildpack-deps:focal-curl
+# hardcoding `--platform` with a constant throws a warning during build.
+# That's OK as this image can't be built on arm64 machines due to gcc-multilib & g++-multilib only provided for x64
+FROM --platform=linux/x86_64 buildpack-deps:22.04-curl
 
-ENV DEBIAN_FRONTEND noninteractive
+ENV DEBIAN_FRONTEND=noninteractive
 
-RUN curl -L https://yarnpkg.com/latest.tar.gz | tar xvz && mv yarn-* /yarn && ln -s /yarn/bin/yarn /usr/bin/yarn
-RUN apt-get -qq update && apt-get -qq dist-upgrade && \
+RUN curl -L --fail --tlsv1.2 --proto "=https" --proto-redir "=https" \
+  -o /tmp/yarn.tar.gz https://yarnpkg.com/latest.tar.gz && \
+    tar xvz -f /tmp/yarn.tar.gz && \
+    rm -f /tmp/yarn.tar.gz && \
+    mv yarn-* /yarn && ln -s /yarn/bin/yarn /usr/bin/yarn
+
+RUN apt-get update -yqq && apt-get -qq dist-upgrade && \
   # add repo for git-lfs
   curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | bash && \
   # git ssh for using as docker image on CircleCI
@@ -12,23 +19,57 @@ RUN apt-get -qq update && apt-get -qq dist-upgrade && \
   # libsecret-1-dev is required even for prebuild keytar (https://atom.github.io/node-keytar/)
   apt-get -qq install --no-install-recommends \
         qtbase5-dev build-essential autoconf libssl-dev gcc-multilib g++-multilib \
-        lzip rpm python libcurl4 git git-lfs ssh unzip libarchive-tools \
-        libxtst6 libsecret-1-dev libopenjp2-tools \
+        lzip rpm python2 python3 libcurl4 git git-lfs ssh unzip libarchive-tools \
+        libxtst6 libsecret-1-dev libopenjp2-tools liblzo2-2 \
   && \
   # git-lfs
   git lfs install && \
   apt-get purge -y --auto-remove && rm -rf /var/lib/apt/lists/*
 
-COPY test.sh /test.sh
+# Resolves the following error due to dependency requirements
+# /root/.cache/electron-builder/winCodeSign/winCodeSign-2.6.0/linux/osslsigncode: error while loading shared libraries: libcrypto.so.1.1: cannot open shared object file: No such file or directory
+# The missing libcrypto.so.1.1 is part of libssl1.1 but Ubuntu 22.04 upgraded to libssl3, so we must install it manually.
+ARG SOURCES_LIST="/etc/apt/sources.list.d/focal_security.list"
+ARG PREFERENCES_FILE="/etc/apt/preferences.d/libssl1.1-focal"
+RUN echo "deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://security.ubuntu.com/ubuntu focal-security main" \
+  | tee "$SOURCES_LIST" \
+  && printf "Package: *\nPin: release n=focal-security\nPin-Priority: 100\n\nPackage: libssl1.1\nPin: release n=focal-security\nPin-Priority: 1001\n" \
+  | tee "$PREFERENCES_FILE" \
+  && apt-get update \
+  && apt-get install -y libssl1.1 \
+  && rm -f "$SOURCES_LIST" "$PREFERENCES_FILE" \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/*
+
+# flatpak and flatpak-builder, for the flatpak target. Ubuntu 22.04's own 1.12 and 1.2 meet its minimum, but flatpak-builder 1.4
+# and newer also handle AppStream metadata with the current SDKs, and 1.4.4 and newer meson and cmake modules, so both come from the
+# Flatpak team's PPA, whose signing key is pinned by its fingerprint:
+# the downloaded key file has to hold exactly that one key.
+# No runtime is installed: a build downloads the runtime, the SDK and the base app that it needs from the flathub remote
+# added here. It is added for root, the user this image runs as, because the flatpak target installs into the user installation.
+# elfutils and zstd are the tools flatpak-builder recommends that the image does not have yet: without eu-strip, a module of
+# flatpak.modules that builds a binary fails. fuse3 has the fusermount3 that rofiles-fuse needs, where /dev/fuse is available.
+ARG FLATPAK_PPA_FINGERPRINT="5C6D153A17C02C337EF6C663B8B9D41229DFA5F5"
+RUN curl -fsSL --tlsv1.2 --proto "=https" -o /usr/share/keyrings/flatpak-stable.asc \
+    "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${FLATPAK_PPA_FINGERPRINT}" \
+  && gpg --show-keys --with-colons /usr/share/keyrings/flatpak-stable.asc \
+  | awk -F: -v fpr="${FLATPAK_PPA_FINGERPRINT}" '$1 == "pub" { keys++ } $1 == "fpr" && first == "" { first = $10 } END { exit !(keys == 1 && first == fpr) }' \
+  && echo "deb [signed-by=/usr/share/keyrings/flatpak-stable.asc] https://ppa.launchpadcontent.net/flatpak/stable/ubuntu jammy main" \
+  | tee /etc/apt/sources.list.d/flatpak-stable.list \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends flatpak flatpak-builder fuse3 elfutils zstd \
+  && flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /project
 
 # fix error /usr/local/bundle/gems/fpm-1.5.0/lib/fpm/package/freebsd.rb:72:in `encode': "\xE2" from ASCII-8BIT to UTF-8 (Encoding::UndefinedConversionError)
 # http://jaredmarkell.com/docker-and-locales/
 # http://askubuntu.com/a/601498
-ENV LANG C.UTF-8
-ENV LANGUAGE C.UTF-8
-ENV LC_ALL C.UTF-8
+ENV LANG=C.UTF-8
+ENV LANGUAGE=C.UTF-8
+ENV LC_ALL=C.UTF-8
 
-ENV DEBUG_COLORS true
-ENV FORCE_COLOR true
+ENV DEBUG_COLORS=true
+ENV FORCE_COLOR=true

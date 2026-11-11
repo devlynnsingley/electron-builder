@@ -1,3 +1,5 @@
+!include WordFunc.nsh
+
 !macro moveFile FROM TO
   ClearErrors
   Rename `${FROM}` `${TO}`
@@ -126,7 +128,10 @@ Function handleUninstallResult
   Return
 
   ${if} $R0 != 0
+    MessageBox MB_OK|MB_ICONEXCLAMATION "$(uninstallFailed): $R0" /SD IDOK
     DetailPrint `Uninstall was not successful. Uninstaller error code: $R0.`
+    SetErrorLevel 2
+    Quit
   ${endif}
 FunctionEnd
 
@@ -156,14 +161,24 @@ Function uninstallOldVersion
     !endif
     ${if} $uninstallString == ""
       ClearErrors
-      Goto Done
+      Return
     ${endif}
   ${endif}
+
+  # a closing quote is followed by a space or the end, never by a backslash: drop the quote that an earlier installer kept from a
+  # quoted /D= argument ("C:\App"\Uninstall App.exe"), so the uninstaller path below is the full path. The first character, the opening
+  # quote, stays: a UNC path follows it with a backslash ("\\server\share\App\Uninstall App.exe")
+  StrCpy $uninstallerFileName $uninstallString 1
+  StrCpy $uninstallerFileNameTemp $uninstallString "" 1
+  ${WordReplace} $uninstallerFileNameTemp '"\' "\" "+" $uninstallerFileNameTemp
+  StrCpy $uninstallString "$uninstallerFileName$uninstallerFileNameTemp"
 
   # uninstaller should be copied out of app installation dir (because this dir will be deleted), so, extract uninstaller file name
   !insertmacro GetInQuotes $uninstallerFileName "$uninstallString"
 
   !insertmacro readReg $installationDir "$rootKey" "${INSTALL_REGISTRY_KEY}" InstallLocation
+  # a double quote is invalid in a path: drop the closing quote that an earlier installer kept from a quoted /D= argument
+  ${WordReplace} $installationDir '"' "" "+" $installationDir
   ${if} $installationDir == ""
   ${andIf} $uninstallerFileName != ""
     # https://github.com/electron-userland/electron-builder/issues/735#issuecomment-246918567
@@ -175,7 +190,7 @@ Function uninstallOldVersion
   ${if} $installationDir == ""
   ${andIf} $uninstallerFileName == ""
     ClearErrors
-    Goto Done
+    Return
   ${endif}
 
   ${if} $installMode == "CurrentUser"
@@ -206,12 +221,37 @@ Function uninstallOldVersion
   StrCpy $uninstallerFileNameTemp "$PLUGINSDIR\old-uninstaller.exe"
   !insertmacro copyFile "$uninstallerFileName" "$uninstallerFileNameTemp"
 
-  ExecWait '"$uninstallerFileNameTemp" /S /KEEP_APP_DATA $0 _?=$installationDir' $R0
-  ifErrors 0 Done
-    # the execution failed - might have been caused by some group policy restrictions
-    # we try to execute the uninstaller in place
-    ExecWait '"$uninstallerFileName" /S /KEEP_APP_DATA $0 _?=$installationDir' $R0
-  Done:
+  # Retry counter
+  StrCpy $R5 0
+
+  UninstallLoop:
+    IntOp $R5 $R5 + 1
+
+    ${if} $R5 > 5
+      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "$(uninstallFailed): $R0" /SD IDCANCEL IDRETRY OneMoreAttempt
+      Return
+    ${endIf}
+
+  OneMoreAttempt:
+    ExecWait '"$uninstallerFileNameTemp" /S /KEEP_APP_DATA $0 _?=$installationDir' $R0
+    ifErrors TryInPlace CheckResult
+
+    TryInPlace:
+      # the execution failed - might have been caused by some group policy restrictions
+      # we try to execute the uninstaller in place
+      ExecWait '"$uninstallerFileName" /S /KEEP_APP_DATA $0 _?=$installationDir' $R0
+      ifErrors DoesNotExist
+
+    CheckResult:
+      ${if} $R0 == 0
+        Return
+      ${endIf}
+
+    Sleep 1000
+    Goto UninstallLoop
+
+  DoesNotExist:
+    SetErrors
 FunctionEnd
 
 !macro uninstallOldVersion ROOT_KEY

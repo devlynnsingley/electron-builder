@@ -1,11 +1,11 @@
+import { SignOptions as MacSignOptions } from "@electron/osx-sign/dist/esm/types.js"
+import { Identity, DoPackOptions } from "app-builder-lib/internal"
+import { AuthenticodeSignerInfo } from "app-builder-lib/src/codeSign/win/authenticodeSignature"
+import { WinPackager, getArchSuffix, MacPackager } from "app-builder-lib"
 import { AsyncTaskManager } from "builder-util"
-import { Arch, MacConfiguration, Packager, Target } from "electron-builder"
-import SquirrelWindowsTarget from "electron-builder-squirrel-windows"
-import { Identity } from "app-builder-lib/out/codeSign/macCodeSign"
-import MacPackager from "app-builder-lib/out/macPackager"
 import { DmgTarget } from "dmg-builder"
-import { WinPackager } from "app-builder-lib/out/winPackager"
-import { SignOptions as MacSignOptions } from "electron-osx-sign"
+import { Arch, MacConfiguration, Packager, Target } from "electron-builder"
+import * as path from "path"
 
 export class CheckingWinPackager extends WinPackager {
   effectiveDistOptions: any
@@ -14,16 +14,23 @@ export class CheckingWinPackager extends WinPackager {
     super(info)
   }
 
-  //noinspection JSUnusedLocalSymbols
-  async pack(outDir: string, arch: Arch, targets: Array<Target>, taskManager: AsyncTaskManager): Promise<any> {
-    // skip pack
-    const helperClass: typeof SquirrelWindowsTarget = require("electron-builder-squirrel-windows").default
-    this.effectiveDistOptions = await new helperClass(this, outDir).computeEffectiveDistOptions()
-
-    await this.sign(this.computeAppOutDir(outDir, arch))
+  // the custom sign hooks these tests use sign nothing: report every file signed, so that forceCodeSigning's read-back
+  // of signed files (which would rightly reject them) leaves the behavior under test alone
+  protected readAuthenticodeSignature(): Promise<AuthenticodeSignerInfo> {
+    return Promise.resolve({ type: "signed", subject: "CN=Test", status: 0 })
   }
 
-  //noinspection JSUnusedLocalSymbols
+  async pack(outDir: string, arch: Arch, targets: Array<Target>, taskManager: AsyncTaskManager): Promise<any> {
+    const pkgName = "electron-builder-squirrel-windows"
+    // skip pack
+    const helperClass = (await import(pkgName)).default
+    const newClass = new (helperClass as any)(this, outDir)
+    const setupFile = this.expandArtifactNamePattern(newClass.options, "exe", arch, "${productName} Setup ${version}.${ext}")
+    const installerOutDir = path.join(outDir, `squirrel-windows${getArchSuffix(arch)}`)
+    this.effectiveDistOptions = await newClass.computeEffectiveDistOptions(installerOutDir, outDir, setupFile)
+    await this.signIf(this.computeAppOutDir(outDir, arch))
+  }
+
   packageInDistributableFormat(appOutDir: string, arch: Arch, targets: Array<Target>, taskManager: AsyncTaskManager): void {
     // skip
   }
@@ -41,7 +48,7 @@ export class CheckingMacPackager extends MacPackager {
     for (const target of targets) {
       // do not use instanceof to avoid dmg require
       if (target.name === "dmg") {
-        this.effectiveDistOptions = await (target as DmgTarget).computeDmgOptions()
+        this.effectiveDistOptions = await (target as DmgTarget).computeDmgOptions("stub")
         break
       }
     }
@@ -50,13 +57,14 @@ export class CheckingMacPackager extends MacPackager {
   }
 
   //noinspection JSUnusedLocalSymbols
-  async doPack(outDir: string, appOutDir: string, platformName: string, arch: Arch, customBuildOptions: MacConfiguration, targets: Array<Target>) {
+  async doPack(_options: DoPackOptions<MacConfiguration>) {
     // skip
   }
 
   //noinspection JSUnusedGlobalSymbols
   async doSign(opts: MacSignOptions): Promise<any> {
     this.effectiveSignOptions = opts
+    return Promise.resolve()
   }
 
   //noinspection JSUnusedGlobalSymbols,JSUnusedLocalSymbols

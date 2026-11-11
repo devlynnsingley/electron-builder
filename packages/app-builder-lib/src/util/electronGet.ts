@@ -1,0 +1,1032 @@
+import * as get from "@electron/get"
+import {
+  ElectronArtifactDetails,
+  ElectronDownloadCacheMode,
+  ElectronDownloadRequest,
+  ElectronDownloadRequestOptions,
+  ElectronPlatformArtifactDetails,
+  FetchDownloaderOptions,
+  MirrorOptions,
+} from "@electron/get"
+import { exec, exists, log, PADDING, parseValidEnvVarUrl, sanitizeDirPath, to7zaOutputSwitch, ensureDir, moveDirAtomic } from "builder-util"
+import { HttpError, MemoLazy, retry, sleep } from "builder-util-runtime"
+import * as crypto from "crypto"
+import type { ProgressBar } from "electron-publish"
+import { MultiProgress } from "electron-publish"
+import { createReadStream } from "fs"
+import * as fs from "fs/promises"
+import * as os from "os"
+import * as path from "path"
+import * as lockfile from "proper-lockfile"
+import { pipeline } from "stream/promises"
+import * as tar from "tar"
+import * as unzipper from "unzipper"
+import { getPath7za } from "../toolsets/7zip.js"
+import { checksumMismatchMessage, ExpectedChecksum, parseChecksum, verifyFileChecksum } from "./checksum.js"
+import { CacheState, cleanupCacheDirectory, computeCacheMetadata, readCacheStateFile, validateCacheDirectory, writeCacheState } from "./cacheState.js"
+import { BUILD_CHANGES_URL } from "./config/legacyOptions.js"
+
+export interface ElectronGetOptions extends Omit<
+  ElectronPlatformArtifactDetails,
+  | "platform"
+  | "arch"
+  | "version"
+  | "artifactName"
+  | "artifactSuffix"
+  | "customFilename"
+  | "tempDirectory"
+  | "downloader"
+  | "cacheMode"
+  | "cacheRoot"
+  | "downloadOptions"
+  | "isGeneric"
+  | "mirrorOptions"
+> {
+  mirrorOptions?: Omit<MirrorOptions, "customDir" | "customFilename" | "customVersion">
+}
+
+export type ArtifactDownloadOptions = {
+  options?: ElectronGetOptions | null
+  artifactName: string
+  platformName: string
+  arch: string
+  version: string
+  cacheDir?: string
+}
+
+export function hashUrlSafe(input: string, length = 6): string {
+  let hash = 5381
+  for (let i = 0; i < input.length; i++) {
+    hash = ((hash << 5) + hash) ^ input.charCodeAt(i)
+  }
+  hash >>>= 0
+  const out = hash.toString(36)
+  return out.length >= length ? out.slice(0, length) : out.padStart(length, "0")
+}
+
+// MemoLazy (not Lazy): keyed on ELECTRON_BUILDER_CACHE so the resolved cache dir is recomputed if the
+// override env var changes, while staying memoized when it doesn't (the production case). The creator
+// also ensures the resolved dir exists — that side effect lives here, at the point of use, so
+// getCacheDirectoryInternal stays a pure path resolver.
+export const cacheDirectoryOverrideAllowed = new MemoLazy<string | undefined, string>(
+  () => process.env.ELECTRON_BUILDER_CACHE?.trim(),
+  async () => {
+    const dir = await getCacheDirectoryInternal({ isAvoidSystemOnWindows: true, allowEnvVarOverride: true })
+    await ensureDir(dir)
+    return dir
+  }
+)
+// Exposed for testing; not intended for public use. Pure path resolution (no I/O) — use the memoized
+// const's above when you need the directory to exist on disk. Kept async for a stable Promise-returning
+// contract across all call sites.
+// eslint-disable-next-line @typescript-eslint/require-await
+export async function getCacheDirectoryInternal(options: { isAvoidSystemOnWindows?: boolean; allowEnvVarOverride: boolean }): Promise<string> {
+  const { isAvoidSystemOnWindows = true, allowEnvVarOverride } = options
+  const env = process.env.ELECTRON_BUILDER_CACHE?.trim()
+  if (allowEnvVarOverride && env && path.parse(env).root) {
+    return sanitizeDirPath(env)
+  }
+
+  const appName = "electron-builder"
+  const platform = os.platform()
+  const homeDir = os.homedir()
+
+  if (platform === "darwin") {
+    return path.join(homeDir, "Library", "Caches", appName)
+  }
+  if (platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA?.trim()
+    const username = process.env.USERNAME?.trim()?.toLowerCase()
+    // https://github.com/electron-userland/electron-builder/issues/1164
+    const isSystemUser = isAvoidSystemOnWindows && (localAppData?.toLowerCase()?.includes("\\windows\\system32\\") || username === "system")
+    if (!localAppData || isSystemUser) {
+      return path.join(os.tmpdir(), `${appName}-cache`)
+    }
+    return path.join(localAppData, appName, "Cache")
+  }
+
+  const xdgCache = process.env.XDG_CACHE_HOME
+  return xdgCache && path.parse(xdgCache).root ? path.join(xdgCache, appName) : path.join(homeDir, ".cache", appName)
+}
+
+function resolveCacheMode(): ElectronDownloadCacheMode {
+  const varName = "ELECTRON_DOWNLOAD_CACHE_MODE"
+  const cacheOverride = process.env[varName]?.trim()
+  if (cacheOverride && Number(cacheOverride) in ElectronDownloadCacheMode) {
+    const mode = Number(cacheOverride) as ElectronDownloadCacheMode
+    log.debug({ mode }, `cache mode overridden via env var ${varName}`)
+    return mode
+  }
+  return ElectronDownloadCacheMode.ReadWrite
+}
+
+/**
+ * Returns true when `destPath` is safely contained within `dir` (direct child or deeper).
+ * On Windows the filesystem is case-insensitive so the comparison is normalised to lowercase.
+ * @internal exported for unit testing
+ */
+export function isSafeExtractPath(destPath: string, dir: string): boolean {
+  const normalizedDest = path.resolve(destPath)
+  const normalizedDir = path.resolve(dir)
+  if (process.platform === "win32") {
+    const d = normalizedDest.toLowerCase()
+    const b = normalizedDir.toLowerCase()
+    return d.startsWith(b + path.sep) || d === b
+  }
+  return normalizedDest.startsWith(normalizedDir + path.sep) || normalizedDest === normalizedDir
+}
+
+/**
+ * Creates the missing directories of `target` one level at a time under the real path of the extraction dir,
+ * resolving symlinks after every step, so a symlink extracted earlier cannot redirect a write outside it.
+ * Returns the real path of `target`.
+ */
+async function mkdirInsideRealDir(target: string, dir: string, realDir: string, entryPath: string): Promise<string> {
+  let current = realDir
+  for (const part of path.relative(dir, target).split(path.sep)) {
+    if (part === "") {
+      continue
+    }
+    const next = path.join(current, part)
+    let existed = false
+    try {
+      await fs.mkdir(next)
+    } catch (e: any) {
+      if (e.code !== "EEXIST") {
+        throw e
+      }
+      existed = true
+    }
+    current = await fs.realpath(next)
+    if (!isSafeExtractPath(current, realDir)) {
+      throw new Error(`Symlinked path escapes extraction dir: ${entryPath}`)
+    }
+    // an earlier file entry (or a symlink to one) at this path cannot hold a directory
+    if (existed && !(await fs.stat(current)).isDirectory()) {
+      throw new Error(`Zip entry needs a directory where a file already exists: ${entryPath}`)
+    }
+  }
+  return current
+}
+
+/**
+ * Walks a relative symlink `target` from the real directory holding the link the way the OS would: existing components
+ * are followed by real path, missing ones are joined lexically (a later `..` steps back out of them, and existing components
+ * after that are followed by real path again). Returns false when any step leaves `realDir`. With `finished`, the tree is
+ * complete and a dangling symlink used as an intermediate component is refused too (its meaning would change once its target
+ * appears); during extraction it is not, because its target may simply come later in the archive.
+ */
+async function isLinkTargetInside(realParent: string, target: string, realDir: string, finished: boolean): Promise<boolean> {
+  const parts = target.split(process.platform === "win32" ? /[\\/]/ : "/").filter(part => part !== "" && part !== ".")
+  let current = realParent
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i] === "..") {
+      current = path.dirname(current)
+    } else {
+      current = path.join(current, parts[i])
+      try {
+        current = await fs.realpath(current)
+      } catch (e: any) {
+        if (e.code !== "ENOENT" && e.code !== "ENOTDIR") {
+          throw e
+        }
+        if (finished && i < parts.length - 1 && (await fs.lstat(current).catch(() => null))?.isSymbolicLink()) {
+          return false
+        }
+      }
+    }
+    if (!isSafeExtractPath(current, realDir)) {
+      return false
+    }
+  }
+  return true
+}
+
+async function extractZipStreaming(file: string, dir: string): Promise<void> {
+  // Pass 1: read central directory once to collect Unix modes (one seek to EOF)
+  const zipDir = await unzipper.Open.file(file)
+  const entryModes = new Map<string, number>()
+  for (const entry of zipDir.files) {
+    const mode = (entry.externalFileAttributes >> 16) & 0xffff
+    if (mode > 0) {
+      entryModes.set(entry.path, mode)
+    }
+  }
+  const isSymlink = (mode: number) => (mode & 0o170000) === 0o120000
+
+  // Lexical checks alone miss chained symlinks, so every write is also confined by real path at write time.
+  const realDir = await fs.realpath(dir)
+  const symlinks: { realParent: string; target: string }[] = []
+
+  // Pass 2: stream from byte 0 — no per-entry seeks, no Docker hang.
+  // Destroy the read stream in a finally block so the file handle is always released,
+  // including when the loop exits early due to a thrown error.
+  const readStream = createReadStream(file)
+  try {
+    const entries = readStream.pipe(unzipper.Parse({ forceStream: true }))
+    for await (const entry of entries as AsyncIterable<unzipper.Entry>) {
+      const destPath = path.resolve(dir, entry.path)
+      if (!isSafeExtractPath(destPath, dir)) {
+        throw new Error(`Path traversal blocked: ${entry.path}`)
+      }
+      const mode = entryModes.get(entry.path) ?? 0
+      if (mode > 0 && isSymlink(mode)) {
+        const target = (await entry.buffer()).toString()
+        // on Windows a drive-relative target ("C:x") is not absolute but resolves against that drive's current directory,
+        // and a ":" inside a component names an alternate data stream, so any ":" is refused there
+        if (path.isAbsolute(target) || (process.platform === "win32" && target.includes(":"))) {
+          throw new Error(`Absolute symlink target blocked: ${target}`)
+        }
+        const realParent = await mkdirInsideRealDir(path.dirname(destPath), dir, realDir, entry.path)
+        if (!(await isLinkTargetInside(realParent, target, realDir, false))) {
+          throw new Error(`Symlink target escapes extraction dir: ${target}`)
+        }
+        await fs.symlink(target, path.join(realParent, path.basename(destPath))).catch((e: any) => {
+          // fs.symlink never replaces an existing path, so a symlink entry at a path an earlier entry holds is refused by name
+          if (e.code === "EEXIST") {
+            throw new Error(`Zip symlink entry would replace an existing file, directory or symlink: ${entry.path}`)
+          }
+          throw e
+        })
+        symlinks.push({ realParent, target })
+      } else if (entry.type === "Directory") {
+        await mkdirInsideRealDir(destPath, dir, realDir, entry.path)
+        entry.autodrain()
+      } else {
+        const realDest = path.join(await mkdirInsideRealDir(path.dirname(destPath), dir, realDir, entry.path), path.basename(destPath))
+        // "wx" refuses an existing path, so a symlink already sitting at the destination is never followed
+        const handle = await fs.open(realDest, "wx").catch(async (e: any) => {
+          if (e.code !== "EEXIST") {
+            throw e
+          }
+          // a duplicate entry replaces the earlier regular file (last one wins, as before); anything else is refused
+          if (!(await fs.lstat(realDest)).isFile()) {
+            throw new Error(`Zip entry would replace an existing symlink or directory: ${entry.path}`)
+          }
+          await fs.unlink(realDest)
+          return fs.open(realDest, "wx")
+        })
+        await pipeline(entry, handle.createWriteStream())
+        if (mode > 0) {
+          await fs.chmod(realDest, mode & 0o7777)
+        }
+      }
+    }
+  } finally {
+    readStream.destroy()
+  }
+
+  // A later entry can turn a component of an earlier symlink's target into a symlink, so re-check every link against
+  // the finished tree: the build writes into this directory afterwards and must not be redirected outside it.
+  for (const { realParent, target } of symlinks) {
+    if (!(await isLinkTargetInside(realParent, target, realDir, true))) {
+      throw new Error(`Symlink target escapes extraction dir: ${target}`)
+    }
+  }
+}
+
+export async function extractArchive(archive: string, dir: string) {
+  const file = sanitizeDirPath(archive)
+
+  const tmpDir = `${dir}.tmp`
+  await fs.mkdir(tmpDir, { recursive: true })
+
+  const release = await lockfile.lock(tmpDir, {
+    // 100 retries (not 15) so concurrent callers wait out a slow first extraction instead of failing
+    // with ELOCKED; the update heartbeat keeps an in-progress holder's lock fresh against `stale`.
+    retries: { retries: 100, minTimeout: 1000, maxTimeout: 5000 },
+    stale: 120000, // Increased from 60s to allow long-running extractions
+  })
+
+  try {
+    // rm + mkdir happen AFTER acquiring the lock so no concurrent caller can clear our tmpDir mid-extraction
+    await fs.rm(tmpDir, { recursive: true, force: true })
+    await fs.mkdir(tmpDir, { recursive: true })
+
+    // Guard against the transient window in @electron/get's non-atomic putFileInCache (remove → move).
+    // A concurrent worker may have deleted and not yet replaced the source archive; wait briefly for it.
+    for (let i = 0; !(await exists(file)); i++) {
+      if (i >= 4) {
+        throw Object.assign(new Error(`Source archive not found after retries: ${file}`), { code: "ENOENT", path: file })
+      }
+      log.warn({ file, attempt: i + 1 }, "source archive transiently missing, retrying")
+      await sleep(300 * (i + 1))
+    }
+
+    if (file.endsWith(".tar.gz") || file.endsWith(".tgz")) {
+      await tar.extract({ file, cwd: tmpDir, strip: 1 })
+    } else if (file.endsWith(".tar.xz") || file.endsWith(".txz") || file.endsWith(".tar.7z")) {
+      // Compressed tarballs node-tar cannot decompress itself (xz, 7z): use 7za to strip the outer
+      // compression layer into a .tar, then extract that tar.
+      // Note: the .tar.7z check MUST stay ahead of the plain .7z branch below, otherwise only the outer
+      // 7z layer is removed and the inner tar is left behind as-is (see https://github.com/electron-userland/electron-builder/issues/10002).
+      const cmd7za = await getPath7za()
+      const decompressOutDir = `${tmpDir}.decompress`
+      await fs.rm(decompressOutDir, { recursive: true, force: true })
+      await fs.mkdir(decompressOutDir, { recursive: true })
+      try {
+        await exec(cmd7za, ["x", "-bd", file, to7zaOutputSwitch(sanitizeDirPath(decompressOutDir)), "-y"])
+        const innerTar = (await fs.readdir(decompressOutDir)).find(f => f.endsWith(".tar"))
+        if (innerTar == null) {
+          throw new Error(`decompression of ${path.basename(file)} produced no .tar archive`)
+        }
+        await tar.extract({ file: path.join(decompressOutDir, innerTar), cwd: tmpDir, strip: 1 })
+      } finally {
+        await fs.rm(decompressOutDir, { recursive: true, force: true })
+      }
+    } else if (file.endsWith(".zip")) {
+      await extractZipStreaming(file, tmpDir)
+    } else if (file.endsWith(".7z")) {
+      const cmd7za = await getPath7za()
+      try {
+        await exec(cmd7za, ["x", "-bd", file, to7zaOutputSwitch(sanitizeDirPath(tmpDir)), "-y"])
+      } catch (e: any) {
+        // Check if extraction actually failed or just had benign warnings
+        const files = await fs.readdir(tmpDir)
+        if (files.length === 0) {
+          log.warn({ file: log.filePath(file), tmpDir: log.filePath(tmpDir), error: e.message }, "7z extraction produced no output")
+          throw new Error(`7z extraction failed for ${file}: ${e.message}`)
+        }
+        // If files were extracted despite the error, log and continue
+        log.warn({ error: e.message, filesExtracted: files.length }, "7z reported error but extracted files")
+      }
+    } else {
+      throw new Error(`Unsupported archive format: ${path.basename(file)}`)
+    }
+
+    // Verify extraction produced files
+    const extractedFiles = await fs.readdir(tmpDir)
+    if (extractedFiles.length === 0) {
+      throw new Error(`Extraction of ${path.basename(file)} produced no files`)
+    }
+
+    await fs.rm(dir, { recursive: true, force: true })
+    await moveDirAtomic(tmpDir, dir)
+  } finally {
+    await release().catch(err => log.warn({ err }, "failed to release lockfile"))
+  }
+}
+
+let proxyInitialized = false
+function initializeProxyOnce(): void {
+  if (!proxyInitialized) {
+    reinitializeProxy()
+    proxyInitialized = true
+  }
+}
+
+/**
+ * Forces undici's global proxy dispatcher to re-read the current HTTP(S)_PROXY / NO_PROXY env vars,
+ * bypassing the once-guard in initializeProxyOnce(). Exported for integration testing only.
+ */
+export function reinitializeProxy(): void {
+  get.initializeProxy()
+}
+
+/**
+ * Error codes considered transient for artifact downloads. Plain node socket errors carry the code
+ * directly on `error.code`; undici (the fetch implementation used by @electron/get v5) wraps them in
+ * a `TypeError: fetch failed` whose code lives on `error.cause.code` — including undici's own
+ * `UND_ERR_*` codes for connection resets and connect timeouts.
+ */
+const TRANSIENT_DOWNLOAD_ERROR_CODES = new Set([
+  "ENOTFOUND",
+  "ETIMEDOUT",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EAI_AGAIN",
+  "EPIPE",
+  "ENOENT",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+])
+
+/**
+ * Decides whether a failed @electron/get download should be retried. Handles all three error shapes
+ * seen in practice (exported for tests):
+ * - builder-util-runtime's `HttpError` — retry on 5xx.
+ * - @electron/get v5's `HTTPError` (`FetchDownloader`) — a plain `Error` subclass with the fetch
+ *   `Response` on `.response` and NO `.code`; retry on 5xx and 429. Matched by class and by
+ *   `name === "HTTPError"` as a fallback in case multiple @electron/get copies are loaded.
+ * - transient network errors — code on `error.code`, or on `error.cause.code` for undici's
+ *   `TypeError: fetch failed` wrapper.
+ */
+export function shouldRetryDownloadError(e: any): boolean {
+  if (e == null) {
+    return false
+  }
+  if (e instanceof HttpError) {
+    return e.isServerError()
+  }
+  if (e instanceof get.HTTPError || e.name === "HTTPError") {
+    const status = e.response?.status
+    return typeof status === "number" && (status >= 500 || status === 429)
+  }
+  const code = typeof e.code === "string" ? e.code : typeof e.cause?.code === "string" ? e.cause.code : undefined
+  return code != null && TRANSIENT_DOWNLOAD_ERROR_CODES.has(code)
+}
+
+const DOWNLOAD_ATTEMPT_TIMEOUT_MS = 10 * 60 * 1000
+
+/** undici gives up on a silent connection after its own headersTimeout/bodyTimeout (300s by default). */
+const STALLED_DOWNLOAD_ERROR_CODES = new Set(["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"])
+
+export interface RetryDownloadOptions {
+  readonly label?: string
+  readonly callerSignal?: AbortSignal | null
+  readonly attemptTimeoutMs?: number
+}
+
+/**
+ * Runs a download with the transient-error retries. Each attempt gets its own `AbortSignal.timeout()` capping
+ * its total duration: a shared one stays aborted once it fires, so any later attempt would fail immediately.
+ * An attempt that hits that cap, or that undici drops as silent, is retried once. A caller-supplied signal is
+ * passed through as is, and its abort is final.
+ * Exported for tests.
+ */
+export function retryDownload<T>(download: (signal: AbortSignal) => Promise<T>, options: RetryDownloadOptions = {}): Promise<T> {
+  const { label, callerSignal, attemptTimeoutMs = DOWNLOAD_ATTEMPT_TIMEOUT_MS } = options
+  let timedOut = false
+  return retry(() => download(callerSignal ?? AbortSignal.timeout(attemptTimeoutMs)), {
+    retries: 3,
+    interval: 2000,
+    backoff: 2000,
+    shouldRetry: e => {
+      // our own timeout abort is a DOMException with a numeric `code`, which shouldRetryDownloadError never matches
+      const reason = callerSignal == null && e?.name === "TimeoutError" ? "TimeoutError" : STALLED_DOWNLOAD_ERROR_CODES.has(e?.cause?.code) ? e.cause.code : null
+      if (reason == null) {
+        return shouldRetryDownloadError(e)
+      }
+      if (timedOut) {
+        return false
+      }
+      timedOut = true
+      log.warn({ label, reason }, "download timed out, retrying")
+      return true
+    },
+  })
+}
+
+async function downloadArtifactToFile(config: ElectronArtifactDetails, label: string): Promise<string> {
+  // Serialize concurrent downloads of the same artifact across vitest workers to prevent @electron/get's
+  // non-atomic putFileInCache (remove + move) from racing with a concurrent reader.
+  const key = {
+    p: (config as ElectronPlatformArtifactDetails).platform,
+    a: (config as ElectronPlatformArtifactDetails).arch,
+    v: config.version,
+    n: config.artifactName,
+    g: config.isGeneric,
+  }
+
+  const artifactLockKey = crypto.createHash("sha256").update(JSON.stringify(key)).digest("hex").slice(0, 20)
+  const artifactLockPath = path.join(os.tmpdir(), `eb-dl-${artifactLockKey}.lock`)
+  // This lock is taken even for cache hits (the cache-hit check lives inside @electron/get), so under
+  // heavy concurrency many builds serialize here. 30 retries (~137s of backoff) is too few — waiters
+  // were exhausting it and failing with ELOCKED while the holder fetched a large artifact. 100 retries
+  // matches the other toolset locks; stale (10min) + proper-lockfile's update heartbeat keep a live
+  // downloader's lock fresh so the longer wait never falsely steals an in-progress download.
+  const releaseArtifactLock = await lockfile.lock(artifactLockPath, {
+    retries: { retries: 100, minTimeout: 500, maxTimeout: 5000 },
+    stale: 600_000,
+    realpath: false,
+  })
+  let lastLoggedMilestone = -1
+  const state: { bar: ProgressBar | undefined } = { bar: undefined }
+
+  // @electron/get v5 downloads via fetch, whose proxy support comes from undici's global dispatcher.
+  // initializeProxy() wires that up from HTTP(S)_PROXY/NO_PROXY env vars (replaces the got proxy agent).
+  initializeProxyOnce()
+
+  const downloadOptions: FetchDownloaderOptions = {
+    ...config.downloadOptions,
+    getProgressCallback: info => {
+      // @electron/get passes downloadOptions (including this callback) to its internal
+      // SHASUMS256.txt validation download. That file is tiny (<1 MB) and fires at 100%
+      // immediately, producing a spurious bar even when the artifact itself is cached.
+      // Skip progress display for any download whose total size is known and small.
+      if (info.total && info.total < 1_000_000) {
+        return Promise.resolve()
+      }
+      if (!state.bar && process.stdout.isTTY) {
+        log.info({ label }, "downloading")
+        state.bar = new MultiProgress().createBar(`${" ".repeat(PADDING + 2)}[:bar] :percent | ${label}`, { total: 100 })
+      }
+      const pct = info.percent != null ? Math.floor(info.percent * 100) : 0
+      if (state.bar) {
+        state.bar.update(pct)
+      } else {
+        // log every 25% milestone for non-TTY environments (e.g. CI logs) to provide some visibility into download progress without overwhelming logs with too many updates
+        const percentCompleted = info.transferred && info.total ? Math.floor((info.transferred / info.total) * 100) : Math.floor(pct / 25) * 25
+        if (percentCompleted > lastLoggedMilestone && percentCompleted > 0) {
+          lastLoggedMilestone = percentCompleted
+          log.info({ label, progress: `${percentCompleted}%` }, percentCompleted !== 100 ? "downloading" : "downloaded")
+        }
+      }
+      return Promise.resolve()
+    },
+  }
+
+  const callerSignal = config.downloadOptions?.signal
+  // every call gets a fresh timeout signal, to prevent an indefinite hang on stalled connections
+  const withSignal = (signal: AbortSignal = callerSignal ?? AbortSignal.timeout(DOWNLOAD_ATTEMPT_TIMEOUT_MS)) => ({ ...config, downloadOptions: { ...downloadOptions, signal } })
+  try {
+    let filePath: string
+    try {
+      filePath = await retryDownload(signal => get.downloadArtifact(withSignal(signal)), { label, callerSignal })
+    } catch (err) {
+      if (typeof (err as any)?.message === "string" && (err as any).message.includes("dest already exists")) {
+        filePath = await get.downloadArtifact(withSignal())
+      } else {
+        throw err
+      }
+    }
+    if (!(await exists(filePath))) {
+      log.warn({ filePath, label }, "cached artifact missing from disk; retrying with cache write")
+      filePath = await get.downloadArtifact({ ...withSignal(), cacheMode: ElectronDownloadCacheMode.WriteOnly })
+    }
+    if (!state.bar && lastLoggedMilestone === -1) {
+      log.info({ label }, "using cached artifact")
+    }
+    return filePath
+  } finally {
+    state.bar?.update(100)
+    state.bar?.terminate()
+    await releaseArtifactLock().catch(err => log.warn({ err }, "failed to release artifact download lock"))
+  }
+}
+
+/**
+ * Checks electron-builder's own archive cache for a previously downloaded archive.
+ * Validates the checksum (SHA-256 hex or base64 SHA-512) when one is known. Returns the cached path on hit,
+ * null on miss or checksum mismatch (mismatch also deletes the stale file).
+ *
+ * Air-gapped seeding contract: placing the archive at
+ * `<cacheDir>/<releaseName>/<archive>` (e.g. `$ELECTRON_BUILDER_CACHE/appimage@1.0.3/appimage-tools-runtime-20251108.tar.gz`)
+ * is sufficient for a fully offline toolset resolution — the checksum here is computed locally
+ * against the value hardcoded in the toolset module, and extraction happens locally too. No
+ * `.state` file needs to be seeded. See https://www.electron.build/tutorials/offline-air-gapped-builds.
+ */
+async function resolveFromArchiveCache(archiveCachePath: string, label: string, expected: ExpectedChecksum | undefined): Promise<string | null> {
+  if (!(await exists(archiveCachePath))) {
+    return null
+  }
+  if (expected != null && !(await verifyFileChecksum(archiveCachePath, expected)).matches) {
+    log.warn({ file: label, archiveCachePath }, "cached archive checksum mismatch — removing and re-downloading")
+    await fs.rm(archiveCachePath).catch(() => {})
+    return null
+  }
+  log.debug({ file: label, archiveCachePath }, "using cached archive — skipping download")
+  return archiveCachePath
+}
+
+/**
+ * Copies a freshly downloaded archive into electron-builder's own archive cache so that
+ * future builds (including offline environments) can skip the network request entirely.
+ */
+async function persistToArchiveCache(sourcePath: string, archiveCachePath: string): Promise<void> {
+  try {
+    await fs.mkdir(path.dirname(archiveCachePath), { recursive: true })
+    await fs.copyFile(sourcePath, archiveCachePath)
+  } catch (err) {
+    log.warn({ err, archiveCachePath }, "failed to persist archive to cache — will re-download next time")
+  }
+}
+
+/**
+ * Core download + extract engine. Handles lockfile, cache-hit short-circuit,
+ * progress bar, extraction (.zip or .tar.gz), and completion marker.
+ * Both public download functions delegate here after building their respective configs.
+ */
+async function downloadAndExtract(
+  config: ElectronArtifactDetails,
+  extractDir: string,
+  label: string,
+  archiveCachePath?: string,
+  expectedChecksum?: ExpectedChecksum
+): Promise<string> {
+  // Create only the PARENT dir (e.g. <cache>/fpm@2.2.1), never extractDir itself, before locking.
+  // The parent is stable — cleanup only ever removes extractDir and its .state/.tmp/.lock siblings —
+  // so extractDir's whole lifecycle (mkdir, rm, re-mkdir) stays inside the lock. ensureDir absorbs
+  // the concurrent-recursive-mkdir ENOENT/EEXIST race while peers populate the cold cache tree.
+  await ensureDir(path.dirname(extractDir))
+
+  // Pre-lock fast path: read-only short-circuit for a definitively complete and valid cache.
+  // Safe unlocked — the cache-state helpers return null/false for a missing or half-written dir,
+  // so a racing read only ever falls through to take the lock. Do NOT mutate the dir here.
+  const stateData = await readCacheStateFile(extractDir)
+  if (stateData?.state === CacheState.complete) {
+    const isValid = await validateCacheDirectory(extractDir, stateData.fileCount)
+    if (isValid) {
+      log.debug({ file: label, path: extractDir }, "using cached artifact - cache valid")
+      return extractDir
+    }
+  }
+
+  // Be patient: when many targets/builds contend on the same toolset cache concurrently, all but the
+  // first wait here while the winner downloads+extracts (a large bundle can take >1min). 15 retries
+  // (~67s) is too few and waiters fail with ELOCKED before the winner finishes; 100 matches the
+  // patience of withToolsetLock. proper-lockfile's update heartbeat keeps a live holder's lock fresh,
+  // so increasing waiter retries never falsely steals an in-progress extraction.
+  const release = await lockfile.lock(extractDir, {
+    // realpath:false so proper-lockfile creates <extractDir>.lock in the (already-created) parent
+    // WITHOUT calling fs.realpath(extractDir) first — which would throw ENOENT now that extractDir
+    // is created lazily inside the lock. This filesystem lock serializes peers both across worker
+    // processes AND within a single process (a second lock() for the same path retries until the
+    // first releases), so no in-process promise cache is needed — and one wouldn't help across the
+    // separate test worker processes anyway.
+    realpath: false,
+    retries: { retries: 100, minTimeout: 1000, maxTimeout: 5000 },
+    stale: 120000,
+  })
+  let downloadedFile: string | null = null
+  try {
+    // Re-check after acquiring lock: another worker may have completed while we waited.
+    const stateDataAfterLock = await readCacheStateFile(extractDir)
+    if (stateDataAfterLock?.state === CacheState.complete) {
+      const isValid = await validateCacheDirectory(extractDir, stateDataAfterLock.fileCount)
+      if (isValid) {
+        log.debug({ file: label, path: extractDir }, "using cached artifact - skipping download/extract")
+        return extractDir
+      }
+      log.warn({ extractDir }, "Cache marked complete but files invalid, clearing")
+    } else if (stateDataAfterLock?.state === CacheState.corrupted) {
+      log.warn({ extractDir }, "Corrupted cache detected, cleaning up and re-extracting")
+    }
+
+    // Cleanup inside the lock — skip lock files since we currently hold them
+    await cleanupCacheDirectory(extractDir, { skipLockFiles: true })
+    await ensureDir(extractDir)
+
+    // Check electron-builder's own archive cache before touching @electron/get.
+    // The cache lives alongside the extract dir: <cacheDir>/<releaseName>/<filename>.
+    // This lets repeated builds (or offline environments) skip the download entirely once
+    // the archive has been fetched at least once.
+    if (archiveCachePath) {
+      downloadedFile = await resolveFromArchiveCache(archiveCachePath, label, expectedChecksum)
+    }
+
+    if (!downloadedFile) {
+      log.debug({ file: label }, "downloading")
+      downloadedFile = await downloadArtifactToFile(config, label)
+      if (!downloadedFile) {
+        throw new Error(`Failed to download artifact: ${label}`)
+      }
+      // A SHA-256 hex checksum is verified by @electron/get during the download. A base64 SHA-512 was passed with
+      // unsafelyDisableChecksums (sumchecker only understands SHA-256 hex), so verify it here, before the archive is
+      // persisted to the archive cache or extracted.
+      if (expectedChecksum != null && expectedChecksum.algorithm !== "sha256") {
+        const { matches, actual } = await verifyFileChecksum(downloadedFile, expectedChecksum)
+        if (!matches) {
+          await fs.rm(downloadedFile, { force: true }).catch(() => {})
+          throw new Error(`${checksumMismatchMessage(label, expectedChecksum, actual)} The corrupted download has been removed.`)
+        }
+        log.debug({ file: label, algorithm: expectedChecksum.algorithm }, "checksum verified")
+      }
+      // Persist the downloaded archive so future builds (and offline environments) can
+      // skip the network request entirely.
+      if (archiveCachePath) {
+        await persistToArchiveCache(downloadedFile, archiveCachePath)
+      }
+    }
+
+    await writeCacheState(extractDir, CacheState.downloaded)
+
+    // Mark extracting so stale-lock detection can recover a crashed mid-extraction process
+    await writeCacheState(extractDir, CacheState.extracting)
+
+    // Extract while holding the lock to prevent concurrent interference
+    await extractArchive(downloadedFile, extractDir)
+
+    // Compute metadata with a full recursive walk now that tmpDir has been renamed to extractDir
+    const { fileCount, extractedSize } = await computeCacheMetadata(extractDir)
+
+    // Write complete state with metadata BEFORE releasing the lock; throwOnError=true so a
+    // failed write (disk full, permissions) propagates instead of silently producing a no-op cache
+    await writeCacheState(extractDir, CacheState.complete, { fileCount, extractedSize }, true)
+  } finally {
+    await release().catch(err => log.warn({ err }, "failed to release lockfile"))
+  }
+  return extractDir
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+/**
+ * Copies a remote artifact to a specific output path on disk.
+ * Unlike downloadBuilderToolset, this does not extract archives — it copies the raw file.
+ * Used for certificate imports where the caller needs the file at a known path.
+ */
+export async function download(url: string, output: string, checksum?: string | null): Promise<void> {
+  const filenameWithExt = path.basename(new URL(url).pathname)
+  if (checksum == null) {
+    log.warn({ url }, "downloading without an integrity checksum — the download is not verified against a known-good hash")
+  }
+  const downloadedFile = await downloadArtifactToFile(
+    {
+      version: "9.9.9",
+      artifactName: filenameWithExt,
+      cacheRoot: path.resolve(await cacheDirectoryOverrideAllowed.value, "downloads"),
+      cacheMode: resolveCacheMode(),
+      ...(checksum != null ? { checksums: { [filenameWithExt]: checksum } } : { unsafelyDisableChecksums: true }),
+      mirrorOptions: { resolveAssetURL: async () => Promise.resolve(url) },
+      isGeneric: true,
+    },
+    filenameWithExt
+  )
+  await fs.copyFile(downloadedFile, output)
+}
+
+function validateBinaryCustomDir(envVarName: string, value: string): string {
+  if (value.includes("://") || value.includes("..") || value.startsWith("/")) {
+    throw new Error(
+      `${envVarName} must be a safe relative path component (e.g. "v1.0.0-custom"). ` + `Values containing "://", "..", or a leading "/" are not allowed. Got: "${value}"`
+    )
+  }
+  return value
+}
+
+const CUSTOM_DIR_ENV_VARS = [
+  "NPM_CONFIG_ELECTRON_BUILDER_BINARIES_CUSTOM_DIR",
+  "npm_config_electron_builder_binaries_custom_dir",
+  "npm_package_config_electron_builder_binaries_custom_dir",
+  "ELECTRON_BUILDER_BINARIES_CUSTOM_DIR",
+] as const
+
+/**
+ * Resolves the final download URL for a builder binary, honouring:
+ *   ELECTRON_BUILDER_BINARIES_DOWNLOAD_OVERRIDE_URL  – fully replaces the URL directory
+ *   ELECTRON_BUILDER_BINARIES_CUSTOM_DIR (and npm_ variants) – replaces releaseName in the path
+ *   overrideUrl (caller-supplied)                     – the complete file URL, used as-is when no env var is set
+ *
+ * Exported for unit testing; not part of the public API.
+ * @internal
+ */
+export function resolveBuilderBinaryUrl(releaseName: string, filenameWithExt: string, baseUrl: string, overrideUrl?: string): string {
+  const envOverrideUrl = parseValidEnvVarUrl("ELECTRON_BUILDER_BINARIES_DOWNLOAD_OVERRIDE_URL")
+  if (envOverrideUrl != null) {
+    return `${envOverrideUrl}/${filenameWithExt}`
+  }
+  if (overrideUrl != null) {
+    // The caller-supplied override (ToolsetCustom.url) points directly at the file — appending
+    // filenameWithExt would double the last path segment (e.g. …/bundle.7z/bundle.7z, issue #10084).
+    return overrideUrl
+  }
+  const customDirEntry = CUSTOM_DIR_ENV_VARS.map(name => ({ name, value: process.env[name] })).find(e => e.value != null)
+  if (customDirEntry != null) {
+    return `${baseUrl}${validateBinaryCustomDir(customDirEntry.name, customDirEntry.value!)}/${filenameWithExt}`
+  }
+  return `${baseUrl}${releaseName}/${filenameWithExt}`
+}
+
+/**
+ * Downloads a generic artifact (.tar.gz or .zip) from a GitHub release.
+ * Used for electron-builder-binaries tools (appimage, etc.).
+ */
+/**
+ * Every `toolsets.*` property now defaults to "latest", which resolves to a newer bundle than v26
+ * pinned (NSIS 3.0.4.1 -> 3.12, winCodeSign 2.6.0 -> 1.3.0, Wine 4.0.1 -> 11.0, AppImage FUSE2 ->
+ * static FUSE3). Nothing recorded which version was used: `downloadBuilderToolset` logged only at
+ * debug level, and on a warm cache it printed nothing at all — so a regression introduced by a new
+ * bundle had no trace in the build log tying it to the toolset.
+ */
+const TOOLSET_DEFAULTS_DOCS = `${BUILD_CHANGES_URL}#toolset-defaults-resolve-to-latest-newest-bundle`
+
+function announceToolsetVersion(releaseName: string): void {
+  // once per toolset per process, so a multi-target build logs each one once
+  log.once(`toolset:${releaseName}`).info({ toolset: releaseName, docs: TOOLSET_DEFAULTS_DOCS }, "using toolset")
+}
+
+export async function downloadBuilderToolset(options: {
+  releaseName: string
+  filenameWithExt: string
+  checksums?: Record<string, string>
+  githubOrgRepo?: string
+  overrideUrl?: string
+}): Promise<string> {
+  const { releaseName, filenameWithExt, checksums, githubOrgRepo = "electron-userland/electron-builder-binaries", overrideUrl } = options
+  announceToolsetVersion(releaseName)
+
+  if (/[/\\]|^\.\./.test(filenameWithExt) || filenameWithExt.includes("..")) {
+    throw new Error(`downloadBuilderToolset: unsafe filenameWithExt "${filenameWithExt}" — must be a plain filename with no path separators or traversal sequences`)
+  }
+
+  const { expectedChecksum, electronGetChecksums } = resolveToolsetChecksums(releaseName, filenameWithExt, checksums)
+
+  const baseUrl = getBinariesMirrorUrl(githubOrgRepo)
+  const fullUrl = resolveBuilderBinaryUrl(releaseName, filenameWithExt, baseUrl, overrideUrl)
+  const suffix = hashUrlSafe(fullUrl, 5)
+  // tar.7z is listed before 7z so the full extension is stripped. Deliberate side effect: this changes the
+  // extract-dir name for .tar.7z toolsets (e.g. the snap template) from "<name>.tar-<hash>" to "<name>-<hash>",
+  // which busts caches poisoned by the broken .tar.7z extraction in 26.15.0-26.15.6 (issue #10002).
+  const folderName = `${filenameWithExt.replace(/\.(tar\.gz|tgz|tar\.xz|txz|tar\.7z|zip|7z)$/, "")}-${suffix}`
+  // releaseName is library input; enforce cache-dir containment (rejects traversal, clears taint into shell extraction)
+  const cacheDir = await cacheDirectoryOverrideAllowed.value
+  const extractDir = sanitizeDirPath(path.join(cacheDir, releaseName, folderName), cacheDir)
+
+  // Use resolveAssetURL so @electron/get's ELECTRON_MIRROR env var check cannot override
+  // the builder-binaries URL we've already resolved (see getArtifactRemoteURL in @electron/get).
+  const mirrorOptions: MirrorOptions = {
+    resolveAssetURL: async () => Promise.resolve(fullUrl),
+  }
+
+  // Predictable archive cache: <cacheDir>/<releaseName>/<filename>, next to the extract dir.
+  // downloadAndExtract checks here before touching @electron/get and persists the archive here
+  // after every successful download, so subsequent builds never need a network round-trip.
+  const archiveCachePath = sanitizeDirPath(path.join(cacheDir, releaseName, filenameWithExt), cacheDir)
+
+  const config: ElectronDownloadRequest & ElectronDownloadRequestOptions & { isGeneric: true } = {
+    version: "9.9.9", // must be >1.3.2 to bypass @electron/get validation shortcut
+    artifactName: filenameWithExt,
+    cacheRoot: path.resolve(await cacheDirectoryOverrideAllowed.value, "downloads"),
+    cacheMode: resolveCacheMode(),
+    ...(electronGetChecksums != null ? { checksums: electronGetChecksums } : { unsafelyDisableChecksums: true }),
+    mirrorOptions,
+    isGeneric: true,
+  }
+  return downloadAndExtract(config, extractDir, filenameWithExt, archiveCachePath, expectedChecksum)
+}
+
+/**
+ * Classifies every entry of a toolset checksum table up front, so a malformed value fails before anything is downloaded
+ * instead of as a sumchecker parse error or a generic mismatch afterwards. Returns the checksum for `filenameWithExt` and,
+ * when every entry is SHA-256 hex, the (lowercased) table to hand to `@electron/get`; base64 SHA-512 checksums are verified
+ * by electron-builder after the download instead (#10040).
+ */
+function resolveToolsetChecksums(
+  releaseName: string,
+  filenameWithExt: string,
+  checksums: Record<string, string> | undefined
+): { expectedChecksum?: ExpectedChecksum; electronGetChecksums?: Record<string, string> } {
+  if (checksums == null) {
+    return {}
+  }
+  const parsed = Object.entries(checksums).map(([file, value]) => [file, parseChecksum(value, `The checksum for "${file}" (${releaseName})`)] as const)
+  const algorithms = new Set(parsed.map(([, checksum]) => checksum.algorithm))
+  if (algorithms.size > 1) {
+    throw new Error(`Checksums for ${releaseName} mix formats: use a single format for all entries, either SHA-256 hex or base64 SHA-512`)
+  }
+  const expectedChecksum = parsed.find(([file]) => file === filenameWithExt)?.[1]
+  if (algorithms.has("sha256")) {
+    return { expectedChecksum, electronGetChecksums: Object.fromEntries(parsed.map(([file, checksum]) => [file, checksum.value])) }
+  }
+  if (expectedChecksum == null) {
+    // @electron/get would reject a missing entry itself, but its validation is disabled for SHA-512 checksums: never let a
+    // table without an entry for this file turn into an unverified download.
+    throw new Error(`No checksum for "${filenameWithExt}" in the checksums for ${releaseName}`)
+  }
+  return { expectedChecksum }
+}
+
+/**
+ * Mirrors @electron/get's default cache root (`env-paths("electron", { suffix: "" }).cache`).
+ * @electron/get does not export it and its package `exports` map blocks deep imports, so the
+ * (deliberately tiny) platform switch is replicated here. Must stay in sync with the
+ * `cacheRoot` default documented in @electron/get's `ElectronDownloadRequestOptions`.
+ * @internal exported for unit testing
+ */
+export function defaultElectronGetCacheRoot(): string {
+  const name = "electron"
+  const homeDir = os.homedir()
+  switch (os.platform()) {
+    case "darwin":
+      return path.join(homeDir, "Library", "Caches", name)
+    case "win32":
+      return path.join(process.env.LOCALAPPDATA || path.join(homeDir, "AppData", "Local"), name, "Cache")
+    default:
+      return path.join(process.env.XDG_CACHE_HOME || path.join(homeDir, ".cache"), name)
+  }
+}
+
+/**
+ * Parses the upstream `SHASUMS256.txt` format into the `Record<filename, sha256-hex>` shape that
+ * @electron/get accepts as inline `checksums`. Each line is `<sha256-hex> *<filename>` (binary
+ * mode) or `<sha256-hex>  <filename>` (text mode); malformed lines are ignored.
+ * @internal exported for unit testing
+ */
+export function parseChecksumFile(content: string): Record<string, string> {
+  const checksums: Record<string, string> = {}
+  for (const rawLine of content.split("\n")) {
+    const match = /^([a-fA-F0-9]{64})\s+\*?(.+)$/.exec(rawLine.trim())
+    if (match != null) {
+      checksums[match[2]] = match[1].toLowerCase()
+    }
+  }
+  return checksums
+}
+
+/**
+ * Looks for a locally seeded SHASUMS256 file at the root of the @electron/get cache and returns
+ * its contents as inline `checksums`, or null when nothing usable is seeded.
+ *
+ * Why: without inline `checksums`, @electron/get re-downloads `SHASUMS256.txt` with a hardcoded
+ * `cacheMode: Bypass` on EVERY build — even when the artifact itself is a cache hit — so a fully
+ * seeded cache still requires network access and air-gapped builds fail (#10039). Cache-seeding
+ * tools (e.g. flatpak-node-generator) already place `SHASUMS256.txt-<version>` flat at the cache
+ * root; feeding it back as inline `checksums` keeps checksum validation enabled while making it
+ * fully offline. A plain `SHASUMS256.txt` at the cache root is accepted as a manual-seeding
+ * fallback. A candidate file is only used when it actually contains an entry for the requested
+ * artifact, so a stale file for another version can never break an online build.
+ * See https://www.electron.build/tutorials/offline-air-gapped-builds for the seeding contract.
+ * @internal exported for unit testing
+ */
+export async function resolveSeededChecksums(cacheRoot: string, version: string, artifactFileName: string): Promise<Record<string, string> | null> {
+  const candidates = [path.join(cacheRoot, `SHASUMS256.txt-${version}`), path.join(cacheRoot, "SHASUMS256.txt")]
+  for (const candidate of candidates) {
+    if (!(await exists(candidate))) {
+      continue
+    }
+    let content: string
+    try {
+      content = await fs.readFile(candidate, "utf-8")
+    } catch (err: any) {
+      log.warn({ file: log.filePath(candidate), err: err.message }, "failed to read seeded SHASUMS file — ignoring it")
+      continue
+    }
+    const checksums = parseChecksumFile(content)
+    if (checksums[artifactFileName] == null) {
+      log.warn({ file: log.filePath(candidate), artifactFileName }, "seeded SHASUMS file has no entry for the requested artifact — ignoring it")
+      continue
+    }
+    log.debug({ file: log.filePath(candidate), artifactFileName }, "using locally seeded SHASUMS256 checksums — checksum validation can run offline")
+    return checksums
+  }
+  return null
+}
+
+/**
+ * Assembles the `@electron/get` artifact config (`ElectronPlatformArtifactDetails`) from
+ * `ArtifactDownloadOptions`: spreads the caller's options and pins `cacheRoot`/`platform`/`arch`/
+ * `version`/`artifactName` and the resolved cache mode, warning when checksum verification is
+ * disabled. When the caller provides no `checksums` (user-provided `electronGet.checksums` always
+ * wins) and verification is not disabled, a locally seeded `SHASUMS256.txt-<version>` at the cache
+ * root is picked up as inline `checksums` so validation works offline (see resolveSeededChecksums).
+ * Callers pass the result to `downloadArtifactToFile` / `downloadAndExtract`.
+ * @internal exported for unit testing
+ */
+export async function buildElectronArtifactConfig(artifactOptions: ArtifactDownloadOptions): Promise<ElectronPlatformArtifactDetails> {
+  const { options, arch, version, platformName: platform, artifactName, cacheDir: cacheRoot } = artifactOptions
+
+  if (options?.unsafelyDisableChecksums) {
+    log.warn(
+      { artifactName },
+      "electronGet.unsafelyDisableChecksums is enabled — downloaded artifacts will NOT be verified; a compromised mirror can serve malicious binaries undetected"
+    )
+  }
+
+  const artifactConfig: ElectronPlatformArtifactDetails = { ...options, cacheRoot, platform, arch, version, artifactName, cacheMode: resolveCacheMode() }
+  if (artifactConfig.checksums == null && !artifactConfig.unsafelyDisableChecksums) {
+    // Matches @electron/get's getArtifactFileName for non-generic artifacts; `artifactSuffix` and
+    // `customFilename` cannot diverge here — both are excluded from ElectronGetOptions.
+    const artifactFileName = `${artifactName}-v${version}-${platform}-${arch}.zip`
+    const seededChecksums = await resolveSeededChecksums(cacheRoot ?? defaultElectronGetCacheRoot(), version, artifactFileName)
+    if (seededChecksums != null) {
+      artifactConfig.checksums = seededChecksums
+    }
+  }
+  return artifactConfig
+}
+
+/**
+ * Downloads the electron artifact zip via @electron/get (with caching) and returns the zip file path.
+ * Use when you need to extract the zip yourself (e.g. directly to appOutDir to preserve empty dirs and symlinks).
+ */
+export async function downloadElectronArtifactZip(options: ArtifactDownloadOptions): Promise<string> {
+  const config = await buildElectronArtifactConfig(options)
+  return downloadArtifactToFile(config, config.artifactName)
+}
+
+/**
+ * Downloads an electron platform artifact (e.g. ffmpeg) via `@electron/get` and extracts it into a
+ * content-addressed cache directory (keyed on a hash of the resolved artifact config), returning the
+ * extraction path.
+ */
+export async function downloadElectronArtifact(options: ArtifactDownloadOptions): Promise<string> {
+  const { arch, version, platformName: platform, artifactName } = options
+  const artifactConfig = await buildElectronArtifactConfig(options)
+
+  const suffix = hashUrlSafe(JSON.stringify(artifactConfig), 5)
+  const folderName = `${artifactName}-v${version}-${platform}-${arch}-${suffix}`
+  const extractDir = path.join(await cacheDirectoryOverrideAllowed.value, `${artifactName}-v${version}`, folderName)
+
+  return downloadAndExtract(artifactConfig, extractDir, artifactName)
+}
+
+/**
+ * Get the binaries mirror URL from environment variables.
+ * Supports various npm config formats and falls back to GitHub.
+ */
+export function getBinariesMirrorUrl(githubOrgRepo: string): string {
+  const allowHttp = process.env["ELECTRON_BUILDER_DANGEROUSLY_ALLOW_HTTP"] === "true"
+  for (const envVar of [
+    "NPM_CONFIG_ELECTRON_BUILDER_BINARIES_MIRROR",
+    "npm_config_electron_builder_binaries_mirror",
+    "npm_package_config_electron_builder_binaries_mirror",
+    "ELECTRON_BUILDER_BINARIES_MIRROR",
+  ]) {
+    const url = parseValidEnvVarUrl(envVar, allowHttp)
+    if (url) {
+      return url.endsWith("/") ? url : `${url}/`
+    }
+  }
+  return `https://github.com/${githubOrgRepo}/releases/download/`
+}

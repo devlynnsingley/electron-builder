@@ -7,10 +7,12 @@
   "author": "Foo Bar <foo@example.com>",
   "license": "MIT",
   "build": {
-    "electronVersion": "11.0.0",
+    "electronVersion": "42.4.0",
     "appId": "org.electron-builder.testApp",
     "compression": "store",
-    "npmRebuild": false,
+    "nativeModules": {
+      "npmRebuild": false
+    },
     "mac": {
       "category": "your.app.category.type"
     },
@@ -19,10 +21,7 @@
     }
   },
   "dependencies": {
-    "electron-log": "2.2.9",
-    "@sentry/core": "0.5.4"
-  },
-  "optionalDependencies": {
-    "unresolved": "^2.0.5"
+    "@sentry/core": "0.5.4",
+    "electron-log": "2.2.9"
   }
 }

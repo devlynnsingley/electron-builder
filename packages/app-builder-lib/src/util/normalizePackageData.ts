@@ -1,6 +1,6 @@
-import * as semver from "semver"
 import { fromUrl } from "hosted-git-info"
-import * as url from "url"
+import * as semver from "semver"
+import { parseUrl } from "./pathManager.js"
 
 export function normalizePackageData(data: any) {
   for (const it of check) {
@@ -96,7 +96,7 @@ const check = [
       if (typeof data.bugs == "string") {
         if (emailRe.test(data.bugs)) {
           data.bugs = { email: data.bugs }
-        } else if (url.parse(data.bugs).protocol) {
+        } else if (parseUrl(data.bugs)?.protocol) {
           data.bugs = { url: data.bugs }
         }
       } else {
@@ -104,7 +104,7 @@ const check = [
         const oldBugs = data.bugs
         data.bugs = {}
         if (oldBugs.url) {
-          if (typeof oldBugs.url == "string" && url.parse(oldBugs.url).protocol) {
+          if (typeof oldBugs.url == "string" && parseUrl(oldBugs.url)?.protocol) {
             data.bugs.url = oldBugs.url
           }
         }
@@ -177,7 +177,7 @@ const check = [
     if (typeof data.homepage !== "string") {
       delete data.homepage
     }
-    if (!url.parse(data.homepage).protocol) {
+    if (!parseUrl(data.homepage)?.protocol) {
       data.homepage = `https://${data.homepage}`
     }
     return
@@ -201,7 +201,7 @@ function fixBundleDependenciesField(data: any) {
         if (!data.dependencies) {
           data.dependencies = {}
         }
-        if (!("bd" in data.dependencies)) {
+        if (!Object.prototype.hasOwnProperty.call(data.dependencies, bd)) {
           data.dependencies[bd] = "*"
         }
         return true
@@ -298,13 +298,13 @@ function depObjectify(deps: any): any {
     .filter(function (d) {
       return typeof d === "string"
     })
-    .forEach(function (d) {
-      d = d.trim().split(/(:?[@\s><=])/)
-      const dn = d.shift()
-      let dv = d.join("")
+    .forEach(function (d: string) {
+      const arr: string[] = d.trim().split(/(:?[@\s><=])/)
+      const dn = arr.shift()
+      let dv = arr.join("")
       dv = dv.trim()
       dv = dv.replace(/^@/, "")
-      o[dn] = dv
+      o[dn!] = dv
     })
   return o
 }

@@ -1,15 +1,17 @@
-import { DIR_TARGET, Platform } from "electron-builder"
-import { readAsarJson } from "app-builder-lib/out/asar/asar"
-import { coerceTypes } from "electron-builder/out/builder"
-import { readJson } from "fs-extra"
+import { readAsarJson } from "app-builder-lib/internal"
+import { Platform } from "electron-builder"
+import { coerceTypes, configureBuildCommand, createYargs, normalizeOptions } from "electron-builder/src/builder"
+import fsExtra from "fs-extra"
 import * as path from "path"
-import { assertThat } from "./helpers/fileAssert"
-import { app, modifyPackageJson } from "./helpers/packTester"
+import { assertThat } from "./helpers/fileAssert.js"
+import { app, linuxDirTarget, modifyPackageJson } from "./helpers/packTester.js"
+import { ExpectStatic } from "vitest"
 
-function createExtraMetadataTest(asar: boolean) {
+function createExtraMetadataTest(expect: ExpectStatic, asar: boolean) {
   return app(
+    expect,
     {
-      targets: Platform.LINUX.createTarget(DIR_TARGET),
+      targets: linuxDirTarget,
       config: coerceTypes({
         asar,
         linux: {
@@ -32,31 +34,28 @@ function createExtraMetadataTest(asar: boolean) {
       projectDirCreated: projectDir =>
         modifyPackageJson(projectDir, data => {
           data.scripts = {}
-          data.devDependencies = { foo: "boo" }
           data.foo = {
             bar: 42,
             existingProp: 22,
           }
         }),
       packed: async context => {
-        await assertThat(path.join(context.getContent(Platform.LINUX), "new-name")).isFile()
+        await assertThat(expect, path.join(context.getContent(Platform.LINUX), "new-name")).isFile()
         if (asar) {
           expect(await readAsarJson(path.join(context.getResources(Platform.LINUX), "app.asar"), "package.json")).toMatchSnapshot()
         } else {
-          expect(await readJson(path.join(context.getResources(Platform.LINUX), "app", "package.json"))).toMatchSnapshot()
+          expect(await fsExtra.readJson(path.join(context.getResources(Platform.LINUX), "app", "package.json"))).toMatchSnapshot()
         }
       },
     }
   )
 }
 
-test.ifDevOrLinuxCi("extra metadata", createExtraMetadataTest(true))
-test.ifDevOrLinuxCi("extra metadata (no asar)", createExtraMetadataTest(false))
+test("extra metadata", ({ expect }) => createExtraMetadataTest(expect, true))
+test("extra metadata (no asar)", ({ expect }) => createExtraMetadataTest(expect, false))
 
-test("cli", async () => {
-  // because these methods are internal
-  const { configureBuildCommand, normalizeOptions } = require("electron-builder/out/builder")
-  const yargs = require("yargs")
+test("cli", ({ expect }) => {
+  const yargs = createYargs()
     .strict()
     .fail((message: string, error: Error | null) => {
       throw error || new Error(message)
@@ -64,7 +63,7 @@ test("cli", async () => {
   configureBuildCommand(yargs)
 
   function parse(input: string): any {
-    return normalizeOptions(yargs.parse(input.split(" ")))
+    return normalizeOptions(yargs.parse(input.split(" ")) as any)
   }
 
   function parseExtraMetadata(input: string) {

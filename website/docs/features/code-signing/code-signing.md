@@ -1,0 +1,229 @@
+# Code Signing
+
+Code signing proves your application's identity and confirms it hasn't been tampered with since it was signed. Without it, operating systems display security warnings — or block the app entirely.
+
+## Why Code Signing Matters
+
+| Platform | Without Signing | With Signing |
+|---|---|---|
+| macOS | Gatekeeper blocks app; user must override in System Preferences | Runs normally; no warning |
+| Windows | SmartScreen warning on first run ("Unknown publisher") | Publisher name shown; SmartScreen warning until reputation builds |
+| Windows (EV cert) | N/A | Same as OV since 2024 — no instant trust (see [Windows Code Signing](code-signing-win.md)) |
+
+On **macOS 10.15+**, notarization is additionally required for apps distributed outside the Mac App Store. An app that is code-signed but not notarized will be blocked by Gatekeeper unless the user explicitly overrides it.
+
+## Platform Requirements Matrix
+
+| Platform | Signing Required? | Certificate Type | Notarization? |
+|---|---|---|---|
+| macOS (direct distribution) | Yes (Gatekeeper) | Developer ID Application | Yes (10.15+) |
+| macOS (Mac App Store) | Yes | Apple Distribution / Mac App Distribution | No (Apple signs on submission) |
+| Windows | Recommended | OV or EV certificate | No |
+| Windows (Azure) | Recommended | Azure Trusted Signing | No |
+
+## Certificate Types
+
+### macOS
+
+| Certificate | Use Case | Where to Get |
+|---|---|---|
+| Developer ID Application | Direct distribution (DMG, ZIP, PKG) | Apple Developer Program ($99/year) |
+| Developer ID Installer | PKG files for direct distribution | Apple Developer Program |
+| Apple Distribution | Mac App Store | Apple Developer Program |
+| Mac App Distribution | Mac App Store (app bundle signing) | Apple Developer Program |
+| Apple Development / Mac Developer | Local testing, mas-dev target | Apple Developer Program |
+
+All Apple certificates require membership in the [Apple Developer Program](https://developer.apple.com/programs/).
+
+### Windows
+
+| Certificate Type | Trust | CI/CD Compatible | Notes |
+|---|---|---|---|
+| Standard OV Certificate | After reputation builds (weeks) | Yes (exportable `.pfx`) | Most common choice |
+| EV (Extended Validation) Certificate | After reputation builds — same as OV since 2024 | Yes, via a hardware-token method | Key bound to a hardware dongle/HSM; not exportable to a file |
+| Azure Trusted Signing | After reputation builds | Yes | Microsoft's cloud signing service; see [code-signing-win.md](code-signing-win.md). Microsoft: it "does not provide instant SmartScreen trust" ([source](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/code-signing-options)) |
+
+For Windows, purchase from any major CA (DigiCert, Sectigo, SSL.com). See [Get a Code Signing Certificate](https://msdn.microsoft.com/windows/hardware/drivers/dashboard/get-a-code-signing-certificate) (select "Microsoft Authenticode" platform).
+
+electron-builder picks the signing backend from the `type` field of `win.sign`: a certificate file or the Windows store (`signtool`, the default), a hardware token (`hsm` on Windows, `pkcs11` on macOS/Linux), or cloud signing (`azure`). An EV or other non-exportable key works in CI through the `hsm`, `pkcs11`, or `azure` methods. See [Windows Code Signing](code-signing-win.md) for full configuration.
+
+:::note[Gatekeeper and Apple certificates]
+macOS Gatekeeper only recognizes [Apple-issued certificates](https://developer.apple.com/support/code-signing/). Third-party certificates cannot be used to sign macOS apps for Gatekeeper.
+:::
+
+## Environment Variables
+
+electron-builder reads signing credentials from environment variables. **Never commit certificates or passwords to source control** — always inject them via CI secrets.
+
+### Shared / macOS Variables
+
+| Variable | Description |
+|---|---|
+| `CSC_LINK` | HTTPS URL, `file://` path, local path, or base64-encoded `.p12`/`.pfx` file |
+| `CSC_KEY_PASSWORD` | Password to decrypt the certificate at `CSC_LINK` |
+| `CSC_NAME` | *macOS only.* Certificate identity name from keychain. Useful when multiple identities exist on a dev machine |
+| `CSC_IDENTITY_AUTO_DISCOVERY` | `true` (default) / `false`. On macOS, automatically selects a valid identity from the keychain |
+| `CSC_KEYCHAIN` | Keychain name. Used when `CSC_LINK` is not set. Defaults to the system default keychain |
+
+### macOS Installer (PKG) Variables
+
+| Variable | Description |
+|---|---|
+| `CSC_INSTALLER_LINK` | Certificate for signing PKG installer files (requires Developer ID Installer certificate) |
+| `CSC_INSTALLER_KEY_PASSWORD` | Password for the installer certificate |
+
+### Windows-Specific Variables
+
+| Variable | Description |
+|---|---|
+| `WIN_CSC_LINK` | Windows certificate path or base64 string. Falls back to `CSC_LINK` if unset |
+| `WIN_CSC_KEY_PASSWORD` | Password for the Windows certificate. Falls back to `CSC_KEY_PASSWORD` if unset |
+
+:::tip[Building Windows on macOS]
+When cross-compiling Windows on macOS, use `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSWORD` to provide a separate Windows certificate while keeping your macOS certificate in `CSC_LINK`.
+:::
+
+### Azure Trusted Signing Variables
+
+| Variable | Description |
+|---|---|
+| `AZURE_TENANT_ID` | Azure AD Tenant ID |
+| `AZURE_CLIENT_ID` | Application (Client) ID of your App registration |
+| `AZURE_CLIENT_SECRET` | Secret value for your App registration |
+
+See [Windows Code Signing](code-signing-win.md#azure-trusted-signing-type-azure-beta) for full Azure Trusted Signing setup.
+
+## Encoding a Certificate for CI
+
+Most CI systems inject certificates as base64-encoded environment variables:
+
+```bash
+# macOS
+base64 -i your-certificate.p12 -o /tmp/cert_encoded.txt
+cat /tmp/cert_encoded.txt   # copy this value into your CI secret
+
+# Linux (-w0: one line, which masked CI variables require)
+base64 -w0 your-certificate.p12 > /tmp/cert_encoded.txt
+cat /tmp/cert_encoded.txt
+```
+
+Then set `CSC_LINK` to the base64 string (no file URL needed):
+
+```
+CSC_LINK=<the-base64-string>
+CSC_KEY_PASSWORD=your-password
+```
+
+The value must be standard base64; see [Base64 certificate values](#base64-certificate-values).
+
+:::warning[Windows environment variable length limit]
+Windows cannot handle environment variable values longer than 8192 characters. If your base64-encoded certificate exceeds this limit, re-export it **without** including intermediate certificates in the chain (uncheck "Include all certificates in the certification path" in the Certificate Manager wizard).
+:::
+
+### Base64 certificate values {#base64-certificate-values}
+
+A `CSC_LINK`, `WIN_CSC_LINK`, `CSC_INSTALLER_LINK` or `SNAP_CSC_LINK` value — or a `cscLink` / `cscInstallerLink` option — is read as base64 when it has a `data:…;base64,` prefix, is longer than 2048 characters, or ends with `=`; any other value is a path, `file://` or `https://` link. A base64 value must be **standard base64**: `A-Z`, `a-z`, `0-9`, `+` and `/` with `=` padding. Line breaks in it are ignored. Surrounding quotes, URL-safe `-`/`_` characters, any other stray character or a truncated value fail the build with an `InvalidConfigurationError` that does not print the value.
+
+Encode the certificate file on one line and store the output without quotes:
+
+```bash
+base64 -w0 your-certificate.p12                # Linux (GNU coreutils)
+base64 -i your-certificate.p12                 # macOS
+openssl base64 -A -in your-certificate.p12     # anywhere OpenSSL is installed
+```
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes((Resolve-Path your-certificate.p12)))
+```
+
+In `cmd.exe`, write `set "CSC_LINK=…"`: `set CSC_LINK="…"` keeps the quotes in the value.
+
+## GitHub Actions Setup
+
+### macOS Signing
+
+```yaml
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and sign
+        run: npx electron-builder --mac
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+```
+
+For a complete GitHub Actions workflow including publishing, see [GitHub Actions](../github-actions.md).
+
+### Windows Signing
+
+```yaml
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and sign
+        run: npx electron-builder --win
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+```
+
+## The `forceCodeSigning` Option
+
+```yaml
+forceCodeSigning: true
+```
+
+When `true`, the build **fails** whenever a signing step could not run, and checks what the signing steps produced. Use this in release pipelines to catch misconfigured secrets early rather than shipping an unsigned, unnotarized build, or one with unsigned update manifests.
+
+Without this option, electron-builder proceeds without signing if no credentials are provided — which can result in silently unsigned production builds.
+
+What it enforces:
+
+- **Code signing** — the build fails when no valid signing identity or certificate is found. On macOS signing needs a macOS host, and a pull-request build (where electron-builder skips signing unless `CSC_FOR_PULL_REQUEST=true`) fails too: pass `-c.forceCodeSigning=false` to builds that cannot sign. A prepackaged app, which electron-builder does not sign, must already be signed.
+- **Notarization (macOS)** — the notarization credentials must be set when the build starts, or it fails before anything is packed. After notarizing, `stapler validate` checks the stapled ticket. See [Notarization](notarization.md).
+- **Update manifests** — `latest*.yml` must be signed, also by a build that does not publish (on Linux this is the only effect). See [Signed Update Manifests](../signed-update-manifests.md).
+- **Verification** — every Windows file reported as signed is read back and must carry a valid Authenticode signature; the output of a custom `mac.sign` signer must pass `codesign --verify --deep --strict`; signed `pkg` installers must pass `pkgutil --check-signature`; a DMG with `dmg.sign: true` must be signed. Any valid signature counts, including ad-hoc and self-signed ones. These tools (`codesign`, `stapler`, `pkgutil`, and Windows PowerShell for `Get-AuthenticodeSignature`) are started by absolute path, from [`toolsets.executables`](../../toolsets.md#executables) or their default locations, never from `PATH`.
+
+Explicit opt-outs are honored, with a warning: `mac.notarize: false`, `updateManifest: false`, `win.signExts` exclusions and a custom `nsis.script`. `win.sign: false` and `mac.sign: null` contradict `forceCodeSigning` and fail the build.
+
+A platform-level value (`mac.forceCodeSigning`, `win.forceCodeSigning`, `linux.forceCodeSigning`) overrides the root one. Mac App Store targets cascade `mac` → `mas` → `masDev` like every other option, so `mas.forceCodeSigning` and `masDev.forceCodeSigning` apply to the `mas` / `mas-dev` targets only (for example `mas.forceCodeSigning: false` with `mac.forceCodeSigning: true` signs the MAS app without enforcing it). To check a finished build — for example artifacts downloaded from CI — run [`electron-builder verify`](../../cli.md#verify).
+
+## Platform-Specific Guides
+
+- **[macOS Code Signing](code-signing-mac.md)** — exporting certificates, keychain setup, disabling signing, ad-hoc signing
+- **[Windows Code Signing](code-signing-win.md)** — OV vs. EV certificates, Azure Trusted Signing setup
+- **[macOS Notarization](notarization.md)** — notarizing apps for macOS 10.15+, Hardened Runtime requirements
+- **[Key Rotation](../key-rotation.md)** — replacing a code-signing certificate or update-manifest key without stranding installs that trust the old one
+
+## Troubleshooting
+
+**"No identity found"** (macOS)
+: No valid Developer ID certificate is in the keychain. Check that you have an active Apple Developer Program membership and that the certificates are correctly exported.
+
+**"The certificate is not valid for use"** (macOS)
+: The certificate is expired or revoked. Renew it in the Apple Developer portal.
+
+**"CSSMERR_TP_CERT_REVOKED"** (macOS CI)
+: The certificate was revoked. Also check that the keychain has been unlocked before signing.
+
+**"Publisher name does not match"** (Windows AppX)
+: The `publisher` in `appx` config must exactly match the Subject of the certificate. Copy it from the certificate properties.
+
+**SmartScreen warning appears even after signing** (Windows)
+: Normal for any certificate. SmartScreen trust builds over time from downloads of the file and of other files signed with the same certificate; since 2024, EV certificates no longer skip this period ([Microsoft](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/distribution-feature-status#smartscreen-reputation-ev-certificates-no-longer-grant-instant-bypass)). See [Windows Code Signing](code-signing-win.md).
+
+**"Command requires admin privileges"** (Windows)
+: Some signing tools require elevated permissions. Run from an elevated prompt or check CI runner permissions.
+
+**Build fails silently with unsigned output**
+: Set `forceCodeSigning: true` to convert missing signing credentials — and skipped notarization or update-manifest signing — from a warning into a build failure, and run [`electron-builder verify`](../../cli.md#verify) to check a build's output.

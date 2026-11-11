@@ -1,20 +1,24 @@
 import {
   AllPublishOptions,
   BaseS3Options,
-  BintrayOptions,
+  BitbucketOptions,
   CustomPublishOptions,
   GenericServerOptions,
   getS3LikeProviderBaseUrl,
   GithubOptions,
+  GitlabOptions,
+  KeygenOptions,
   newError,
   PublishConfiguration,
 } from "builder-util-runtime"
-import { AppUpdater } from "./AppUpdater"
-import { BintrayProvider } from "./providers/BintrayProvider"
-import { GenericProvider } from "./providers/GenericProvider"
-import { GitHubProvider } from "./providers/GitHubProvider"
-import { PrivateGitHubProvider } from "./providers/PrivateGitHubProvider"
-import { Provider, ProviderRuntimeOptions } from "./providers/Provider"
+import { AppUpdater } from "./AppUpdater.js"
+import { BitbucketProvider } from "./providers/BitbucketProvider.js"
+import { GenericProvider } from "./providers/GenericProvider.js"
+import { GitHubProvider } from "./providers/GitHubProvider.js"
+import { GitLabProvider } from "./providers/GitLabProvider.js"
+import { KeygenProvider } from "./providers/KeygenProvider.js"
+import { PrivateGitHubProvider } from "./providers/PrivateGitHubProvider.js"
+import { Provider, ProviderRuntimeOptions } from "./providers/Provider.js"
 
 export function isUrlProbablySupportMultiRangeRequests(url: string): boolean {
   return !url.includes("s3.amazonaws.com")
@@ -30,7 +34,7 @@ export function createClient(data: PublishConfiguration | AllPublishOptions, upd
   switch (provider) {
     case "github": {
       const githubOptions = data as GithubOptions
-      const token = (githubOptions.private ? process.env.GH_TOKEN || process.env.GITHUB_TOKEN : null) || githubOptions.token
+      const token = (githubOptions.private ? process.env["GH_TOKEN"] || process.env["GITHUB_TOKEN"] : null) || githubOptions.token
       if (token == null) {
         return new GitHubProvider(githubOptions, updater, runtimeOptions)
       } else {
@@ -38,8 +42,18 @@ export function createClient(data: PublishConfiguration | AllPublishOptions, upd
       }
     }
 
+    case "bitbucket":
+      return new BitbucketProvider(data as BitbucketOptions, updater, runtimeOptions)
+
+    case "gitlab":
+      return new GitLabProvider(data as GitlabOptions, updater, runtimeOptions)
+
+    case "keygen":
+      return new KeygenProvider(data as KeygenOptions, updater, runtimeOptions)
+
     case "s3":
     case "spaces":
+    case "r2":
       return new GenericProvider(
         {
           provider: "generic",
@@ -61,9 +75,6 @@ export function createClient(data: PublishConfiguration | AllPublishOptions, upd
         isUseMultipleRangeRequest: options.useMultipleRangeRequest !== false && isUrlProbablySupportMultiRangeRequests(options.url),
       })
     }
-
-    case "bintray":
-      return new BintrayProvider(data as BintrayOptions, runtimeOptions)
 
     case "custom": {
       const options = data as CustomPublishOptions

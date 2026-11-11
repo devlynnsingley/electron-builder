@@ -1,163 +1,311 @@
+import { createRequire } from "node:module"
 import { AllPublishOptions, newError, safeStringifyJson } from "builder-util-runtime"
-import { stat } from "fs-extra"
+import { urlWithoutQuery } from "builder-util-runtime/internal"
+
+// import.meta is empty when a bundler inlines this module into a CommonJS bundle; Electron resolves "electron" from any base path
+const require = createRequire(import.meta.url ?? process.execPath)
+import fsExtra from "fs-extra"
 import { createReadStream } from "fs"
-import { createServer, IncomingMessage, ServerResponse } from "http"
-import { AddressInfo } from "net"
-import { AppAdapter } from "./AppAdapter"
-import { AppUpdater, DownloadUpdateOptions } from "./AppUpdater"
-import { ResolvedUpdateFileInfo } from "./main"
-import { findFile } from "./providers/Provider"
-import AutoUpdater = Electron.AutoUpdater
+import * as path from "path"
+import { createServer, IncomingMessage, Server, ServerResponse } from "http"
+import { AppAdapter } from "./AppAdapter.js"
+import { AppUpdater, DownloadUpdateOptions } from "./AppUpdater.js"
+import { QuitAndInstallOptions, ResolvedUpdateFileInfo, DownloadExecutorResult } from "./types.js"
+import { UpdateDownloadedEvent } from "./types.js"
+import { findFile } from "./providers/Provider.js"
+type AutoUpdater = Electron.AutoUpdater
 import { execFileSync } from "child_process"
+import { randomBytes, timingSafeEqual } from "crypto"
 
 export class MacUpdater extends AppUpdater {
   private readonly nativeUpdater: AutoUpdater = require("electron").autoUpdater
 
   private squirrelDownloadedUpdate = false
 
+  private server?: Server
+
   constructor(options?: AllPublishOptions, app?: AppAdapter) {
     super(options, app)
 
     this.nativeUpdater.on("error", it => {
-      this._logger.warn(it)
+      this.log.warn(it)
       this.emit("error", it)
     })
     this.nativeUpdater.on("update-downloaded", () => {
       this.squirrelDownloadedUpdate = true
+      this.log.debug("nativeUpdater.update-downloaded")
     })
   }
 
-  protected async doDownloadUpdate(downloadUpdateOptions: DownloadUpdateOptions): Promise<Array<string>> {
+  /** Filters update files to the appropriate architecture.
+   * On arm64 Macs (including Rosetta), arm64 files are preferred when available.
+   * On x64 Macs, arm64 files are excluded. */
+  protected static filterFilesForArch(files: ResolvedUpdateFileInfo[], isArm64Mac: boolean): ResolvedUpdateFileInfo[] {
+    const isArm64File = (file: ResolvedUpdateFileInfo) => file.url.pathname.includes("arm64") || file.info.url?.includes("arm64")
+    if (isArm64Mac && files.some(isArm64File)) {
+      return files.filter(file => isArm64Mac === isArm64File(file))
+    }
+    return files.filter(file => !isArm64File(file))
+  }
+
+  private closeServerIfExists() {
+    if (this.server) {
+      this.log.debug("Closing proxy server")
+      this.server.close(err => {
+        if (err) {
+          this.log.debug("proxy server wasn't already open, probably attempted closing again as a safety check before quit")
+        }
+      })
+    }
+  }
+
+  protected async doDownloadUpdate(downloadUpdateOptions: DownloadUpdateOptions): Promise<DownloadExecutorResult> {
     let files = downloadUpdateOptions.updateInfoAndProvider.provider.resolveFiles(downloadUpdateOptions.updateInfoAndProvider.info)
 
-    // Detect if we are running inside Rosetta emulation
+    // detect if we are running inside Rosetta emulation
     const sysctlRosettaInfoKey = "sysctl.proc_translated"
-    let isRosetta: boolean
+    let isRosetta = false
     try {
-      const result = execFileSync("sysctl", [sysctlRosettaInfoKey], { encoding: "utf8" })
+      this.log.debug("Checking for macOS Rosetta environment")
+      // by absolute path, like uname below: a bare name would be looked up on the PATH the app was started with
+      const result = execFileSync("/usr/sbin/sysctl", [sysctlRosettaInfoKey], { encoding: "utf8" })
       isRosetta = result.includes(`${sysctlRosettaInfoKey}: 1`)
-    } catch (e) {
-      this._logger.info(`sysctl shell command to check for macOS Rosetta environment failed: ${e}`)
+      this.log.info(`Checked for macOS Rosetta environment (isRosetta=${isRosetta})`)
+    } catch (e: any) {
+      this.log.warn(`sysctl shell command to check for macOS Rosetta environment failed: ${e}`)
     }
 
-    // Allow arm64 macs to install universal or rosetta2(x64) - https://github.com/electron-userland/electron-builder/pull/5524
-    const isArm64 = (file: ResolvedUpdateFileInfo) => file.url.pathname.includes("arm64")
-    if (files.some(isArm64)) {
-      files = files.filter(file => (process.arch === "arm64" || isRosetta) === isArm64(file))
+    let isArm64Mac = false
+    try {
+      this.log.debug("Checking for arm64 in uname")
+      const result = execFileSync("/usr/bin/uname", ["-a"], { encoding: "utf8" })
+      const isArm = result.includes("ARM")
+      this.log.info(`Checked 'uname -a': arm64=${isArm}`)
+      isArm64Mac = isArm64Mac || isArm
+    } catch (e: any) {
+      this.log.warn(`uname shell command to check for arm64 failed: ${e}`)
     }
+
+    isArm64Mac = isArm64Mac || process.arch === "arm64" || isRosetta
+
+    // allow arm64 macs to install universal or rosetta2(x64) - https://github.com/electron-userland/electron-builder/pull/5524
+    files = MacUpdater.filterFilesForArch(files, isArm64Mac)
 
     const zipFileInfo = findFile(files, "zip", ["pkg", "dmg"])
+
     if (zipFileInfo == null) {
       throw newError(`ZIP file not provided: ${safeStringifyJson(files)}`, "ERR_UPDATER_ZIP_FILE_NOT_FOUND")
     }
 
-    const server = createServer()
-    server.on("close", () => {
-      this._logger.info(`Proxy server for native Squirrel.Mac is closed (was started to download ${zipFileInfo.url.href})`)
-    })
-
-    function getServerUrl(): string {
-      const address = server.address() as AddressInfo
-      return `http://127.0.0.1:${address.port}`
-    }
+    const provider = downloadUpdateOptions.updateInfoAndProvider.provider
+    const CURRENT_MAC_APP_ZIP_FILE_NAME = "update.zip"
 
     return this.executeDownload({
       fileExtension: "zip",
       fileInfo: zipFileInfo,
       downloadUpdateOptions,
-      task: (destinationFile, downloadOptions) => {
-        return this.httpExecutor.download(zipFileInfo.url, destinationFile, downloadOptions)
-      },
-      done: async event => {
-        const downloadedFile = event.downloadedFile
-        let updateFileSize = zipFileInfo.info.size
-        if (updateFileSize == null) {
-          updateFileSize = (await stat(downloadedFile)).size
+      task: async (destinationFile, downloadOptions) => {
+        const cachedUpdateFilePath = path.join(this.downloadedUpdateHelper!.cacheDir, CURRENT_MAC_APP_ZIP_FILE_NAME)
+        const canDifferentialDownload = () => {
+          if (!fsExtra.pathExistsSync(cachedUpdateFilePath)) {
+            this.log.info("Unable to locate previous update.zip for differential download (is this first install?), falling back to full download")
+            return false
+          }
+          return !downloadUpdateOptions.disableDifferentialDownload
+        }
+        let differentialDownloadFailed = true
+        if (canDifferentialDownload()) {
+          differentialDownloadFailed = await this.differentialDownloadInstaller(zipFileInfo, downloadUpdateOptions, destinationFile, provider, CURRENT_MAC_APP_ZIP_FILE_NAME)
+          // only report a result when a differential download was actually attempted
+          this.log.info(`Differential download ${differentialDownloadFailed ? "failed" : "succeeded"}`)
         }
 
-        return await new Promise<Array<string>>((resolve, reject) => {
-          // insecure random is ok
-          const fileUrl = `/${Date.now()}-${Math.floor(Math.random() * 9999)}.zip`
-          server.on("request", (request: IncomingMessage, response: ServerResponse) => {
-            const requestUrl = request.url!
-            this._logger.info(`${requestUrl} requested`)
-            if (requestUrl === "/") {
-              const data = Buffer.from(`{ "url": "${getServerUrl()}${fileUrl}" }`)
-              response.writeHead(200, { "Content-Type": "application/json", "Content-Length": data.length })
-              response.end(data)
-              return
-            }
-
-            if (!requestUrl.startsWith(fileUrl)) {
-              this._logger.warn(`${requestUrl} requested, but not supported`)
-              response.writeHead(404)
-              response.end()
-              return
-            }
-
-            this._logger.info(`${fileUrl} requested by Squirrel.Mac, pipe ${downloadedFile}`)
-
-            let errorOccurred = false
-            response.on("finish", () => {
-              try {
-                setImmediate(() => server.close())
-              } finally {
-                if (!errorOccurred) {
-                  this.nativeUpdater.removeListener("error", reject)
-                  resolve([])
-                }
-              }
-            })
-
-            const readStream = createReadStream(downloadedFile)
-            readStream.on("error", error => {
-              try {
-                response.end()
-              } catch (e) {
-                this._logger.warn(`cannot end response: ${e}`)
-              }
-              errorOccurred = true
-              this.nativeUpdater.removeListener("error", reject)
-              reject(new Error(`Cannot pipe "${downloadedFile}": ${error}`))
-            })
-
-            response.writeHead(200, {
-              "Content-Type": "application/zip",
-              "Content-Length": updateFileSize,
-            })
-            readStream.pipe(response)
-          })
-          server.listen(0, "127.0.0.1", () => {
-            this.nativeUpdater.setFeedURL({
-              url: getServerUrl(),
-              headers: { "Cache-Control": "no-cache" },
-            })
-
-            // The update has been downloaded and is ready to be served to Squirrel
-            this.dispatchUpdateDownloaded(event)
-
-            if (this.autoInstallOnAppQuit) {
-              this.nativeUpdater.once("error", reject)
-              // This will trigger fetching and installing the file on Squirrel side
-              this.nativeUpdater.checkForUpdates()
-            } else {
-              resolve([])
-            }
-          })
-        })
+        if (differentialDownloadFailed) {
+          await this.httpExecutor.download(zipFileInfo.url, destinationFile, downloadOptions)
+        }
+      },
+      done: async event => {
+        if (!downloadUpdateOptions.disableDifferentialDownload) {
+          try {
+            const cachedUpdateFilePath = path.join(this.downloadedUpdateHelper!.cacheDir, CURRENT_MAC_APP_ZIP_FILE_NAME)
+            await fsExtra.copyFile(event.downloadedFile, cachedUpdateFilePath)
+          } catch (error: any) {
+            this.log.warn(`Unable to copy file for caching for future differential downloads: ${error.message}`)
+          }
+        }
+        return this.updateDownloaded(zipFileInfo, event)
       },
     })
   }
 
-  quitAndInstall(): void {
-    if (this.squirrelDownloadedUpdate) {
-      // Update already fetched by Squirrel, it's ready to install
+  private async updateDownloaded(zipFileInfo: ResolvedUpdateFileInfo, event: UpdateDownloadedEvent): Promise<void> {
+    const downloadedFile = event.downloadedFile
+    const updateFileSize = zipFileInfo.info.size ?? (await fsExtra.stat(downloadedFile)).size
+
+    const logContext = `fileToProxy=${urlWithoutQuery(zipFileInfo.url)}`
+    this.closeServerIfExists()
+    this.log.debug(`Creating proxy server for native Squirrel.Mac (${logContext})`)
+    const server = createServer()
+    this.server = server
+    this.log.debug(`Proxy server for native Squirrel.Mac is created (${logContext})`)
+    server.on("close", () => {
+      this.log.info(`Proxy server for native Squirrel.Mac is closed (${logContext})`)
+    })
+
+    // must be called after server is listening, otherwise address is null
+    const getServerUrl = (s: Server): string => {
+      const address = s.address()
+      if (typeof address === "string") {
+        return address
+      }
+      return `http://127.0.0.1:${address?.port}`
+    }
+
+    return await new Promise<void>((resolve, reject) => {
+      // hex, so the password can sit unencoded in the userinfo of the zip URL handed to Squirrel.Mac below
+      const pass = randomBytes(64).toString("hex")
+      const authInfo = Buffer.from(`autoupdater:${pass}`, "ascii")
+      const expectedAuthorization = Buffer.from(`Basic ${authInfo.toString("base64")}`, "ascii")
+
+      // a fresh path per download; the credentials above, not this path, are what guard the zip
+      const fileUrl = `/${randomBytes(64).toString("hex")}.zip`
+      server.on("request", (request: IncomingMessage, response: ServerResponse) => {
+        const requestUrl = request.url ?? ""
+        this.log.debug(`Proxy server for native Squirrel.Mac: ${requestUrl} requested`)
+
+        // every route requires the credentials. Squirrel.Mac sends the setFeedURL headers only with the feed request:
+        // it requests the zip without them, then answers this challenge with the credentials in the zip URL
+        const authorization = Buffer.from(request.headers.authorization ?? "", "utf8")
+        // timingSafeEqual throws on a length mismatch; the expected length is not secret
+        if (authorization.length !== expectedAuthorization.length || !timingSafeEqual(authorization, expectedAuthorization)) {
+          response.writeHead(401, "Invalid Authentication Credentials", { "WWW-Authenticate": 'Basic realm="electron-updater"' })
+          response.end()
+          this.log.debug("Proxy server for native Squirrel.Mac: request without valid credentials rejected")
+          return
+        }
+
+        // Squirrel.Mac only GETs the feed and the zip; any other method (a HEAD would end like a served zip) must not complete the download
+        if (request.method !== "GET") {
+          response.writeHead(405, { Allow: "GET" })
+          response.end()
+          this.log.debug(`Proxy server for native Squirrel.Mac: ${request.method ?? "unknown"} method rejected`)
+          return
+        }
+
+        if (requestUrl === "/") {
+          const zipUrl = new URL(fileUrl, getServerUrl(server))
+          zipUrl.username = "autoupdater"
+          zipUrl.password = pass
+          const data = Buffer.from(JSON.stringify({ url: zipUrl.href }))
+          response.writeHead(200, { "Content-Type": "application/json", "Content-Length": data.length })
+          response.end(data)
+          return
+        }
+
+        if (!requestUrl.startsWith(fileUrl)) {
+          this.log.warn(`${requestUrl} requested, but not supported`)
+          response.writeHead(404)
+          response.end()
+          return
+        }
+
+        this.log.debug(`Proxy server for native Squirrel.Mac: serving ${downloadedFile}`)
+
+        let errorOccurred = false
+        response.on("finish", () => {
+          if (!errorOccurred) {
+            this.nativeUpdater.removeListener("error", reject)
+            resolve()
+          }
+        })
+
+        const readStream = createReadStream(downloadedFile)
+        readStream.on("error", error => {
+          try {
+            response.end()
+          } catch (e: any) {
+            this.log.warn(`cannot end response: ${e}`)
+          }
+          errorOccurred = true
+          this.nativeUpdater.removeListener("error", reject)
+          reject(new Error(`Cannot pipe "${downloadedFile}": ${error}`))
+        })
+
+        response.writeHead(200, {
+          "Content-Type": "application/zip",
+          "Content-Length": updateFileSize,
+        })
+        readStream.pipe(response)
+      })
+
+      server.on("error", error => {
+        this.nativeUpdater.removeListener("error", reject)
+        // this server, not this.server: a later download may already have replaced it
+        server.close()
+        reject(newError(`Proxy server for native Squirrel.Mac failed: ${error}`, "ERR_UPDATER_MAC_PROXY_SERVER_FAILED"))
+      })
+
+      this.log.debug(`Proxy server for native Squirrel.Mac is starting to listen (${logContext})`)
+
+      server.listen(0, "127.0.0.1", () => {
+        this.log.debug(`Proxy server for native Squirrel.Mac is listening (address=${getServerUrl(server)}, ${logContext})`)
+        this.nativeUpdater.setFeedURL({
+          url: getServerUrl(server),
+          headers: {
+            "Cache-Control": "no-cache",
+            Authorization: `Basic ${authInfo.toString("base64")}`,
+          },
+        })
+
+        // The update has been downloaded and is ready to be served to Squirrel
+        this.dispatchUpdateDownloaded(event)
+
+        // on macOS both "onQuit" and "onNextLaunch" map to the same native behavior: Squirrel stages the update and
+        // applies it on relaunch after quit. Only "manual" leaves it unstaged until an explicit quitAndInstall().
+        if (this.autoInstallEvent !== "manual") {
+          this.nativeUpdater.once("error", reject)
+          // This will trigger fetching and installing the file on Squirrel side
+          this.nativeUpdater.checkForUpdates()
+        } else {
+          resolve()
+        }
+      })
+    })
+  }
+
+  private handleUpdateDownloaded() {
+    if (this.autoRunAppAfterInstall) {
       this.nativeUpdater.quitAndInstall()
     } else {
+      this.app.quit()
+    }
+    this.closeServerIfExists()
+  }
+
+  quitAndInstall(options: QuitAndInstallOptions | boolean = {}, legacyIsForceRunAfter?: boolean): void {
+    const normalized = this.normalizeQuitAndInstallOptions(options, legacyIsForceRunAfter)
+    if (normalized.waitUntilNextLaunch) {
+      // no deferred-install state is needed on macOS: Squirrel.Mac already stages the downloaded update natively
+      // (ShipIt) and applies it when the app is relaunched after a normal quit, without spawning a killable
+      // detached installer process. Quitting the app is the closest equivalent behavior.
+      this.log.info("quitAndInstall called with waitUntilNextLaunch: Squirrel.Mac stages updates natively, the staged update is applied on relaunch after quit")
+      this.app.quit()
+      return
+    }
+    if (this.squirrelDownloadedUpdate) {
+      // update already fetched by Squirrel, it's ready to install
+      this.handleUpdateDownloaded()
+    } else {
       // Quit and install as soon as Squirrel get the update
-      this.nativeUpdater.on("update-downloaded", () => {
-        this.nativeUpdater.quitAndInstall()
-      })
+      this.nativeUpdater.once("update-downloaded", () => this.handleUpdateDownloaded())
+
+      if (this.autoInstallEvent === "manual") {
+        /**
+         * In "manual" mode MacUpdater.doDownloadUpdate() would not actually initiate the downloading by electron's
+         * autoUpdater, so kick it off now.
+         */
+        this.nativeUpdater.checkForUpdates()
+      }
     }
   }
 }

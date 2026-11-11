@@ -1,6 +1,7 @@
+import { Nullish } from "builder-util-runtime"
 import * as path from "path"
-import { langIdToName, toLangWithRegion } from "./langs"
-import { PlatformPackager } from "../platformPackager"
+import { PlatformPackager } from "../platformPackager.js"
+import { langIdToName, toLangWithRegion } from "./langs.js"
 
 export function getLicenseAssets(fileNames: Array<string>, packager: PlatformPackager<any>) {
   return fileNames
@@ -10,7 +11,10 @@ export function getLicenseAssets(fileNames: Array<string>, packager: PlatformPac
       return aW === bW ? a.localeCompare(b) : aW - bW
     })
     .map(file => {
-      let lang = /_([^.]+)\./.exec(file)![1]
+      // Linear parse (first `_` → first `.` after it) avoids the polynomial backtracking of /_([^.]+)\./
+      const underscore = file.indexOf("_")
+      const dot = file.indexOf(".", underscore + 1)
+      let lang = file.substring(underscore + 1, dot)
       let langWithRegion
       if (lang.includes("_")) {
         langWithRegion = lang
@@ -24,7 +28,7 @@ export function getLicenseAssets(fileNames: Array<string>, packager: PlatformPac
 }
 
 export async function getNotLocalizedLicenseFile(
-  custom: string | null | undefined,
+  custom: string | Nullish,
   packager: PlatformPackager<any>,
   supportedExtension: Array<string> = ["rtf", "txt", "html"]
 ): Promise<string | null> {
@@ -45,7 +49,7 @@ export async function getLicenseFiles(packager: PlatformPackager<any>): Promise<
   return getLicenseAssets(
     (await packager.resourceList).filter(it => {
       const name = it.toLowerCase()
-      return (name.startsWith("license_") || name.startsWith("eula_")) && (name.endsWith(".rtf") || name.endsWith(".txt"))
+      return (name.startsWith("license_") || name.startsWith("eula_")) && (name.endsWith(".rtf") || name.endsWith(".txt") || name.endsWith(".html"))
     }),
     packager
   )

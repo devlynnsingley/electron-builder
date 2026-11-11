@@ -1,21 +1,65 @@
-import { exec } from "builder-util"
-import { PlatformPackager } from "app-builder-lib"
-import { executeFinally } from "builder-util/out/promise"
+import { DmgContent, DmgOptions, MacPackager, PlatformPackager } from "app-builder-lib"
+import { downloadBuilderToolset, withToolsetLock } from "app-builder-lib/internal"
+import { exec, Executables, executeFinally, exists, InvalidConfigurationError, isEmptyOrSpaces, log, TmpDir } from "builder-util"
+import { sleep } from "builder-util-runtime"
+import { stat } from "fs/promises"
+
 import * as path from "path"
+import { DmgBuildConfig } from "./dmg.js"
+import type { DmgBuildLicenseConfig } from "./dmgLicense.js"
+import { hdiUtil, hdiUtilWithStdin, hdiutilTransientExitCodes } from "./hdiuil.js"
+import _fsExtra from "fs-extra"
+const { writeFile } = _fsExtra
 
-export { DmgTarget } from "./dmg"
+export { DmgTarget } from "./dmg.js"
 
-const root = path.join(__dirname, "..")
+const root = path.join(import.meta.dirname, "..")
 
 export function getDmgTemplatePath() {
   return path.join(root, "templates")
 }
 
-export function getDmgVendorPath() {
-  return path.join(root, "vendor")
+async function getDmgVendorPath(): Promise<string> {
+  const customDmgbuildPath = process.env.CUSTOM_DMGBUILD_PATH?.trim()
+  if (customDmgbuildPath) {
+    const resolvedPath = path.resolve(customDmgbuildPath)
+    let dmgbuildStat: Awaited<ReturnType<typeof stat>>
+    try {
+      dmgbuildStat = await stat(resolvedPath)
+    } catch (e: any) {
+      if (e.code === "ENOENT") {
+        throw new Error(`CUSTOM_DMGBUILD_PATH "${resolvedPath}" does not exist`)
+      }
+      throw e
+    }
+    if (!dmgbuildStat.isFile()) {
+      throw new Error(`CUSTOM_DMGBUILD_PATH "${resolvedPath}" is not a regular file`)
+    }
+    log.warn({ path: resolvedPath }, "using CUSTOM_DMGBUILD_PATH override for dmgbuild binary")
+    return resolvedPath
+  }
+
+  const file = await downloadBuilderToolset(getDmgbuildBundle(process.arch === "arm64" ? "arm64" : "x86_64"))
+  return path.resolve(file, "dmgbuild")
 }
 
-export async function attachAndExecute(dmgPath: string, readWrite: boolean, task: () => Promise<any>) {
+// https://github.com/electron-userland/electron-builder-binaries/releases?q=dmg-builder&expanded=true
+const DMGBUILD_RELEASE = "dmg-builder@1.2.7"
+const DMGBUILD_CHECKSUMS = {
+  "dmgbuild-bundle-arm64-cc96fa2.tar.gz": "2b5b01f3900c702a8dcbaec5d502ae0e3dea9f3abe83097fb16f5bed11c252c6",
+  "dmgbuild-bundle-x86_64-cc96fa2.tar.gz": "fa3d91c8f9c4ac44c32cd223349a4154bdd94b09ec072c7a3cb62b11fe83f023",
+} as const
+
+/** The dmgbuild bundle downloaded for the given host architecture. */
+export function getDmgbuildBundle(arch: "arm64" | "x86_64") {
+  return {
+    releaseName: DMGBUILD_RELEASE,
+    filenameWithExt: `dmgbuild-bundle-${arch}-cc96fa2.tar.gz` as const,
+    checksums: DMGBUILD_CHECKSUMS,
+  }
+}
+
+export async function attachAndExecute(dmgPath: string, readWrite: boolean, forceDetach: boolean, task: (devicePath: string) => Promise<any>) {
   //noinspection SpellCheckingInspection
   const args = ["attach", "-noverify", "-noautoopen"]
   if (readWrite) {
@@ -23,26 +67,68 @@ export async function attachAndExecute(dmgPath: string, readWrite: boolean, task
   }
 
   args.push(dmgPath)
-  const attachResult = await exec("hdiutil", args)
-  const deviceResult = attachResult == null ? null : /^(\/dev\/\w+)/.exec(attachResult)
+  // Pipe "y\n" to stdin so that hdiutil auto-accepts any SLA/EULA dialog
+  // embedded in the DMG instead of blocking on a terminal prompt.
+  const attachResult = await hdiUtilWithStdin(args, "y\n")
+  // Use multiline flag so ^ matches any line start — the EULA text (if any)
+  // precedes the /dev/... device lines in hdiutil's stdout output.
+  const deviceResult = attachResult == null ? null : /^(\/dev\/\w+)/m.exec(attachResult)
   const device = deviceResult == null || deviceResult.length !== 2 ? null : deviceResult[1]
   if (device == null) {
     throw new Error(`Cannot mount: ${attachResult}`)
   }
 
-  return await executeFinally(task(), () => detach(device))
+  return executeAndDetach(attachResult!, device, forceDetach, task)
 }
 
-export async function detach(name: string) {
-  try {
-    await exec("hdiutil", ["detach", "-quiet", name])
-  } catch (e) {
-    await new Promise((resolve, reject) => {
-      setTimeout(() => {
-        exec("hdiutil", ["detach", "-force", name]).then(resolve).catch(reject)
-      }, 1000)
-    })
-  }
+/** @internal */
+export async function executeAndDetach(
+  attachResult: string,
+  device: string,
+  forceDetach: boolean,
+  task: (volumePath: string) => Promise<any>,
+  detacher: (device: string, forceDetach: boolean) => Promise<any> = detach
+) {
+  return executeFinally(
+    (async () => {
+      // Find the volume mount path directly from hdiutil attach output.
+      // APFS images synthesize a new disk device (e.g. disk9) separate from the container disk
+      // (e.g. disk8), so device-name matching via hdiutil info misses the APFS volume.
+      let volumePath: string | null = null
+      for (const line of attachResult.split("\n")) {
+        // the mount point is the rest of the line after the first whitespace-preceded "/Volumes/"; a fixed pattern, not
+        // /\s+(\/Volumes\/.+?)\s*$/, which backtracked polynomially on long runs of whitespace
+        const start = line.search(/\s\/Volumes\//)
+        if (start === -1) {
+          continue
+        }
+        // trimEnd removes the same characters as \s, including a trailing \r
+        const mountPoint = line.slice(start + 1).trimEnd()
+        // an empty volume name is not a mount point
+        if (mountPoint !== "/Volumes/") {
+          volumePath = mountPoint
+          break
+        }
+      }
+      if (volumePath == null) {
+        throw new Error(`Cannot find volume mount path for device: ${device}`)
+      }
+
+      return task(volumePath)
+    })(),
+    () => detacher(device, forceDetach)
+  )
+}
+
+export async function detach(name: string, alwaysForce: boolean) {
+  return hdiUtil(["detach", "-quiet", name]).catch(async e => {
+    if (hdiutilTransientExitCodes.has(e.code) || alwaysForce) {
+      // Delay then force unmount with verbose output
+      await sleep(3000)
+      return hdiUtil(["detach", "-force", name])
+    }
+    throw e
+  })
 }
 
 export async function computeBackground(packager: PlatformPackager<any>): Promise<string> {
@@ -66,4 +152,185 @@ export function serializeString(data: string) {
       .join('"\n  $"') +
     '"'
   )
+}
+
+type DmgBuilderConfig = {
+  appPath: string
+  artifactPath: string
+  volumeName: string
+  specification: DmgOptions
+  packager: MacPackager
+  licenseData?: DmgBuildLicenseConfig | null
+}
+
+export async function customizeDmg({ appPath, artifactPath, volumeName, specification, packager, licenseData }: DmgBuilderConfig): Promise<boolean> {
+  const isValidIconTextSize = !!specification.iconTextSize && specification.iconTextSize >= 10 && specification.iconTextSize <= 16
+  const iconTextSize = isValidIconTextSize ? specification.iconTextSize : 12
+  const volumePath = path.join("/Volumes", volumeName)
+  // https://github.com/electron-userland/electron-builder/issues/2115
+
+  const settings: DmgBuildConfig = {
+    title: path.basename(volumePath),
+    "icon-size": specification.iconSize,
+    "text-size": iconTextSize,
+
+    "compression-level": Number(process.env.ELECTRON_BUILDER_COMPRESSION_LEVEL || "9"),
+    filesystem: specification.filesystem || "APFS",
+    format: specification.format,
+    size: specification.size,
+    shrink: specification.shrink,
+    contents:
+      specification.contents?.map((c: DmgContent) => ({
+        path: c.path || appPath, // path is required, when ommitted, appPath is used (backward compatibility
+        x: c.x,
+        y: c.y,
+        name: c.name,
+        type: c.type === "dir" ? "file" : c.type, // appdmg expects "file" for directories
+        // hide_extension: c.hideExtension,
+      })) || [],
+  }
+
+  if (specification.badgeIcon) {
+    let badgeIcon = await packager.getResource(specification.badgeIcon)
+    if (badgeIcon && badgeIcon.toLowerCase().endsWith(".icon")) {
+      badgeIcon = await packager.generateIcnsFromIcon(badgeIcon)
+    }
+    settings["badge-icon"] = badgeIcon
+  } else {
+    settings.icon = await packager.getResource(specification.icon)
+  }
+
+  if (specification.backgroundColor != null || specification.background == null) {
+    settings["background-color"] = specification.backgroundColor || "#ffffff"
+
+    const window = specification.window
+    if (window != null) {
+      settings.window = {
+        position: {
+          x: window.x ?? 100,
+          y: window.y ?? 400,
+        },
+        size: {
+          width: window.width ?? 540,
+          height: window.height ?? 300,
+        },
+      }
+    }
+  } else {
+    settings.background = specification.background == null ? null : await transformBackgroundFileIfNeed(specification.background, packager.tempDirManager)
+  }
+
+  if (!isEmptyOrSpaces(settings.background)) {
+    const size = await getImageSizeUsingSips(settings.background)
+    const window = specification.window
+    settings.window = {
+      position: {
+        x: window?.x ?? 400,
+        y: window?.y ?? Math.round((1440 - size.height) / 2),
+      },
+      size: {
+        width: window?.width ?? size.width,
+        height: window?.height ?? size.height,
+      },
+    }
+  }
+
+  const workspaceRoot = await packager.getWorkspaceRoot()
+  for (const item of settings.contents ?? []) {
+    if (item.type === "file" && item.path && path.isAbsolute(item.path)) {
+      if (!item.path.startsWith(workspaceRoot + path.sep) && item.path !== appPath) {
+        log.error({ contentPath: item.path }, "dmg.contents path is outside the workspace root — verify this is intentional")
+        throw new InvalidConfigurationError(`dmg.contents path "${item.path}" is outside the workspace root`)
+      }
+    }
+  }
+
+  if (licenseData) {
+    settings.license = licenseData
+  }
+
+  const settingsFile = await packager.getTempFile(".json")
+  await writeFile(settingsFile, JSON.stringify(settings, null, 2))
+
+  const dmgbuild = await getDmgVendorPath()
+  await withToolsetLock(() =>
+    exec(dmgbuild, ["-s", settingsFile, path.basename(volumePath), artifactPath], {
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: "utf8",
+      },
+    })
+  )
+
+  // effectiveOptionComputed, when present, is purely for verifying result during test execution
+  return (
+    packager.packagerOptions.effectiveOptionComputed == null ||
+    (await attachAndExecute(artifactPath, false, true, async volumePath => {
+      return !(await packager.packagerOptions.effectiveOptionComputed!({
+        volumePath,
+        specification: {
+          ...specification,
+          // clean up `contents` for test snapshot verification since app path is absolute to a unique tmp dir
+          contents: specification.contents?.map((c: any) => ({
+            ...c,
+            path: path.extname(c.path ?? "") === ".app" ? path.relative(packager.projectDir, c.path) : c.path,
+          })),
+        },
+        packager,
+      }))
+    }))
+  )
+}
+
+export async function transformBackgroundFileIfNeed(file: string, tmpDir: TmpDir): Promise<string> {
+  if (path.extname(file.toLowerCase()) === ".tiff") {
+    return file
+  }
+
+  const retinaFile = getRetinaFilePath(file)
+  if (retinaFile != null && (await exists(retinaFile))) {
+    const tiffFile = await tmpDir.getTempFile({ suffix: ".tiff" })
+    await exec(Executables.resolve("tiffutil"), ["-cathidpicheck", file, retinaFile, "-out", tiffFile])
+    return tiffFile
+  }
+
+  return file
+}
+
+/** @internal */
+export function getRetinaFilePath(file: string): string | null {
+  const extension = path.extname(file)
+  return extension === "" ? null : `${file.slice(0, -extension.length)}@2x${extension}`
+}
+
+export async function getImageSizeUsingSips(background: string) {
+  const stdout = await exec(Executables.resolve("sips"), ["-g", "pixelHeight", "-g", "pixelWidth", background])
+
+  let width = 0
+  let height = 0
+
+  const re = /([a-zA-Z]+):\s*(\d+)/
+  const lines = stdout.split("\n")
+
+  for (const line of lines) {
+    const match = re.exec(line)
+    if (!match) {
+      continue
+    }
+
+    const key = match[1]
+    const value = parseInt(match[2], 10)
+
+    if (isNaN(value)) {
+      throw new Error(`Failed to parse number from line: "${line}"`)
+    }
+
+    if (key === "pixelWidth") {
+      width = value
+    } else if (key === "pixelHeight") {
+      height = value
+    }
+  }
+
+  return { width, height }
 }

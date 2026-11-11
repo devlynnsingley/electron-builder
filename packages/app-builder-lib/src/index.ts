@@ -1,60 +1,117 @@
-import { executeFinally } from "builder-util/out/promise"
-import { PublishOptions } from "electron-publish/out/publisher"
-import { log, InvalidConfigurationError } from "builder-util"
+import { Executables, InvalidConfigurationError, executeFinally, log } from "builder-util"
 import { asArray } from "builder-util-runtime"
-import { Packager } from "./packager"
-import { PackagerOptions } from "./packagerApi"
-import { resolveFunction } from "./platformPackager"
-import { PublishManager } from "./publish/PublishManager"
+import { PublishOptions } from "electron-publish"
+import { Packager } from "./packager.js"
+import { PackagerOptions } from "./packagerApi.js"
+import { PublishManager } from "./publish/PublishManager.js"
+import { resolveFunction } from "./util/resolve.js"
 
-export { Packager, BuildResult } from "./packager"
-export { PackagerOptions, ArtifactCreated, ArtifactBuildStarted } from "./packagerApi"
+export { Arch, archFromString, getArchSuffix } from "builder-util"
+export { AppInfo } from "./appInfo.js"
 export {
-  TargetConfiguration,
-  Platform,
-  Target,
-  DIR_TARGET,
+  AfterExtractContext,
+  AfterPackContext,
+  BeforePackContext,
+  CommonConfiguration,
+  Configuration,
+  ExecutableLocation,
+  ExecutableName,
+  ExecutablesConfig,
+  Hook,
+  Hooks,
+  MetadataDirectories,
+  PackContext,
+  ToolsetConfig,
+  ToolsetCustom,
+} from "./configuration.js"
+export {
   BeforeBuildContext,
-  SourceRepositoryInfo,
-  TargetSpecificOptions,
-  TargetConfigType,
-  DEFAULT_TARGET,
   CompressionLevel,
-} from "./core"
-export { getArchSuffix, Arch, archFromString } from "builder-util"
-export { Configuration, AfterPackContext, MetadataDirectories } from "./configuration"
-export { ElectronBrandingOptions, ElectronDownloadOptions, ElectronPlatformName } from "./electron/ElectronFramework"
-export { PlatformSpecificBuildOptions, AsarOptions, FileSet, Protocol, ReleaseInfo } from "./options/PlatformSpecificBuildOptions"
-export { FileAssociation } from "./options/FileAssociation"
-export { MacConfiguration, DmgOptions, MasConfiguration, MacOsTargetName, DmgContent, DmgWindow } from "./options/macOptions"
-export { PkgOptions, PkgBackgroundOptions, BackgroundAlignment, BackgroundScaling } from "./options/pkgOptions"
-export { WindowsConfiguration } from "./options/winOptions"
-export { AppXOptions } from "./options/AppXOptions"
-export { MsiOptions } from "./options/MsiOptions"
-export { CommonWindowsInstallerConfiguration } from "./options/CommonWindowsInstallerConfiguration"
-export { NsisOptions, NsisWebOptions, PortableOptions, CommonNsisOptions } from "./targets/nsis/nsisOptions"
-export { LinuxConfiguration, DebOptions, CommonLinuxOptions, LinuxTargetSpecificOptions, AppImageOptions, FlatpakOptions } from "./options/linuxOptions"
-export { SnapOptions } from "./options/SnapOptions"
-export { Metadata, AuthorMetadata, RepositoryInfo } from "./options/metadata"
-export { AppInfo } from "./appInfo"
-export { SquirrelWindowsOptions } from "./options/SquirrelWindowsOptions"
+  DEFAULT_TARGET,
+  DIR_TARGET,
+  Platform,
+  SourceRepositoryInfo,
+  Target,
+  TargetConfigType,
+  TargetConfiguration,
+  TargetSpecificOptions,
+} from "./core.js"
+export { ElectronBrandingOptions, ElectronPlatformName } from "./electron/ElectronFramework.js"
+export { AppXOptions } from "./options/AppXOptions.js"
+export { CommonWindowsInstallerConfiguration } from "./options/CommonWindowsInstallerConfiguration.js"
+export { FileAssociation } from "./options/FileAssociation.js"
 export {
-  WindowsSignOptions,
-  CustomWindowsSignTaskConfiguration,
-  WindowsSignTaskConfiguration,
-  CustomWindowsSign,
-  FileCodeSigningInfo,
-  CertificateFromStoreInfo,
-} from "./codeSign/windowsCodeSign"
+  AppImageOptions,
+  CommonLinuxOptions,
+  DebOptions,
+  FlatpakAdditionalArgs,
+  FlatpakOptions,
+  LinuxConfiguration,
+  LinuxDesktopFile,
+  LinuxTargetSpecificOptions,
+  PacmanOptions,
+  RpmOptions,
+} from "./options/linuxOptions.js"
+export type { DmgContent, DmgOptions, DmgWindow, ElectronSignOptions, ElectronUniversalOptions, MacConfiguration, MacOsTargetName, MasConfiguration } from "./options/macOptions.js"
+export { AuthorMetadata, Metadata, RepositoryInfo } from "./options/metadata.js"
+export { MsiOptions } from "./options/MsiOptions.js"
+export { MsiWrappedOptions } from "./options/MsiWrappedOptions.js"
+export { MsixOptions, MsixWindowsService } from "./options/MsixOptions.js"
+export { BackgroundAlignment, BackgroundScaling, PkgBackgroundOptions, PkgOptions } from "./options/pkgOptions.js"
+export { AsarOptions, FileSet, FilesBuildOptions, PlatformSpecificBuildOptions, Protocol, ReleaseInfo } from "./options/PlatformSpecificBuildOptions.js"
+export { PlugDescriptor, RemoteBuildOptions, SlotDescriptor, SnapcraftOptions, SnapOptions24, SnapOptionsCustom, SnapOptionsLegacy } from "./options/SnapOptions.js"
+export { SquirrelWindowsOptions } from "./options/SquirrelWindowsOptions.js"
+export {
+  WindowsAzureSigningConfig,
+  WindowsConfiguration,
+  WindowsHsmSigningConfig,
+  WindowsPkcs11SigningConfig,
+  WindowsSigningConfiguration,
+  WindowsSigntoolFamilyConfig,
+  WindowsSigntoolSigningConfig,
+} from "./options/winOptions.js"
+export { BuildResult, Packager } from "./packager.js"
+export { ElectronGetOptions } from "./util/electronGet.js"
+export { ArtifactBuildStarted, ArtifactCreated, PackagerOptions } from "./packagerApi.js"
+export { CommonNsisOptions, NsisOptions, NsisWebOptions, PortableOptions } from "./targets/win/nsis/nsisOptions.js"
+export { FuseOptionsV1 } from "./options/FuseOptionsV1.js"
 export { CancellationToken, ProgressInfo } from "builder-util-runtime"
 export { PublishOptions, UploadTask } from "electron-publish"
-export { PublishManager } from "./publish/PublishManager"
-export { PlatformPackager } from "./platformPackager"
-export { Framework, PrepareApplicationStageDirectoryOptions } from "./Framework"
-export { buildForge, ForgeOptions } from "./forge-maker"
-export { SnapStoreOptions } from "./publish/SnapStorePublisher"
+export { combineSignResults, isSignResultSigned, SignFileResult, SigningResult } from "./codeSign/signResult.js"
+export { WindowsSignOptions } from "./codeSign/win/windowsCodeSign.js"
+export {
+  CertificateFromStoreInfo,
+  CustomWindowsSign,
+  CustomWindowsSignTaskConfiguration,
+  FileCodeSigningInfo,
+  WindowsSignTaskConfiguration,
+  WindowsSignToolManager,
+} from "./codeSign/win/windowsSignToolManager.js"
+export { HsmSignManager } from "./codeSign/win/hsmSignManager.js"
+export { Pkcs11SignManager } from "./codeSign/win/pkcs11SignManager.js"
+export { SigntoolSignManager } from "./codeSign/win/signtoolBaseSignManager.js"
+export { ToolInfo } from "./util/bundledTool.js"
+export { ElectronBuilderForgeMaker, ForgeMakerConfig, ForgeMakerOptions, ForgeMakerTarget, ForgeOptions, ForgePlatform, buildForge, withLegacyForgeCall } from "./forge-maker.js"
+export { Framework, PrepareApplicationStageDirectoryOptions } from "./Framework.js"
+export { LinuxPackager } from "./linuxPackager.js"
+export { CustomMacSign, CustomMacSignOptions, MacPackager } from "./macPackager.js"
+export { PlatformPackager } from "./platformPackager.js"
+export { PublishManager } from "./publish/PublishManager.js"
+export { WinPackager } from "./winPackager.js"
 
-const expectedOptions = new Set(["publish", "targets", "mac", "win", "linux", "projectDir", "platformPackagerFactory", "config", "effectiveOptionComputed", "prepackaged"])
+const expectedOptions = new Set([
+  "publish",
+  "targets",
+  "mac",
+  "win",
+  "linux",
+  "projectDir",
+  "platformPackagerFactory",
+  "config",
+  "effectiveOptionComputed",
+  "afterPackTestHook",
+  "prepackaged",
+])
 
 export function checkBuildRequestOptions(options: PackagerOptions & PublishOptions) {
   for (const optionName of Object.keys(options)) {
@@ -75,35 +132,47 @@ export function build(options: PackagerOptions & PublishOptions, packager: Packa
   }
   process.once("SIGINT", sigIntHandler)
 
-  const promise = packager.build().then(async buildResult => {
-    const afterAllArtifactBuild = resolveFunction(buildResult.configuration.afterAllArtifactBuild, "afterAllArtifactBuild")
-    if (afterAllArtifactBuild != null) {
-      const newArtifacts = asArray(await Promise.resolve(afterAllArtifactBuild(buildResult)))
-      if (newArtifacts.length === 0 || !publishManager.isPublish) {
-        return buildResult.artifactPaths
-      }
+  // what runs after the build (afterAllArtifactBuild, its uploads) gets the build's toolsets.executables too
+  const promise = packager.build().then(buildResult =>
+    Executables.run(buildResult.configuration.toolsets?.executables, async () => {
+      const afterAllArtifactBuild = await resolveFunction(
+        packager.appInfo.type,
+        buildResult.configuration.afterAllArtifactBuild,
+        "afterAllArtifactBuild",
+        await packager.getWorkspaceRoot()
+      )
+      if (afterAllArtifactBuild != null) {
+        const newArtifacts = asArray(await Promise.resolve(afterAllArtifactBuild(buildResult)))
+        if (newArtifacts.length === 0 || !publishManager.isPublish) {
+          return buildResult.artifactPaths
+        }
 
-      const publishConfigurations = await publishManager.getGlobalPublishConfigurations()
-      if (publishConfigurations == null || publishConfigurations.length === 0) {
-        return buildResult.artifactPaths
-      }
+        const publishConfigurations = await publishManager.getGlobalPublishConfigurations()
+        if (publishConfigurations == null || publishConfigurations.length === 0) {
+          return buildResult.artifactPaths
+        }
 
-      for (const newArtifact of newArtifacts) {
-        buildResult.artifactPaths.push(newArtifact)
-        for (const publishConfiguration of publishConfigurations) {
-          publishManager.scheduleUpload(
-            publishConfiguration,
-            {
-              file: newArtifact,
-              arch: null,
-            },
-            packager.appInfo
-          )
+        for (const newArtifact of newArtifacts) {
+          if (buildResult.artifactPaths.includes(newArtifact)) {
+            log.warn({ newArtifact }, "skipping publish of artifact, already published")
+            continue
+          }
+          buildResult.artifactPaths.push(newArtifact)
+          for (const publishConfiguration of publishConfigurations) {
+            await publishManager.scheduleUpload(
+              publishConfiguration,
+              {
+                file: newArtifact,
+                arch: null,
+              },
+              packager.appInfo
+            )
+          }
         }
       }
-    }
-    return buildResult.artifactPaths
-  })
+      return buildResult.artifactPaths
+    })
+  )
 
   return executeFinally(promise, isErrorOccurred => {
     let promise: Promise<any>
@@ -114,6 +183,9 @@ export function build(options: PackagerOptions & PublishOptions, packager: Packa
       promise = publishManager.awaitTasks()
     }
 
-    return promise.then(() => process.removeListener("SIGINT", sigIntHandler))
+    return promise.then(() => {
+      packager.clearPackagerEventListeners()
+      process.removeListener("SIGINT", sigIntHandler)
+    })
   })
 }

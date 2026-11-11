@@ -1,0 +1,23 @@
+FROM archlinux:base-20250629.0.373469
+
+RUN pacman-key --init \
+ && pacman-key --populate archlinux \
+ && pacman -Sy --noconfirm archlinux-keyring \
+ && pacman-key --populate archlinux \
+ && pacman -S --noconfirm gnupg \
+ && pacman -Syu --noconfirm \
+ && pacman -S --noconfirm \
+    libxcrypt-compat \
+    base-devel \
+    git \
+    nodejs-lts-jod \
+    npm \
+    sudo \
+    xorg-server-xvfb \
+ && pacman -Scc --noconfirm \
+ && rm -rf /var/lib/pacman/sync/* /var/cache/pacman/pkg/*
+
+RUN npm --silent install --global --depth 0 pnpm corepack \
+ && corepack enable
+
+WORKDIR /project

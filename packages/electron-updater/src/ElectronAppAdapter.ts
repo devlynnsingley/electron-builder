@@ -1,5 +1,9 @@
+import { createRequire } from "node:module"
 import * as path from "path"
-import { AppAdapter, getAppCacheDir } from "./AppAdapter"
+
+// import.meta is empty when a bundler inlines this module into a CommonJS bundle; Electron resolves "electron" from any base path
+const require = createRequire(import.meta.url ?? process.execPath)
+import { AppAdapter, CancellableQuitEvent, getAppCacheDir } from "./AppAdapter.js"
 
 export class ElectronAppAdapter implements AppAdapter {
   constructor(private readonly app = require("electron").app) {}
@@ -21,7 +25,7 @@ export class ElectronAppAdapter implements AppAdapter {
   }
 
   get appUpdateConfigPath(): string {
-    return this.isPackaged ? path.join(process.resourcesPath!, "app-update.yml") : path.join(this.app.getAppPath(), "dev-app-update.yml")
+    return this.isPackaged ? path.join(process.resourcesPath, "app-update.yml") : path.join(this.app.getAppPath(), "dev-app-update.yml")
   }
 
   get userDataPath(): string {
@@ -36,7 +40,42 @@ export class ElectronAppAdapter implements AppAdapter {
     this.app.quit()
   }
 
+  relaunch(): void {
+    this.app.relaunch()
+  }
+
   onQuit(handler: (exitCode: number) => void): void {
-    this.app.once("quit", (_: Event, exitCode: number) => handler(exitCode))
+    this.app.once("quit", (_: Electron.Event, exitCode: number) => handler(exitCode))
+  }
+
+  onWillQuit(handler: (event: CancellableQuitEvent) => void): void {
+    // `on`, not `once`: a cancelled quit is followed by another one
+    this.app.on("will-quit", (event: Electron.Event) =>
+      handler({
+        preventDefault: () => event.preventDefault(),
+        // read when asked: a handler that cancels the quit sets it; an Electron version without it reports false
+        get defaultPrevented(): boolean {
+          const defaultPrevented: unknown = event.defaultPrevented
+          return typeof defaultPrevented === "boolean" && defaultPrevented
+        },
+      })
+    )
+  }
+
+  onSessionEnd(handler: () => void): void {
+    // powerMonitor can only be used after the app is ready
+    void this.whenReady().then(() => {
+      const electron = require("electron")
+      // `shutdown` is only emitted on macOS and Linux
+      if (process.platform !== "win32") {
+        electron.powerMonitor.on("shutdown", () => handler())
+        return
+      }
+      // Windows has no app-level session-end signal; `session-end` is only emitted on BrowserWindow instances,
+      // so windowless (e.g. tray-only) apps cannot be covered here
+      const attachToWindow = (window: Electron.BrowserWindow) => window.on("session-end", () => handler())
+      electron.BrowserWindow.getAllWindows().forEach(attachToWindow)
+      this.app.on("browser-window-created", (_event: Electron.Event, window: Electron.BrowserWindow) => attachToWindow(window))
+    })
   }
 }

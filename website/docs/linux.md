@@ -1,0 +1,295 @@
+---
+title: "Linux"
+---
+
+{!./partials/_upgrading-from-v26.md!}
+
+The top-level [linux](configuration.md) key contains a set of options instructing electron-builder on how it should build Linux targets. These options are applicable to any Linux target.
+
+## Linux Target Overview
+
+electron-builder supports a wide range of Linux package formats. Choose based on your target audience and distribution method:
+
+| Target | Format | Best For | Distro Support |
+|---|---|---|---|
+| `AppImage` | Single file | Broad compatibility, no install | Universal |
+| `deb` | Debian package | Ubuntu, Debian, Mint | Debian-based |
+| `rpm` | RPM package | Fedora, RHEL, openSUSE | Red Hat-based |
+| `snap` | Snap package | Ubuntu-primary | Any (snapd required) |
+| `flatpak` | Flatpak | Cross-distro sandboxed | Any (flatpak required) |
+| `pacman` | Arch package | Arch Linux, Manjaro | Arch-based |
+| `apk` | Alpine package | Alpine Linux, containers | Alpine |
+| `freebsd` | FreeBSD pkg | FreeBSD | FreeBSD |
+| `p5p` | Solaris IPS | Solaris, illumos | Solaris-based |
+| `zip`, `7z`, `tar.*` | Archive | Custom CDN distribution | Universal |
+| `dir` | Directory | Development/debugging | N/A |
+
+The default targets are `AppImage` and `Snap`.
+
+## Common Linux Configuration
+
+Options set in the `linux` key apply to all Linux targets:
+
+```yaml
+linux:
+  target:
+    - AppImage
+    - deb
+    - rpm
+  category: Utility                  # freedesktop.org category
+  synopsis: "A short description"    # one-line description
+  description: "Full description"    # longer description
+  maintainer: "Name <email>"         # package maintainer
+  vendor: "My Company"               # package vendor
+  mimeTypes:
+    - application/x-myapp
+  executableArgs:
+    - --enable-features=WebContentsFocusOnResize
+```
+
+:::note[v27: launcher entrypoint]
+Every Linux target except flatpak (deb/rpm, AppImage, snap) now launches through a generated `<executableName>-launcher` shell script rather than invoking the executable directly. `executableArgs` (and `forceX11`) are injected into that launcher, and the generated `.desktop` `Exec` key points at it (e.g. `Exec=/opt/MyApp/MyApp-launcher %U`) rather than inlining the args. This makes `executableArgs` apply consistently across all Linux targets. If you ship a custom `.desktop` override, an AppArmor/snap profile, or a MIME handler that hard-codes the `Exec` command, point it at the `*-launcher` script. The flatpak target keeps its own `electron-wrapper` script (`Exec=electron-wrapper %U`), which receives `executableArgs` as well. See [v27 Breaking Changes → Linux launcher entrypoint](./migration/v27-runtime-changes.md#linux-launcher-entrypoint).
+:::
+
+## Desktop File Customization
+
+All Linux targets include a `.desktop` file for application menu integration. Customize it via `linux.desktop`:
+
+```yaml
+linux:
+  desktop:
+    entry:
+      Name: My Application
+      Comment: A fantastic application
+      Categories: Office;Productivity
+      Keywords: productivity;notes;organizer
+      StartupWMClass: my-app       # helps window managers match window to icon
+      Terminal: false
+      Type: Application
+    desktopActions:
+      NewWindow:
+        Name: New Window
+        Exec: my-app --new-window
+      NewFile:
+        Name: New File
+        Exec: my-app --new-file
+```
+
+Standard freedesktop.org category values include: `AudioVideo`, `Audio`, `Video`, `Development`, `Education`, `Game`, `Graphics`, `Network`, `Office`, `Science`, `Settings`, `System`, `Utility`.
+
+### Desktop entry validation {#desktop-entry-validation}
+
+Keys and values are written to the file as given, so escape sequences such as `\;` in a list value are kept. Every Linux target that writes a desktop entry checks them first, and fails the build with an `InvalidConfigurationError` that names the group and the key (or the action) when:
+
+- a key, in `entry` or in an action, is empty, contains `=` or a line break, or has brackets other than around a trailing locale of letters, digits, `-`, `_`, `.` and `@`, right after the key, such as `Name[de]` or `Comment[sr@latin]`. These are the keys that GLib, which most desktops read the file with, rejects, and it then ignores the whole file. Keys that the specification does not allow but desktop environments read, such as `X_Foo`, are kept;
+- a value contains a line break, which would end the line and start a new key or group. A value must be on one line: write a newline in a string value as `\n`. Line breaks at the end of a value, as in a YAML block scalar (`|`), are dropped. This also applies to the values built from other options: `Categories` from `linux.category`, and `MimeType` from `linux.mimeTypes`, `fileAssociations` and `protocols`;
+- an action name contains `[`, `]` or a control character.
+
+The `Name`, `Comment` and `StartupWMClass` values that electron-builder derives from the product name, the description and `desktopName` are escaped instead, so they are not affected. Each of these cases would otherwise produce a file that desktop environments read differently from what was configured, or not at all. To fix the error, write the value on one line and use a key that the [Desktop Entry Specification](https://specifications.freedesktop.org/desktop-entry/latest/basic-format.html) allows; your own keys start with `X-`, such as `X-MyApp-Feature`.
+
+## Window Association (`desktopName`)
+
+Electron derives its [`app_id`](https://github.com/electron/electron/blob/main/lib/browser/init.ts) — which becomes the window's `WM_CLASS` — from the `desktopName` field in your root `package.json`. Desktop environments (GNOME, KDE, etc.) use `WM_CLASS` to match a running window to its `.desktop` entry for taskbar grouping, dock badges, and launcher highlighting.
+
+**Without `desktopName` set, this association can break**: the fallback `WM_CLASS` may not match the installed `.desktop` filename, so the DE treats the running app as an unknown window.
+
+To fix this, set `desktopName` in `package.json`:
+
+```json title="package.json"
+{
+  "desktopName": "com.example.MyApp"
+}
+```
+
+electron-builder installs the `.desktop` file as `${desktopName}.desktop` (here `com.example.MyApp.desktop`) and sets `StartupWMClass=com.example.MyApp`, both matching Electron's `app_id`. A trailing `.desktop` in `desktopName` is tolerated (stripped before the filename is composed), so configs written for earlier versions keep working. When `desktopName` is absent, the filename falls back to `executableName`. The flatpak target is the exception: its `.desktop` file is always named after the [Flatpak application ID](flatpak.md#application-id), so for the flatpak `desktopName` has to be that ID followed by `.desktop` — see [Desktop Name](flatpak.md#desktop-name).
+
+:::note[Changed in v27]
+The installed `.desktop` filename is now always derived from `desktopName`. The `linux.syncDesktopName` flag that previously gated this behaviour has been removed — see the [v27 breaking changes](./migration/v27-config-changes.md#linuxsyncdesktopname-always-synced).
+:::
+
+:::warning[desktopName is required for reliable window association]
+If `desktopName` is absent, electron-builder will log a warning at build time. Without it, desktop environments on GNOME, KDE, and others may not correctly link the running application window to its launcher entry.
+:::
+
+See the [freedesktop.org specification](https://specifications.freedesktop.org/desktop-entry-spec/latest/example.html) for all valid keys.
+
+## Icon Configuration
+
+Provide a directory of PNG icons named with their size:
+
+```yaml
+linux:
+  icon: build/icons/
+```
+
+Files must be named `NxN.png` (e.g., `256x256.png`, `512x512.png`). If not specified, electron-builder auto-generates Linux icons from the macOS `.icns` file (if present) or the Windows `.ico` file.
+
+Recommended sizes: 16, 24, 32, 48, 64, 96, 128, 256, 512 pixels.
+
+## Debian Package (`deb`)
+
+The `deb` target creates a `.deb` package installable via `apt` on Debian, Ubuntu, Mint, and other Debian-based distributions.
+
+```yaml
+deb:
+  depends:
+    - libgtk-3-0
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0
+    - libuuid1
+    - libsecret-1-0
+  recommends:
+    - libappindicator3-1    # system tray support
+  packageCategory: utils
+  priority: optional
+```
+
+**Common `depends` packages for Electron apps:**
+- `libgtk-3-0` — GTK3 (required)
+- `libnotify4` — desktop notifications
+- `libnss3` — NSS (Chromium networking)
+- `libxss1` — screen saver extension
+- `libxtst6` — X test extension
+- `xdg-utils` — desktop integration utilities
+- `libatspi2.0-0` — accessibility
+- `libuuid1` — UUID support
+- `libsecret-1-0` — keychain/Secret Service
+
+**Priority values:** `required`, `important`, `standard`, `optional` (use `optional` for most apps)
+
+## RPM Package (`rpm`)
+
+The `rpm` target creates a `.rpm` package for Fedora, RHEL, CentOS, openSUSE, and other RPM-based distributions.
+
+```yaml
+rpm:
+  depends:
+    - libXScrnSaver
+    - libnotify
+    - libappindicator
+    - nss
+    - gtk3
+  compression: xz     # gz | bzip2 | xz | lzo (default: xz)
+  packageCategory: Applications/Internet
+```
+
+**Common `depends` for Electron on RPM systems:**
+- `gtk3` — GTK3
+- `libnotify` — notifications
+- `libXScrnSaver` — screen saver
+- `nss` — networking
+
+**Build-id links and package format:** RPMs are built without `/usr/lib/.build-id` links and with the v4 package format, so the output is the same whichever `rpm` version is installed on the build host. Without this, rpm 4.x adds a build-id link for every bundled ELF file, and two apps that ship the same Electron binaries conflict on install. To restore the links, override the define through `fpm` (user args come last, so they win):
+
+```yaml
+rpm:
+  fpm:
+    - "--rpm-rpmbuild-define=_build_id_links compat"
+```
+
+**`rpmbuild`:** fpm runs the `rpmbuild` (rpm 6.1.0) from the [`toolsets.archive`](./toolsets.md) toolset on Linux x64 and arm64 and macOS arm64, so those hosts need no `rpm` package. On Intel macOS and 32-bit Linux the toolset has no `rpmbuild`: install one (`brew install rpm`, `apt-get install rpm`) and fpm uses the host `rpmbuild` on `PATH`.
+
+**After-install/after-remove scripts:**
+
+```yaml
+rpm:
+  afterInstall: build/scripts/after-install.sh
+  afterRemove: build/scripts/after-remove.sh
+```
+
+:::note[v27: maintainer-script variable syntax]
+electron-builder interpolates variables into maintainer scripts (`afterInstall` / `afterRemove`) using shell-style `${var}`. The legacy EJS `<%= var %>` interpolation was **removed** in v27 — update any templated maintainer scripts to `${var}`. See [v27 Breaking Changes → Linux maintainer-script EJS syntax](./migration/v27-developer-changes.md#linux-maintainer-script-ejs-template-syntax).
+:::
+
+## Pacman Package (`pacman`)
+
+:::warning[Beta]
+The `pacman` target is in beta. Test thoroughly before distributing.
+:::
+
+Creates a `.pkg.tar.zst` package for Arch Linux and Arch-based distributions (Manjaro, EndeavourOS, etc.):
+
+```yaml
+pacman:
+  depends:
+    - gtk3
+    - libnotify
+    - nss
+    - libxss
+    - libxtst
+    - xdg-utils
+    - at-spi2-core
+    - libsecret
+```
+
+## Alpine APK Package (`apk`)
+
+Creates an `.apk` package for Alpine Linux, commonly used in Docker containers:
+
+```yaml
+apk:
+  depends:
+    - gtk+3.0
+    - libnotify
+    - nss
+```
+
+:::note[musl libc]
+Alpine uses musl libc rather than glibc. Electron bundles its own copy of glibc-dependent libraries, but some native modules may not be compatible with Alpine without recompilation.
+:::
+
+## FreeBSD Package (`freebsd`)
+
+Creates a `.pkg` package (not to be confused with macOS PKG) for FreeBSD systems:
+
+```yaml
+freebsd:
+  depends:
+    - gtk3
+    - libnotify
+    - nss
+```
+
+## FPM Passthrough Options
+
+The DEB, RPM, Pacman, APK, FreeBSD, and P5P targets are built using [FPM](https://github.com/jordansissel/fpm) internally. Pass additional FPM command-line arguments:
+
+```yaml
+deb:
+  fpm:
+    - "--deb-changelog=CHANGELOG.md"
+    - "--deb-no-default-config-files"
+```
+
+## AppArmor Profile (Ubuntu 24+)
+
+Ubuntu 24.04 introduced mandatory AppArmor profiles for application sandboxing. Specify a custom profile:
+
+```yaml
+deb:
+  appArmorProfile: build/apparmor-profile
+```
+
+Without a profile, the app may be restricted by Ubuntu's default profile. See the [AppArmor documentation](https://ubuntu.com/server/docs/how-to/security/apparmor/) for profile syntax.
+
+## Base Linux Configuration
+
+{!./app-builder-lib.Interface.LinuxConfiguration.md!}
+
+## Debian Package Options
+
+The top-level [deb](configuration.md) key contains a set of options for Debian packages.
+
+{!./app-builder-lib.Interface.DebOptions.md!}
+
+All [LinuxTargetSpecificOptions](linux.md#linuxtargetspecificoptions-apk-freebsd-pacman-p5p-and-rpm-options) can also be specified in `deb` to customize Debian packages.
+
+## `LinuxTargetSpecificOptions` — APK, FreeBSD, Pacman, P5P and RPM Options {#linuxtargetspecificoptions-apk-freebsd-pacman-p5p-and-rpm-options}
+
+The top-level `apk`, `freebsd`, `pacman`, `p5p` and `rpm` keys contain options for their respective Linux targets.
+
+{!./app-builder-lib.Interface.LinuxTargetSpecificOptions.md!}

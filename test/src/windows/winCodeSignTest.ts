@@ -1,109 +1,236 @@
-import { DIR_TARGET, Platform } from "electron-builder"
-import { outputFile } from "fs-extra"
-import * as path from "path"
-import { CheckingWinPackager } from "../helpers/CheckingPackager"
-import { app, appThrows } from "../helpers/packTester"
 import { parseDn } from "builder-util-runtime"
+import { WinPackager } from "app-builder-lib"
+import { SigningResult } from "app-builder-lib/src/codeSign/signResult"
+import { AuthenticodeSignerInfo } from "app-builder-lib/src/codeSign/win/authenticodeSignature"
+import { WindowsSigntoolSigningConfig } from "app-builder-lib/src/options/winOptions"
+import { Configuration, CustomWindowsSign } from "app-builder-lib/internal"
+import { AsyncTaskManager } from "builder-util"
+import { Arch, DIR_TARGET, Platform, Target } from "electron-builder"
+import { Packager } from "electron-builder"
 import { load } from "js-yaml"
+import * as path from "path"
+import { app, appThrows } from "../helpers/packTester"
 
-test("parseDn", () => {
+type SignIfResult = { file: string; ok: boolean }
+
+const baseSigningConfig: WindowsSigntoolSigningConfig = {
+  type: "signtool",
+  certificateFile: "secretFile",
+  certificatePassword: "pass",
+  signingHashAlgorithms: ["sha256"],
+}
+
+const signtoolBaseConfig: Configuration = {
+  toolsets: { winCodeSign: "1.1.0" },
+  win: {
+    sign: baseSigningConfig,
+  },
+}
+
+function makeSignQueueTestPackager(signIfResults: SignIfResult[]) {
+  return class SignQueueTestPackager extends WinPackager {
+    constructor(info: Packager) {
+      super(info)
+    }
+
+    // the no-op hook never really signs these (nonexistent) files: report them signed, so that the forceCodeSigning
+    // read-back - which fails on Windows for an unsigned file - leaves the queue behavior under test alone
+    protected readAuthenticodeSignature(): Promise<AuthenticodeSignerInfo> {
+      return Promise.resolve({ type: "signed", subject: "CN=Test", status: 0 })
+    }
+
+    async pack(outDir: string, _arch: Arch, _targets: Array<Target>, _taskManager: AsyncTaskManager): Promise<void> {
+      const files = ["file1.exe", "file2.exe", "file3.exe"].map(f => path.join(outDir, f))
+      await Promise.all(
+        files.map(f =>
+          this.signIf(f).then(
+            () => signIfResults.push({ file: path.basename(f), ok: true }),
+            () => signIfResults.push({ file: path.basename(f), ok: false })
+          )
+        )
+      )
+    }
+
+    packageInDistributableFormat(_appOutDir: string, _arch: Arch, _targets: Array<Target>, _taskManager: AsyncTaskManager): void {}
+  }
+}
+
+function makeSequentialSignTestPackager() {
+  return class SequentialSignTestPackager extends WinPackager {
+    constructor(info: Packager) {
+      super(info)
+    }
+
+    async pack(outDir: string, _arch: Arch, _targets: Array<Target>, _taskManager: AsyncTaskManager): Promise<void> {
+      for (const f of ["file1.exe", "file2.exe", "file3.exe"].map(n => path.join(outDir, n))) {
+        await this.signIf(f)
+      }
+    }
+
+    packageInDistributableFormat(_appOutDir: string, _arch: Arch, _targets: Array<Target>, _taskManager: AsyncTaskManager): void {}
+  }
+}
+
+test("parseDn", ({ expect }) => {
   expect(parseDn("CN=7digital Limited, O=7digital Limited, L=London, C=GB")).toMatchSnapshot()
 
   expect(load("publisherName:\n  - 7digital Limited")).toMatchObject({ publisherName: ["7digital Limited"] })
 })
 
-const windowsDirTarget = Platform.WINDOWS.createTarget(["dir"])
+describe("signing queue", () => {
+  describe("normal flow", () => {
+    test("signs all files when no errors occur", async ({ expect }) => {
+      let callCount = 0
+      const results: SignIfResult[] = []
 
-test.ifNotCiMac(
-  "sign nested asar unpacked executables",
-  appThrows(
-    {
-      targets: Platform.WINDOWS.createTarget(DIR_TARGET),
-      config: {
-        publish: "never",
-        asarUnpack: ["assets"],
-      },
-    },
-    {
-      signedWin: true,
-      projectDirCreated: async projectDir => {
-        await outputFile(path.join(projectDir, "assets", "nested", "nested", "file.exe"), "invalid PE file")
-      },
-    },
-    error => expect(error.message).toContain("Unrecognized file type:")
-  )
-)
+      const sign: CustomWindowsSign = () => {
+        callCount++
+        return Promise.resolve()
+      }
 
-function testCustomSign(sign: any) {
-  return app({
-    targets: Platform.WINDOWS.createTarget(DIR_TARGET),
-    platformPackagerFactory: (packager, platform) => new CheckingWinPackager(packager),
-    config: {
-      win: {
-        certificatePassword: "pass",
-        certificateFile: "secretFile",
-        sign,
-        signingHashAlgorithms: ["sha256"],
-        // to be sure that sign code will be executed
-        forceCodeSigning: true,
-      },
-    },
+      const PackagerClass = makeSignQueueTestPackager(results)
+
+      await app(expect, {
+        targets: Platform.WINDOWS.createTarget(DIR_TARGET),
+        platformPackagerFactory: (info, _platform) => new PackagerClass(info),
+        config: {
+          ...signtoolBaseConfig,
+          win: { sign: { ...baseSigningConfig, sign } },
+        },
+      })
+
+      expect(callCount).toBe(3)
+      expect(results.every(r => r.ok)).toBe(true)
+      expect(results.map(r => r.file)).toContain("file1.exe")
+      expect(results.map(r => r.file)).toContain("file2.exe")
+      expect(results.map(r => r.file)).toContain("file3.exe")
+    })
   })
-}
 
-test.ifAll.ifNotCiMac(
-  "certificateFile/password - sign as async/await",
-  testCustomSign(async () => {
-    return
-  })
-)
-test.ifAll.ifNotCiMac(
-  "certificateFile/password - sign as Promise",
-  testCustomSign(() => Promise.resolve())
-)
-test.ifAll.ifNotCiMac("certificateFile/password - sign as function", testCustomSign(require("../helpers/customWindowsSign").default))
-test.ifAll.ifNotCiMac("certificateFile/password - sign as path", testCustomSign(path.join(__dirname, "../helpers/customWindowsSign")))
+  describe("queue recovery", () => {
+    test("signs subsequent files after a transient rejection on file2", async ({ expect }) => {
+      let callCount = 0
+      const signedFiles: string[] = []
+      const results: SignIfResult[] = []
 
-test.ifAll.ifNotCiMac("custom sign if no code sign info", () => {
-  let called = false
-  return app(
-    {
-      targets: Platform.WINDOWS.createTarget(DIR_TARGET),
-      platformPackagerFactory: (packager, platform) => new CheckingWinPackager(packager),
-      config: {
-        win: {
-          // to be sure that sign code will be executed
-          forceCodeSigning: true,
-          sign: async () => {
-            called = true
+      const sign: CustomWindowsSign = config => {
+        callCount++
+        if (path.basename(config.path) === "file2.exe") {
+          throw new Error("transient signing error")
+        }
+        signedFiles.push(path.basename(config.path))
+        return Promise.resolve()
+      }
+
+      const PackagerClass = makeSignQueueTestPackager(results)
+
+      await app(expect, {
+        targets: Platform.WINDOWS.createTarget(DIR_TARGET),
+        platformPackagerFactory: (info, _platform) => new PackagerClass(info),
+        config: {
+          ...signtoolBaseConfig,
+          win: { sign: { ...baseSigningConfig, sign } },
+        },
+      })
+
+      // All 3 files must be attempted — proves queue was not permanently broken
+      expect(callCount).toBe(3)
+      expect(signedFiles).toContain("file1.exe")
+      expect(signedFiles).not.toContain("file2.exe")
+      expect(signedFiles).toContain("file3.exe")
+
+      // Rejection from file2 must propagate to its caller
+      expect(results.find(r => r.file === "file2.exe")?.ok).toBe(false)
+      // file3 must resolve successfully after queue recovery
+      expect(results.find(r => r.file === "file3.exe")?.ok).toBe(true)
+    })
+
+    test("rejection propagates to caller even with forceCodeSigning enabled", async ({ expect }) => {
+      let callCount = 0
+      const results: SignIfResult[] = []
+
+      const sign: CustomWindowsSign = config => {
+        callCount++
+        if (path.basename(config.path) === "file2.exe") {
+          throw new Error("transient signing error")
+        }
+        return Promise.resolve()
+      }
+
+      const PackagerClass = makeSignQueueTestPackager(results)
+
+      await app(expect, {
+        targets: Platform.WINDOWS.createTarget(DIR_TARGET),
+        platformPackagerFactory: (info, _platform) => new PackagerClass(info),
+        config: {
+          ...signtoolBaseConfig,
+          win: {
+            sign: { ...baseSigningConfig, sign },
+            forceCodeSigning: true,
           },
         },
-      },
-    },
-    {
-      packed: async () => {
-        expect(called).toBe(true)
-      },
-    }
-  )()
+      })
+
+      // Queue must recover regardless of forceCodeSigning
+      expect(callCount).toBe(3)
+      expect(results.find(r => r.file === "file2.exe")?.ok).toBe(false)
+      expect(results.find(r => r.file === "file3.exe")?.ok).toBe(true)
+    })
+
+    test("forceCodeSigning: true — transient error on any file propagates to a build failure", async ({ expect }) => {
+      const sign: CustomWindowsSign = () => {
+        throw new Error("transient signing error")
+      }
+
+      const PackagerClass = makeSequentialSignTestPackager()
+
+      await appThrows(
+        expect,
+        {
+          targets: Platform.WINDOWS.createTarget(DIR_TARGET),
+          platformPackagerFactory: (info, _platform) => new PackagerClass(info),
+          config: {
+            ...signtoolBaseConfig,
+            win: {
+              sign: { ...baseSigningConfig, sign },
+              forceCodeSigning: true,
+            },
+          },
+        },
+        {},
+        error => expect(error.message).toContain("transient signing error")
+      )
+    })
+  })
 })
 
-test.ifAll.ifNotCiMac(
-  "forceCodeSigning",
-  appThrows({
-    targets: windowsDirTarget,
-    config: {
-      forceCodeSigning: true,
-    },
-  })
-)
+describe("sign: false (signing disabled)", () => {
+  test("signIf skips every file even when a cert is discoverable via env", async ({ expect }) => {
+    const signResults: SigningResult[] = []
 
-test.ifAll.ifNotCiMac(
-  "electronDist",
-  appThrows({
-    targets: Platform.WINDOWS.createTarget(DIR_TARGET),
-    config: {
-      electronDist: "foo",
-    },
+    class SignDisabledTestPackager extends WinPackager {
+      async pack(outDir: string, _arch: Arch, _targets: Array<Target>, _taskManager: AsyncTaskManager): Promise<void> {
+        for (const f of ["file1.exe", "file2.exe", "file3.exe"].map(n => path.join(outDir, n))) {
+          signResults.push(await this.signIf(f))
+        }
+      }
+
+      packageInDistributableFormat(_appOutDir: string, _arch: Arch, _targets: Array<Target>, _taskManager: AsyncTaskManager): void {}
+    }
+
+    await app(
+      expect,
+      {
+        targets: Platform.WINDOWS.createTarget(DIR_TARGET),
+        platformPackagerFactory: (info, _platform) => new SignDisabledTestPackager(info),
+        config: {
+          win: { sign: false },
+        },
+      },
+      // signedWin injects a self-signed cert, so a cert is discoverable — sign: false must still short-circuit
+      { signedWin: true }
+    )
+
+    expect(signResults).toEqual(["skipped:disabled", "skipped:disabled", "skipped:disabled"])
   })
-)
+})

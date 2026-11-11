@@ -1,25 +1,25 @@
 #! /usr/bin/env node
 
-import { InvalidConfigurationError, log } from "builder-util"
-import * as chalk from "chalk"
-import { getElectronVersion } from "app-builder-lib/out/electron/electronVersion"
-import { pathExists, readJson } from "fs-extra"
-import * as isCi from "is-ci"
-import * as path from "path"
-import { loadEnv } from "read-config-file"
-import * as updateNotifier from "update-notifier"
-import { ExecError } from "builder-util/out/util"
-import { build, configureBuildCommand, createYargs } from "../builder"
-import { createSelfSignedCert } from "./create-self-signed-cert"
-import { configureInstallAppDepsCommand, installAppDeps } from "./install-app-deps"
-import { start } from "./start"
-import { nodeGypRebuild } from "app-builder-lib/out/util/yarn"
+import { getElectronVersion, nodeGypRebuild } from "app-builder-lib/internal"
+import chalk from "chalk"
+import { build, configureBuildCommand, createYargs } from "../builder.js"
+import { configurePublishCommand, publish } from "../publish.js"
+import { clearCache } from "./clear-cache.js"
+import { wrap } from "./cli-util.js"
+import { createSelfSignedCert } from "./create-self-signed-cert.js"
+import { createUpdateKey } from "./create-update-key.js"
+import { configureInstallAppDepsCommand, installAppDeps } from "./install-app-deps.js"
+import { configureMigrateSchemaCommand, migrateSchema } from "./migrate-schema.js"
+import { configureSignUpdateManifestCommand, SIGN_UPDATE_MANIFEST_COMMAND, signUpdateManifest, signUpdateManifestOptionsFromArgs } from "./sign-update-manifest.js"
+import { start } from "./start.js"
+import { configureVerifyCommand, verify } from "./verify.js"
 
 // tslint:disable:no-unused-expression
 void createYargs()
   .command(["build", "*"], "Build", configureBuildCommand, wrap(build))
   .command("install-app-deps", "Install app deps", configureInstallAppDepsCommand, wrap(installAppDeps))
   .command("node-gyp-rebuild", "Rebuild own native code", configureInstallAppDepsCommand /* yes, args the same as for install app deps */, wrap(rebuildAppNativeCode))
+  .command("publish", "Publish a list of artifacts", configurePublishCommand, wrap(publish))
   .command(
     "create-self-signed-cert",
     "Create self-signed code signing cert for Windows apps",
@@ -40,53 +40,36 @@ void createYargs()
     yargs => yargs,
     wrap(() => start())
   )
+  .command(
+    "clear-cache",
+    "Clear the electron-builder default cache directory",
+    yargs => yargs,
+    wrap(() => clearCache())
+  )
+  .command(
+    "create-update-key",
+    "Generate an Ed25519 keypair for signing auto-update manifests",
+    yargs =>
+      yargs.option("out", {
+        alias: ["o"],
+        type: "string",
+        requiresArg: true,
+        description: "Path to write the private key PEM (default: ./update-private-key.pem)",
+      }),
+    wrap(argv => createUpdateKey(argv.out))
+  )
+  .command(
+    SIGN_UPDATE_MANIFEST_COMMAND,
+    "Re-sign edited auto-update manifests (latest*.yml) in place, or verify them",
+    configureSignUpdateManifestCommand,
+    wrap(argv => signUpdateManifest(signUpdateManifestOptionsFromArgs(argv)))
+  )
+  .command("migrate-schema", "Migrate build config from v26 to v27 format", configureMigrateSchemaCommand, wrap(migrateSchema))
+  .command("verify [dir]", "Verify code signatures, notarization and update-manifest signatures of built artifacts", configureVerifyCommand, wrap(verify))
   .help()
   .epilog(`See ${chalk.underline("https://electron.build")} for more documentation.`)
   .strict()
   .recommendCommands().argv
-
-function wrap(task: (args: any) => Promise<any>) {
-  return (args: any) => {
-    checkIsOutdated()
-    loadEnv(path.join(process.cwd(), "electron-builder.env"))
-      .then(() => task(args))
-      .catch(error => {
-        process.exitCode = 1
-        // https://github.com/electron-userland/electron-builder/issues/2940
-        process.on("exit", () => (process.exitCode = 1))
-        if (error instanceof InvalidConfigurationError) {
-          log.error(null, error.message)
-        } else if (!(error instanceof ExecError) || !error.alreadyLogged) {
-          log.error({ failedTask: task.name, stackTrace: error.stack }, error.message)
-        }
-      })
-  }
-}
-
-function checkIsOutdated() {
-  if (isCi || process.env.NO_UPDATE_NOTIFIER != null) {
-    return
-  }
-
-  readJson(path.join(__dirname, "..", "..", "package.json"))
-    .then(async it => {
-      if (it.version === "0.0.0-semantic-release") {
-        return
-      }
-
-      const packageManager = (await pathExists(path.join(__dirname, "..", "..", "package-lock.json"))) ? "npm" : "yarn"
-
-      const notifier = updateNotifier({ pkg: it })
-      if (notifier.update != null) {
-        notifier.notify({
-          message: `Update available ${chalk.dim(notifier.update.current)}${chalk.reset(" → ")}${chalk.green(notifier.update.latest)} \nRun ${chalk.cyan(
-            `${packageManager} upgrade electron-builder`
-          )} to update`,
-        })
-      }
-    })
-    .catch(e => log.warn({ error: e }, "cannot check updates"))
-}
 
 async function rebuildAppNativeCode(args: any) {
   const projectDir = process.cwd()

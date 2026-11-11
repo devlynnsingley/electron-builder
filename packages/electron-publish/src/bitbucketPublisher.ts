@@ -1,0 +1,93 @@
+import { Arch, httpExecutor, InvalidConfigurationError, isEmptyOrSpaces, log } from "builder-util"
+import { configureRequestOptions, HttpExecutor } from "builder-util-runtime"
+import { BitbucketOptions } from "builder-util-runtime"
+import FormData from "form-data"
+import fsExtra from "fs-extra"
+import { ClientRequest, RequestOptions } from "http"
+import { PublishContext } from "./index.js"
+import { HttpPublisher } from "./httpPublisher.js"
+
+export class BitbucketPublisher extends HttpPublisher {
+  readonly providerName = "bitbucket"
+  readonly hostname = "api.bitbucket.org"
+
+  private readonly info: BitbucketOptions
+  private readonly auth: string
+  private readonly basePath: string
+
+  constructor(context: PublishContext, info: BitbucketOptions) {
+    super(context)
+
+    const token = info.token || process.env.BITBUCKET_TOKEN || null
+    const username = info.username || process.env.BITBUCKET_USERNAME || null
+
+    if (isEmptyOrSpaces(token)) {
+      throw new InvalidConfigurationError(`Bitbucket token is not set using env "BITBUCKET_TOKEN" (see https://www.electron.build/docs/publish#bitbucket)`)
+    }
+
+    this.info = info
+    // Bitbucket Cloud is retiring app passwords (https://www.atlassian.com/blog/bitbucket/bitbucket-cloud-transitions-to-api-tokens-enhancing-security-with-app-password-deprecation).
+    // - With a username, the token is sent as HTTP Basic auth: a Bitbucket username + app password, or an Atlassian account email + API token.
+    // - Without a username, the token is treated as a repository/project/workspace access token and sent as Bearer auth.
+    if (isEmptyOrSpaces(username)) {
+      // Warn rather than inform: v26 always sent Basic auth using the repository owner as the
+      // username, so a CI job supplying an app password / API token with no username silently
+      // switches scheme here and the upload fails authentication.
+      log.warn(
+        'No Bitbucket username provided via "BITBUCKET_USERNAME"; sending the token as an access token (Bearer auth). ' +
+          "This changed in v27 — electron-builder <= 26 always used Basic auth with the repository owner as the username. " +
+          'If your token is an app password or an Atlassian API token, set "BITBUCKET_USERNAME" (or bitbucket.username) or authentication will fail. ' +
+          "See https://www.electron.build/docs/migration/v27-build-changes#bitbucket-cloud-publishing-token-without-username-uses-bearer-auth"
+      )
+      this.auth = BitbucketPublisher.convertAccessToken(token)
+    } else {
+      this.auth = BitbucketPublisher.convertAppPassword(username, token)
+    }
+    this.basePath = `/2.0/repositories/${this.info.owner}/${this.info.slug}/downloads`
+  }
+
+  protected doUpload(
+    fileName: string,
+    _arch: Arch,
+    _dataLength: number,
+    _requestProcessor: (request: ClientRequest, reject: (error: Error) => void) => void,
+    file: string
+  ): Promise<any> {
+    return HttpExecutor.retryOnServerError(async () => {
+      const fileContent = await fsExtra.readFile(file)
+      const form = new FormData()
+      form.append("files", fileContent, fileName)
+      const upload: RequestOptions = {
+        hostname: this.hostname,
+        path: this.basePath,
+        headers: form.getHeaders(),
+        timeout: this.info.timeout || undefined,
+      }
+      await httpExecutor.doApiRequest(configureRequestOptions(upload, this.auth, "POST"), this.context.cancellationToken, it => form.pipe(it))
+      return fileName
+    })
+  }
+
+  async deleteRelease(filename: string): Promise<void> {
+    const req: RequestOptions = {
+      hostname: this.hostname,
+      path: `${this.basePath}/${encodeURIComponent(filename)}`,
+      timeout: this.info.timeout || undefined,
+    }
+    await httpExecutor.request(configureRequestOptions(req, this.auth, "DELETE"), this.context.cancellationToken)
+  }
+
+  toString() {
+    const { owner, slug, channel } = this.info
+    return `Bitbucket (owner: ${owner}, slug: ${slug}, channel: ${channel})`
+  }
+
+  static convertAppPassword(username: string, token: string) {
+    const base64encodedData = Buffer.from(`${username}:${token.trim()}`).toString("base64")
+    return `Basic ${base64encodedData}`
+  }
+
+  static convertAccessToken(token: string) {
+    return `Bearer ${token.trim()}`
+  }
+}

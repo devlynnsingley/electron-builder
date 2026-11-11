@@ -1,60 +1,94 @@
-import { addValue, Arch, archFromString, AsyncTaskManager, DebugLogger, deepAssign, InvalidConfigurationError, log, safeStringifyJson, serializeToYaml, TmpDir } from "builder-util"
-import { CancellationToken } from "builder-util-runtime"
-import { executeFinally, orNullIfFileNotExist } from "builder-util/out/promise"
-import { EventEmitter } from "events"
-import { mkdirs, chmod, outputFile } from "fs-extra"
-import * as isCI from "is-ci"
-import { Lazy } from "lazy-val"
-import * as path from "path"
-import { getArtifactArchName } from "builder-util/out/arch"
-import { AppInfo } from "./appInfo"
-import { readAsarJson } from "./asar/asar"
-import { AfterPackContext, Configuration } from "./configuration"
-import { Platform, SourceRepositoryInfo, Target } from "./core"
-import { createElectronFrameworkSupport } from "./electron/ElectronFramework"
-import { Framework } from "./Framework"
-import { LibUiFramework } from "./frameworks/LibUiFramework"
-import { Metadata } from "./options/metadata"
-import { ArtifactBuildStarted, ArtifactCreated, PackagerOptions } from "./packagerApi"
-import { PlatformPackager, resolveFunction } from "./platformPackager"
-import { ProtonFramework } from "./ProtonFramework"
-import { computeArchToTargetNamesMap, createTargets, NoOpTarget } from "./targets/targetFactory"
-import { computeDefaultAppDirectory, getConfig, validateConfig } from "./util/config"
-import { expandMacro } from "./util/macroExpander"
-import { createLazyProductionDeps, NodeModuleDirInfo } from "./util/packageDependencies"
-import { checkMetadata, readPackageJson } from "./util/packageMetadata"
-import { getRepositoryInfo } from "./util/repositoryInfo"
-import { installOrRebuild, nodeGypRebuild } from "./util/yarn"
-import { PACKAGE_VERSION } from "./version"
-import { release as getOsRelease } from "os"
+import {
+  Arch,
+  archFromString,
+  AsyncTaskManager,
+  DebugLogger,
+  Executables,
+  executeFinally,
+  getArtifactArchName,
+  InvalidConfigurationError,
+  log,
+  MAX_FILE_REQUESTS,
+  orNullIfFileNotExist,
+  sanitizeDirPath,
+  safeStringifyJson,
+  serializeToYaml,
+  TmpDir,
+} from "builder-util"
+import { CancellationToken, deepAssign, retry } from "builder-util-runtime"
 
-function addHandler(emitter: EventEmitter, event: string, handler: (...args: Array<any>) => void) {
-  emitter.on(event, handler)
+import { isCI } from "ci-info"
+import { Lazy } from "lazy-val"
+import { release as getOsRelease } from "os"
+import * as path from "path"
+import { AppInfo } from "./appInfo.js"
+import { readAsarJson } from "./asar/asar.js"
+import { AfterExtractContext, AfterPackContext, BeforePackContext, Configuration, Hook } from "./configuration.js"
+import { Platform, SourceRepositoryInfo, Target } from "./core.js"
+import { createElectronFrameworkSupport } from "./electron/ElectronFramework.js"
+import { assertElectronArchSupported } from "./electron/electronArchSupport.js"
+import { Framework, isElectronBased } from "./Framework.js"
+import { Metadata } from "./options/metadata.js"
+import { ArtifactBuildStarted, ArtifactCreated, PackagerOptions, PlannedTargets } from "./packagerApi.js"
+import { PlatformPackager } from "./platformPackager.js"
+import { addTargetsForPlatform, createTargets, NoOpTarget, PlatformBuildPlan, resolvePlatformBuildPlan, resolveTargetNames } from "./targets/targetFactory.js"
+import { computeDefaultAppDirectory, getConfig, validateConfiguration } from "./util/config/config.js"
+import { assertNoRemovedEnvVars } from "./util/flags.js"
+import { expandMacro } from "./util/macroExpander.js"
+import { electronUpdaterRequirements } from "./util/electronUpdaterCompatibility.js"
+import { checkMetadata, readPackageJson } from "./util/packageMetadata.js"
+import { warnOnRemovedEnvVars } from "./util/removedEnvVars.js"
+import { getRepositoryInfo } from "./util/repositoryInfo.js"
+import { resolveFunction } from "./util/resolve.js"
+import { installOrRebuild, nodeGypRebuild, resolveBuildFromSource } from "./util/installOrRebuild.js"
+import { PACKAGE_VERSION } from "./version.js"
+import { AsyncEventEmitter, HandlerType } from "./util/asyncEventEmitter.js"
+import asyncPool from "tiny-async-pool"
+import { determinePackageManagerEnv, PM } from "./node-module-collector/index.js"
+import _fsExtra from "fs-extra"
+const { chmod, mkdirs, outputFile } = _fsExtra
+import { setSevenZipPath, setSevenZipVersion } from "./toolsets/7zip.js"
+import { getCustomToolsetPath } from "./toolsets/custom.js"
+
+type PackagerEvents = {
+  artifactBuildStarted: Hook<ArtifactBuildStarted, void>
+
+  beforePack: Hook<BeforePackContext, void>
+  afterExtract: Hook<AfterExtractContext, void>
+  afterPack: Hook<AfterPackContext, void>
+  afterSign: Hook<AfterPackContext, void>
+
+  artifactBuildCompleted: Hook<ArtifactCreated, void>
+
+  msiProjectCreated: Hook<string, void>
+  appxManifestCreated: Hook<string, void>
+  pkgDistributionCreated: Hook<string, void>
+
+  // internal-use only, prefer usage of `artifactBuildCompleted`
+  artifactCreated: Hook<ArtifactCreated, void>
+
+  // internal-use only: every target of the build, before the first pack
+  targetsCreated: Hook<ReadonlyArray<PlannedTargets>, void>
 }
 
-async function createFrameworkInfo(configuration: Configuration, packager: Packager): Promise<Framework> {
-  let framework = configuration.framework
-  if (framework != null) {
-    framework = framework.toLowerCase()
-  }
-
-  let nodeVersion = configuration.nodeVersion
-  if (framework === "electron" || framework == null) {
-    return await createElectronFrameworkSupport(configuration, packager)
-  }
-
-  if (nodeVersion == null || nodeVersion === "current") {
-    nodeVersion = process.versions.node
-  }
-
-  const distMacOsName = `${packager.appInfo.productFilename}.app`
-  const isUseLaunchUi = configuration.launchUiVersion !== false
-  if (framework === "proton" || framework === "proton-native") {
-    return new ProtonFramework(nodeVersion, distMacOsName, isUseLaunchUi)
-  } else if (framework === "libui") {
-    return new LibUiFramework(nodeVersion, distMacOsName, isUseLaunchUi)
-  } else {
-    throw new InvalidConfigurationError(`Unknown framework: ${framework}`)
+/**
+ * `devMetadata` and `extraMetadata` were removed from `PackagerOptions` in v27 (they had thrown since
+ * v22). `build()` rejected them with a bare `Unknown option "…"` that named no replacement, and a
+ * directly constructed Packager ignored them entirely — the key simply sat unread on `options`.
+ */
+function checkRemovedPackagerOptions(options: PackagerOptions): void {
+  const removed: Array<[key: string, replacement: string]> = [
+    ["devMetadata", "config"],
+    ["extraMetadata", "config.extraMetadata"],
+  ]
+  for (const [key, replacement] of removed) {
+    if ((options as any)[key] !== undefined) {
+      throw new InvalidConfigurationError(
+        `\`${key}\` was removed from PackagerOptions in electron-builder v27. Pass \`${replacement}\` instead, ` +
+          `e.g. build({ targets, config: ${key === "devMetadata" ? "{ … }" : "{ extraMetadata: { … } }"} }).\n` +
+          "https://www.electron.build/docs/migration/v27-developer-changes#devmetadata-extrametadata-programmatic-packageroptions"
+      )
+    }
   }
 }
 
@@ -66,9 +100,29 @@ export class Packager {
     return this._appDir
   }
 
+  private readonly _packageManager: Lazy<{ pm: PM; workspaceRoot: Promise<string | undefined> }>
+  async getPackageManager(): Promise<PM> {
+    return (await this._packageManager.value).pm
+  }
+  async getWorkspaceRoot(): Promise<string> {
+    return (await (await this._packageManager.value).workspaceRoot) || this.projectDir
+  }
+
+  /** Stores original metadata merged with extraMetadata from configuration. */
   private _metadata: Metadata | null = null
   get metadata(): Metadata {
     return this._metadata!
+  }
+
+  /** Stores original metadata from package.json before merging with extraMetadata. */
+  private _originalMetadata: Metadata | null = null
+  get originalMetadata(): Metadata {
+    return this._originalMetadata!
+  }
+
+  /** The "name" field from package.json. */
+  get nodePackageName() {
+    return this.originalMetadata.name!
   }
 
   private _nodeModulesHandledExternally = false
@@ -96,7 +150,7 @@ export class Packager {
 
   isTwoPackageJsonProjectLayoutUsed = false
 
-  readonly eventEmitter = new EventEmitter()
+  private readonly eventEmitter = new AsyncEventEmitter<PackagerEvents>()
 
   _appInfo: AppInfo | null = null
   get appInfo(): AppInfo {
@@ -105,9 +159,37 @@ export class Packager {
 
   readonly tempDirManager = new TmpDir("packager")
 
-  private _repositoryInfo = new Lazy<SourceRepositoryInfo | null>(() => getRepositoryInfo(this.projectDir, this.metadata, this.devMetadata))
+  // Tasks that must run after EVERY target has finished building — the only point at which the
+  // shared appOutDir can be mutated without racing a concurrent target that reads it. Used by NSIS
+  // to write elevate.exe into win-unpacked without it leaking into Squirrel/zip/etc. (see #9852).
+  private readonly buildFinalizeTasks: Array<() => Promise<void>> = []
 
-  private readonly afterPackHandlers: Array<(context: AfterPackContext) => Promise<any> | null> = []
+  addBuildFinalizeTask(task: () => Promise<void>): void {
+    this.buildFinalizeTasks.push(task)
+  }
+
+  // Targets whose build was skipped by `afterPackTestHook`. Their `finishBuild()` must not run either:
+  // NsisTarget and MsiWrappedTarget assume `build()` populated per-arch state first.
+  // Target instances are shared across archs (`createTargets` reuses `nameToTarget`), so a target may be
+  // skipped for one arch and built for another — track both and only skip `finishBuild()` when it never built.
+  private readonly targetsSkippedByTestHook = new Set<Target>()
+  private readonly targetsBuiltAfterPack = new Set<Target>()
+
+  /** @internal see PackagerOptions.afterPackTestHook */
+  async shouldSkipTargetsAfterPack(context: AfterPackContext): Promise<boolean> {
+    const hook = this.options.afterPackTestHook
+    const skip = hook != null && (await hook(context))
+    const recordInto = skip ? this.targetsSkippedByTestHook : this.targetsBuiltAfterPack
+    for (const target of context.targets) {
+      recordInto.add(target)
+    }
+    if (skip) {
+      log.debug({ platform: context.packager.platform.name, arch: Arch[context.arch] }, "afterPackTestHook requested early exit; skipping target builds")
+    }
+    return skip
+  }
+
+  private _repositoryInfo = new Lazy<SourceRepositoryInfo | null>(() => getRepositoryInfo(this.projectDir, this.metadata, this.devMetadata))
 
   readonly options: PackagerOptions
 
@@ -117,25 +199,7 @@ export class Packager {
     return this._repositoryInfo.value
   }
 
-  private nodeDependencyInfo = new Map<string, Lazy<Array<any>>>()
-
-  getNodeDependencyInfo(platform: Platform | null): Lazy<Array<NodeModuleDirInfo>> {
-    let key = ""
-    let excludedDependencies: Array<string> | null = null
-    if (platform != null && this.framework.getExcludedDependencies != null) {
-      excludedDependencies = this.framework.getExcludedDependencies(platform)
-      if (excludedDependencies != null) {
-        key += `-${platform.name}`
-      }
-    }
-
-    let result = this.nodeDependencyInfo.get(key)
-    if (result == null) {
-      result = createLazyProductionDeps(this.appDir, excludedDependencies)
-      this.nodeDependencyInfo.set(key, result)
-    }
-    return result
-  }
+  private runtimeEnvironmentVariables: NodeJS.ProcessEnv = {}
 
   stageDirPathCustomizer: (target: Target, packager: PlatformPackager<any>, arch: Arch) => string = (target, packager, arch) => {
     return path.join(target.outDir, `__${target.name}-${getArtifactArchName(arch, target.name)}`)
@@ -168,13 +232,13 @@ export class Packager {
   }
 
   //noinspection JSUnusedGlobalSymbols
-  constructor(options: PackagerOptions, readonly cancellationToken = new CancellationToken()) {
-    if ("devMetadata" in options) {
-      throw new InvalidConfigurationError("devMetadata in the options is deprecated, please use config instead")
-    }
-    if ("extraMetadata" in options) {
-      throw new InvalidConfigurationError("extraMetadata in the options is deprecated, please use config.extraMetadata instead")
-    }
+  constructor(
+    options: PackagerOptions,
+    readonly cancellationToken = new CancellationToken()
+  ) {
+    // Checked here rather than only in `checkBuildRequestOptions` so a directly constructed Packager
+    // is covered too — that path reads neither field, so a v26 caller was silently ignored.
+    checkRemovedPackagerOptions(options)
 
     const targets = options.targets || new Map<Platform, Map<Arch, Array<string>>>()
     if (options.targets == null) {
@@ -187,29 +251,11 @@ export class Packager {
         return result.length === 0 && currentIfNotSpecified ? [archFromString(process.arch)] : result
       }
 
-      let archToType = targets.get(platform)
-      if (archToType == null) {
-        archToType = new Map<Arch, Array<string>>()
-        targets.set(platform, archToType)
-      }
-
-      if (types.length === 0) {
+      addTargetsForPlatform(targets, platform, types, commonArch, archToType => {
         for (const arch of commonArch(false)) {
           archToType.set(arch, [])
         }
-        return
-      }
-
-      for (const type of types) {
-        const suffixPos = type.lastIndexOf(":")
-        if (suffixPos > 0) {
-          addValue(archToType, archFromString(type.substring(suffixPos + 1)), type.substring(0, suffixPos))
-        } else {
-          for (const arch of commonArch(true)) {
-            addValue(archToType, arch, type)
-          }
-        }
-      }
+      })
     }
 
     if (options.mac != null) {
@@ -222,33 +268,61 @@ export class Packager {
       processTargets(Platform.WINDOWS, options.win)
     }
 
-    this.projectDir = options.projectDir == null ? process.cwd() : path.resolve(options.projectDir)
+    this.projectDir = sanitizeDirPath(options.projectDir == null ? process.cwd() : options.projectDir)
     this._appDir = this.projectDir
+    this._packageManager = determinePackageManagerEnv({ projectDir: this.projectDir, appDir: this.appDir, workspaceRoot: undefined })
+
     this.options = {
       ...options,
-      prepackaged: options.prepackaged == null ? null : path.resolve(this.projectDir, options.prepackaged),
+      prepackaged: options.prepackaged == null ? null : sanitizeDirPath(path.resolve(this.projectDir, options.prepackaged)),
     }
 
-    try {
-      log.info({ version: PACKAGE_VERSION, os: getOsRelease() }, "electron-builder")
-    } catch (e) {
-      // error in dev mode without babel
-      if (!(e instanceof ReferenceError)) {
-        throw e
-      }
-    }
+    log.info({ version: PACKAGE_VERSION, os: getOsRelease() }, "electron-builder")
+
+    warnOnRemovedEnvVars()
   }
 
-  addAfterPackHandler(handler: (context: AfterPackContext) => Promise<any> | null) {
-    this.afterPackHandlers.push(handler)
+  private async addPackagerEventHandlers() {
+    const { type } = this.appInfo
+    const root = await this.getWorkspaceRoot()
+    this.eventEmitter.on("artifactBuildStarted", await resolveFunction(type, this.config.artifactBuildStarted, "artifactBuildStarted", root), "user")
+    this.eventEmitter.on("artifactBuildCompleted", await resolveFunction(type, this.config.artifactBuildCompleted, "artifactBuildCompleted", root), "user")
+
+    this.eventEmitter.on("appxManifestCreated", await resolveFunction(type, this.config.appxManifestCreated, "appxManifestCreated", root), "user")
+    this.eventEmitter.on("msiProjectCreated", await resolveFunction(type, this.config.msiProjectCreated, "msiProjectCreated", root), "user")
+    this.eventEmitter.on("pkgDistributionCreated", await resolveFunction(type, this.config.pkgDistributionCreated, "pkgDistributionCreated", root), "user")
+
+    this.eventEmitter.on("beforePack", await resolveFunction(type, this.config.beforePack, "beforePack", root), "user")
+    this.eventEmitter.on("afterExtract", await resolveFunction(type, this.config.afterExtract, "afterExtract", root), "user")
+    this.eventEmitter.on("afterPack", await resolveFunction(type, this.config.afterPack, "afterPack", root), "user")
+    this.eventEmitter.on("afterSign", await resolveFunction(type, this.config.afterSign, "afterSign", root), "user")
   }
 
-  artifactCreated(handler: (event: ArtifactCreated) => void): Packager {
-    addHandler(this.eventEmitter, "artifactCreated", handler)
+  onAfterPack(handler: PackagerEvents["afterPack"]): Packager {
+    this.eventEmitter.on("afterPack", handler)
     return this
   }
 
-  async callArtifactBuildStarted(event: ArtifactBuildStarted, logFields?: any): Promise<void> {
+  /** @internal emitted once per build, after every platform's targets are created and before anything is packed */
+  onTargetsCreated(handler: PackagerEvents["targetsCreated"]): Packager {
+    this.eventEmitter.on("targetsCreated", handler)
+    return this
+  }
+
+  onArtifactCreated(handler: PackagerEvents["artifactCreated"]): Packager {
+    this.eventEmitter.on("artifactCreated", handler)
+    return this
+  }
+
+  filterPackagerEventListeners(event: keyof PackagerEvents, type: HandlerType | undefined) {
+    return this.eventEmitter.filterListeners(event, type)
+  }
+
+  clearPackagerEventListeners() {
+    this.eventEmitter.clear()
+  }
+
+  async emitArtifactBuildStarted(event: ArtifactBuildStarted, logFields?: any) {
     log.info(
       logFields || {
         target: event.targetPresentableName,
@@ -257,43 +331,59 @@ export class Packager {
       },
       "building"
     )
-    const handler = resolveFunction(this.config.artifactBuildStarted, "artifactBuildStarted")
-    if (handler != null) {
-      await Promise.resolve(handler(event))
-    }
+    await this.eventEmitter.emit("artifactBuildStarted", event)
   }
 
   /**
    * Only for sub artifacts (update info), for main artifacts use `callArtifactBuildCompleted`.
    */
-  dispatchArtifactCreated(event: ArtifactCreated): void {
-    this.eventEmitter.emit("artifactCreated", event)
+  async emitArtifactCreated(event: ArtifactCreated) {
+    await this.eventEmitter.emit("artifactCreated", event)
   }
 
-  async callArtifactBuildCompleted(event: ArtifactCreated): Promise<void> {
-    this.dispatchArtifactCreated(event)
-
-    const handler = resolveFunction(this.config.artifactBuildCompleted, "artifactBuildCompleted")
-    if (handler != null) {
-      await Promise.resolve(handler(event))
-    }
+  async emitArtifactBuildCompleted(event: ArtifactCreated) {
+    await this.eventEmitter.emit("artifactBuildCompleted", event)
+    await this.emitArtifactCreated(event)
   }
 
-  async callAppxManifestCreated(path: string): Promise<void> {
-    const handler = resolveFunction(this.config.appxManifestCreated, "appxManifestCreated")
-    if (handler != null) {
-      await Promise.resolve(handler(path))
-    }
+  async emitAppxManifestCreated(path: string) {
+    await this.eventEmitter.emit("appxManifestCreated", path)
   }
 
-  async callMsiProjectCreated(path: string): Promise<void> {
-    const handler = resolveFunction(this.config.msiProjectCreated, "msiProjectCreated")
-    if (handler != null) {
-      await Promise.resolve(handler(path))
-    }
+  async emitMsiProjectCreated(path: string) {
+    await this.eventEmitter.emit("msiProjectCreated", path)
   }
 
-  async build(): Promise<BuildResult> {
+  async emitPkgDistributionCreated(path: string) {
+    await this.eventEmitter.emit("pkgDistributionCreated", path)
+  }
+
+  async emitBeforePack(context: BeforePackContext) {
+    await this.eventEmitter.emit("beforePack", context)
+  }
+
+  async emitAfterPack(context: AfterPackContext) {
+    await this.eventEmitter.emit("afterPack", context)
+  }
+
+  async emitAfterSign(context: AfterPackContext) {
+    await this.eventEmitter.emit("afterSign", context)
+  }
+
+  async emitAfterExtract(context: AfterPackContext) {
+    await this.eventEmitter.emit("afterExtract", context)
+  }
+
+  /**
+   * Loads and validates the configuration. The app's electron-updater is checked against no platform's `electronUpdaterCompatibility`
+   * here: `build` checks it against the platforms it builds, while the CLI `publish` and `verify` commands write no update files.
+   */
+  async validateConfig(): Promise<void> {
+    await this.loadAndValidateConfig(new Map())
+  }
+
+  /** `builtTargets`: the targets the build creates, whose update files the app's electron-updater has to read. */
+  private async loadAndValidateConfig(builtTargets: Map<Platform, Map<Arch, Array<string>>>): Promise<void> {
     let configPath: string | null = null
     let configFromOptions = this.options.config
     if (typeof configFromOptions === "string") {
@@ -312,9 +402,8 @@ export class Packager {
 
     const devMetadata = this.devMetadata
     const configuration = await getConfig(projectDir, configPath, configFromOptions, new Lazy(() => Promise.resolve(devMetadata)))
-    if (log.isDebugEnabled) {
-      log.debug({ config: getSafeEffectiveConfig(configuration) }, "effective config")
-    }
+
+    log.debug({ config: getSafeEffectiveConfig(configuration) }, "effective config")
 
     this._appDir = await computeDefaultAppDirectory(projectDir, configuration.directories!.app)
     this.isTwoPackageJsonProjectLayoutUsed = this._appDir !== projectDir
@@ -327,52 +416,91 @@ export class Packager {
     } else {
       this._metadata = await this.readProjectMetadataIfTwoPackageStructureOrPrepacked(appPackageFile)
     }
-    deepAssign(this.metadata, configuration.extraMetadata)
+    this._originalMetadata = deepAssign({}, this._metadata)
+    deepAssign(this._metadata, configuration.extraMetadata)
 
     if (this.isTwoPackageJsonProjectLayoutUsed) {
       log.debug({ devPackageFile, appPackageFile }, "two package.json structure is used")
     }
-    checkMetadata(this.metadata, this.devMetadata, appPackageFile, devPackageFile)
+    // per platform the build targets, which writes update files for its own range
+    const updaterRequirements = electronUpdaterRequirements(configuration, resolveTargetNames(builtTargets, configuration))
+    checkMetadata(this.metadata, this.devMetadata, appPackageFile, devPackageFile, projectDir, updaterRequirements)
 
-    return await this._build(configuration, this._metadata, this._devMetadata)
+    await validateConfiguration(configuration, this.debugLogger)
+
+    this._configuration = configuration
+    this._devMetadata = devMetadata
+  }
+
+  /** @internal */
+  shouldWriteEffectiveConfig(): boolean {
+    return this.config.writeEffectiveConfig ?? (!isCI && process.stdout.isTTY === true)
   }
 
   // external caller of this method always uses isTwoPackageJsonProjectLayoutUsed=false and appDir=projectDir, no way (and need) to use another values
-  async _build(configuration: Configuration, metadata: Metadata, devMetadata: Metadata | null, repositoryInfo?: SourceRepositoryInfo): Promise<BuildResult> {
-    await validateConfig(configuration, this.debugLogger)
-    this._configuration = configuration
-    this._metadata = metadata
-    this._devMetadata = devMetadata
+  async build(repositoryInfo?: SourceRepositoryInfo): Promise<BuildResult> {
+    // Removed env vars are checked before anything else: nothing validates process.env, so a CI
+    // image still exporting one silently gets a different toolchain than it asked for.
+    assertNoRemovedEnvVars()
 
+    await this.loadAndValidateConfig(this.options.targets ?? new Map())
+
+    // every host program the build starts, also in its asynchronous work, comes from this build's toolsets.executables (or the
+    // default install locations), whatever other builds in this process configure
+    return await Executables.run(this.config.toolsets?.executables, () => this.buildWithValidatedConfig(repositoryInfo))
+  }
+
+  private async buildWithValidatedConfig(repositoryInfo: SourceRepositoryInfo | undefined): Promise<BuildResult> {
     if (repositoryInfo != null) {
       this._repositoryInfo.value = Promise.resolve(repositoryInfo)
     }
 
     this._appInfo = new AppInfo(this, null)
-    this._framework = await createFrameworkInfo(this.config, this)
+    await this.addPackagerEventHandlers()
+
+    this._framework = await createElectronFrameworkSupport(this.config, this)
 
     const commonOutDirWithoutPossibleOsMacro = path.resolve(
       this.projectDir,
-      expandMacro(configuration.directories!.output!, null, this._appInfo, {
+      expandMacro(this.config.directories!.output!, null, this._appInfo, {
         os: "",
       })
     )
 
-    if (!isCI && (process.stdout as any).isTTY) {
+    if (this.shouldWriteEffectiveConfig()) {
       const effectiveConfigFile = path.join(commonOutDirWithoutPossibleOsMacro, "builder-effective-config.yaml")
       log.info({ file: log.filePath(effectiveConfigFile) }, "writing effective config")
-      await outputFile(effectiveConfigFile, getSafeEffectiveConfig(configuration))
+      await outputFile(effectiveConfigFile, getSafeEffectiveConfig(this.config))
     }
 
     // because artifact event maybe dispatched several times for different publish providers
     const artifactPaths = new Set<string>()
-    this.artifactCreated(event => {
+    this.onArtifactCreated(event => {
       if (event.file != null) {
         artifactPaths.add(event.file)
       }
     })
 
-    this.disposeOnBuildFinish(() => this.tempDirManager.cleanup())
+    this.disposeOnBuildFinish(() =>
+      retry(() => this.tempDirManager.cleanup(), {
+        retries: 2,
+        interval: 2000,
+        backoff: 2000,
+        cancellationToken: this.cancellationToken,
+        shouldRetry: e => {
+          const message: string = e?.message || ""
+          const code = e?.code
+          // windows file locks
+          const resourceIsBusy = message.includes("EBUSY") || code === "EBUSY"
+          if (resourceIsBusy) {
+            log.debug({ error: message || code }, "retrying temporary directory cleanup")
+            return true
+          }
+          return false
+        },
+      })
+    )
+
     const platformToTargets = await executeFinally(this.doBuild(), async () => {
       if (this.debugLogger.isEnabled) {
         await this.debugLogger.save(path.join(commonOutDirWithoutPossibleOsMacro, "builder-debug.yml"))
@@ -381,7 +509,7 @@ export class Packager {
       const toDispose = this.toDispose.slice()
       this.toDispose.length = 0
       for (const disposer of toDispose) {
-        await disposer().catch(e => {
+        await disposer().catch((e: any) => {
           log.warn({ error: e }, "cannot dispose")
         })
       }
@@ -391,7 +519,7 @@ export class Packager {
       outDir: commonOutDirWithoutPossibleOsMacro,
       artifactPaths: Array.from(artifactPaths),
       platformToTargets,
-      configuration,
+      configuration: this.config,
     }
   }
 
@@ -411,47 +539,178 @@ export class Packager {
   }
 
   private async doBuild(): Promise<Map<Platform, Map<string, Target>>> {
-    const taskManager = new AsyncTaskManager(this.cancellationToken)
+    await this.configureSevenZip()
 
     const platformToTarget = new Map<Platform, Map<string, Target>>()
-    const createdOutDirs = new Set<string>()
+    // Every platform packager and target is created before the first pack, so listeners of `targetsCreated` (the
+    // publish preflight) see the whole build and can fail it before any artifact exists - let alone is uploaded.
+    const plans = await this.createPlannedTargets(this.options.targets ?? new Map(), platformToTarget)
 
-    for (const [platform, archToType] of this.options.targets!) {
+    // a cancelled build stops here rather than running the publish preflight on a partial plan
+    if (!this.cancellationToken.cancelled) {
+      await this.eventEmitter.emit(
+        "targetsCreated",
+        plans.flatMap<PlannedTargets>(it => it.archs)
+      )
+    }
+
+    await this.finishTargets(await this.packAll(plans))
+
+    // Every target has now finished reading the shared appOutDir(s), so finalize tasks may safely
+    // mutate them (e.g. NSIS copying elevate.exe into win-unpacked — see #9852).
+    for (const task of this.buildFinalizeTasks) {
+      if (this.cancellationToken.cancelled) {
+        break
+      }
+      await task()
+    }
+    return platformToTarget
+  }
+
+  private async configureSevenZip(): Promise<void> {
+    const sevenZipConfig = this.config.toolsets?.sevenZip
+    if (typeof sevenZipConfig === "object" && sevenZipConfig != null) {
+      const toolDir = await getCustomToolsetPath(sevenZipConfig, this.buildResourcesDir)
+      const bin = path.join(toolDir, "bin", process.platform === "win32" ? "7za.exe" : "7za")
+      if (process.platform !== "win32") {
+        await chmod(bin, 0o755)
+      }
+      setSevenZipPath(bin)
+    } else {
+      setSevenZipVersion(sevenZipConfig)
+    }
+  }
+
+  /**
+   * Creates the platform packagers and the targets of each arch, recording each platform's targets in `platformToTarget`. Each platform's
+   * targets are resolved from its created packager's `platformOptions`, which a custom packager (`platformPackagerFactory`) may override.
+   */
+  private async createPlannedTargets(
+    requested: ReadonlyMap<Platform, ReadonlyMap<Arch, ReadonlyArray<string>>>,
+    platformToTarget: Map<Platform, Map<string, Target>>
+  ): Promise<Array<PlatformTargets>> {
+    const result: Array<PlatformTargets> = []
+    for (const [platform, archToType] of requested) {
       if (this.cancellationToken.cancelled) {
         break
       }
 
       if (platform === Platform.MAC && process.platform === Platform.WINDOWS.nodeName) {
-        throw new InvalidConfigurationError("Build for macOS is supported only on macOS, please see https://electron.build/multi-platform-build")
+        throw new InvalidConfigurationError("Build for macOS is supported only on macOS, please see https://electron.build/docs/features/multi-platform-build")
       }
 
       const packager = await this.createHelper(platform)
-      const nameToTarget: Map<string, Target> = new Map()
+      const nameToTarget = new Map<string, Target>()
       platformToTarget.set(platform, nameToTarget)
+      const platformPlan = resolvePlatformBuildPlan(platform, archToType, packager.platformOptions)
+      result.push({ packager, nameToTarget, archs: this.createArchTargets(platformPlan, packager, nameToTarget) })
+    }
+    return result
+  }
 
-      for (const [arch, targetNames] of computeArchToTargetNamesMap(archToType, packager, platform)) {
-        if (this.cancellationToken.cancelled) {
-          break
-        }
-
-        // support os and arch macro in output value
-        const outDir = path.resolve(this.projectDir, packager.expandMacro(this._configuration!.directories!.output!, Arch[arch]))
-        const targetList = createTargets(nameToTarget, targetNames.length === 0 ? packager.defaultTarget : targetNames, outDir, packager)
-        await createOutDirIfNeed(targetList, createdOutDirs)
-        await packager.pack(outDir, arch, targetList, taskManager)
-      }
-
+  private createArchTargets({ platform, archToTargetNames }: PlatformBuildPlan, packager: PlatformPackager<any>, nameToTarget: Map<string, Target>): Array<ArchTargets> {
+    const result: Array<ArchTargets> = []
+    for (const [arch, targetNames] of archToTargetNames) {
       if (this.cancellationToken.cancelled) {
         break
       }
 
-      for (const target of nameToTarget.values()) {
-        taskManager.addTask(target.finishBuild())
+      // fail fast when the requested arch has no official Electron build anymore (Electron 44 removed win32-ia32 and linux-armv7l);
+      // skipped for prepackaged apps since nothing is downloaded then
+      if (this.options.prepackaged == null && isElectronBased(this.framework)) {
+        assertElectronArchSupported(platform, arch, this.framework.version, this.config)
+      }
+
+      // support os and arch macro in output value
+      const outDir = path.resolve(this.projectDir, packager.expandMacro(this.outputDirectoryPattern(), Arch[arch]))
+      const targets = createTargets(nameToTarget, targetNames.length === 0 ? packager.defaultTarget : targetNames, outDir, packager)
+      result.push({ packager, arch, targets, outDir })
+    }
+    return result
+  }
+
+  private outputDirectoryPattern(): string {
+    const output = this.config.directories?.output
+    if (output == null) {
+      throw new Error("directories.output is not set: the configuration was not loaded")
+    }
+    return output
+  }
+
+  /**
+   * Packs the platforms one after another. The targets of a packed platform that support it start finishing right away, in the
+   * returned task manager; the others are returned to be finished once every platform is packed.
+   */
+  private async packAll(plans: ReadonlyArray<PlatformTargets>): Promise<TargetFinishers> {
+    const taskManager = new AsyncTaskManager(this.cancellationToken)
+    const syncTargets: Array<Target> = []
+    const createdOutDirs = new Set<string>()
+    for (const plan of plans) {
+      if (this.cancellationToken.cancelled) {
+        break
+      }
+      await this.packPlatform(plan, taskManager, createdOutDirs)
+      if (this.cancellationToken.cancelled) {
+        break
+      }
+
+      for (const target of plan.nameToTarget.values()) {
+        if (this.targetsSkippedByTestHook.has(target) && !this.targetsBuiltAfterPack.has(target)) {
+          continue
+        }
+        if (target.isAsyncSupported) {
+          taskManager.addTask(target.finishBuild())
+        } else {
+          syncTargets.push(target)
+        }
+      }
+    }
+    return { taskManager, syncTargets }
+  }
+
+  private async packPlatform({ packager, archs }: PlatformTargets, taskManager: AsyncTaskManager, createdOutDirs: Set<string>): Promise<void> {
+    let poolCount = Math.floor(packager.config.concurrency?.jobs || 1)
+    if (poolCount < 1) {
+      log.warn({ concurrency: poolCount }, "concurrency is invalid, overriding with job count: 1")
+      poolCount = 1
+    } else if (poolCount > MAX_FILE_REQUESTS) {
+      log.warn(
+        { concurrency: poolCount, MAX_FILE_REQUESTS },
+        `job concurrency is greater than recommended MAX_FILE_REQUESTS, this may lead to File Descriptor errors (too many files open). Proceed with caution (e.g. this is an experimental feature)`
+      )
+    }
+    const packPromises: Array<Promise<any>> = []
+    for (const { arch, targets, outDir } of archs) {
+      if (this.cancellationToken.cancelled) {
+        break
+      }
+
+      await createOutDirIfNeed(targets, createdOutDirs)
+      const promise = packager.pack(outDir, arch, targets, taskManager)
+      if (poolCount < 2) {
+        await promise
+      } else {
+        packPromises.push(promise)
       }
     }
 
+    await asyncPool(poolCount, packPromises, async it => {
+      if (this.cancellationToken.cancelled) {
+        return
+      }
+      await it
+    })
+  }
+
+  /** Waits for the targets that finish on their own, then finishes the others one after another. */
+  private async finishTargets({ taskManager, syncTargets }: TargetFinishers): Promise<void> {
     await taskManager.awaitTasks()
-    return platformToTarget
+    for (const target of syncTargets) {
+      if (this.cancellationToken.cancelled) {
+        break
+      }
+      await target.finishBuild()
+    }
   }
 
   private async createHelper(platform: Platform): Promise<PlatformPackager<any>> {
@@ -461,17 +720,17 @@ export class Packager {
 
     switch (platform) {
       case Platform.MAC: {
-        const helperClass = (await import("./macPackager")).default
+        const helperClass = (await import("./macPackager.js")).MacPackager
         return new helperClass(this)
       }
 
       case Platform.WINDOWS: {
-        const helperClass = (await import("./winPackager")).WinPackager
+        const helperClass = (await import("./winPackager.js")).WinPackager
         return new helperClass(this)
       }
 
       case Platform.LINUX:
-        return new (await import("./linuxPackager")).LinuxPackager(this)
+        return new (await import("./linuxPackager.js")).LinuxPackager(this)
 
       default:
         throw new Error(`Unknown platform: ${platform}`)
@@ -485,16 +744,16 @@ export class Packager {
 
     const frameworkInfo = { version: this.framework.version, useCustomDist: true }
     const config = this.config
-    if (config.nodeGypRebuild === true) {
+    if (config.nativeModules?.nodeGypRebuild === true) {
       await nodeGypRebuild(platform.nodeName, Arch[arch], frameworkInfo)
     }
 
-    if (config.npmRebuild === false) {
-      log.info({ reason: "npmRebuild is set to false" }, "skipped dependencies rebuild")
+    if (config.nativeModules?.npmRebuild === false) {
+      log.info({ reason: "nativeModules.npmRebuild is set to false" }, "skipped dependencies rebuild")
       return
     }
 
-    const beforeBuild = resolveFunction(config.beforeBuild, "beforeBuild")
+    const beforeBuild = await resolveFunction(this.appInfo.type, config.beforeBuild, "beforeBuild", await this.getWorkspaceRoot())
     if (beforeBuild != null) {
       const performDependenciesInstallOrRebuild = await beforeBuild({
         appDir: this.appDir,
@@ -510,30 +769,40 @@ export class Packager {
       }
     }
 
-    if (config.buildDependenciesFromSource === true && platform.nodeName !== process.platform) {
-      log.info({ reason: "platform is different and buildDependenciesFromSource is set to true" }, "skipped dependencies rebuild")
-    } else {
-      await installOrRebuild(config, this.appDir, {
+    // Always rebuild for the target, even cross-platform: skipping here would ship whatever binary is
+    // already in node_modules (typically the host's). buildDependenciesFromSource is downgraded to
+    // prebuilt binaries for a cross-platform target, since node-gyp cannot cross-compile.
+    await installOrRebuild(
+      config,
+      { appDir: this.appDir, projectDir: this.projectDir, workspaceRoot: await this.getWorkspaceRoot() },
+      {
         frameworkInfo,
         platform: platform.nodeName,
         arch: Arch[arch],
-        productionDeps: this.getNodeDependencyInfo(null),
-      })
-    }
+        buildFromSource: resolveBuildFromSource(config, platform.nodeName),
+      },
+      false,
+      this.runtimeEnvironmentVariables
+    )
   }
+}
 
-  async afterPack(context: AfterPackContext): Promise<any> {
-    const afterPack = resolveFunction(this.config.afterPack, "afterPack")
-    const handlers = this.afterPackHandlers.slice()
-    if (afterPack != null) {
-      // user handler should be last
-      handlers.push(afterPack)
-    }
+interface ArchTargets extends PlannedTargets {
+  readonly targets: Array<Target>
+  readonly outDir: string
+}
 
-    for (const handler of handlers) {
-      await Promise.resolve(handler(context))
-    }
-  }
+interface PlatformTargets {
+  readonly packager: PlatformPackager<any>
+  readonly nameToTarget: Map<string, Target>
+  readonly archs: ReadonlyArray<ArchTargets>
+}
+
+interface TargetFinishers {
+  /** The targets that finish while the build goes on. */
+  readonly taskManager: AsyncTaskManager
+  /** The targets to finish one after another at the end. */
+  readonly syncTargets: ReadonlyArray<Target>
 }
 
 function createOutDirIfNeed(targetList: Array<Target>, createdOutDirs: Set<string>): Promise<any> {

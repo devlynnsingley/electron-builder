@@ -1,7 +1,20 @@
 {
   "name": "builder-util-runtime",
-  "version": "8.7.9",
-  "main": "out/index.js",
+  "version": "10.0.0-alpha.13",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    },
+    "./internal": {
+      "types": "./dist/indexInternal.d.ts",
+      "import": "./dist/indexInternal.js",
+      "require": "./dist/indexInternal.js"
+    }
+  },
   "author": "Vladimir Krivosheev",
   "license": "MIT",
   "repository": {
@@ -12,18 +25,23 @@
   "bugs": "https://github.com/electron-userland/electron-builder/issues",
   "homepage": "https://github.com/electron-userland/electron-builder",
   "files": [
-    "out"
+    "dist"
   ],
+  "scripts": {
+    "build": "tsc --build tsconfig.build.json --force",
+    "watch": "tsc --build tsconfig.build.json --watch"
+  },
   "engines": {
-    "node": ">=12.0.0"
+    "node": ">=22.12.0"
   },
   "dependencies": {
-    "debug": "^4.3.2",
+    "@noble/hashes": "^2.2.0",
+    "debug": "^4.3.4",
     "sax": "^1.2.4"
   },
   "devDependencies": {
-    "@types/debug": "4.1.6",
+    "@types/debug": "4.1.7",
     "@types/sax": "1.2.3"
   },
-  "types": "./out/index.d.ts"
+  "types": "./dist/index.d.ts"
 }

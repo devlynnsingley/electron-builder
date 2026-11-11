@@ -1,8 +1,7 @@
-import { sanitizeFileName } from "app-builder-lib/out/util/sanitizeFileName"
-import { exec, log, spawn, TmpDir } from "builder-util"
-import { unlinkIfExists } from "builder-util/out/fs"
-import * as chalk from "chalk"
-import { getSignVendorPath } from "app-builder-lib/out/codeSign/windowsCodeSign"
+import { getWindowsKitsBundle } from "app-builder-lib/internal"
+import { exec, Executables, log, spawn, TmpDir, unlinkIfExists } from "builder-util"
+import { sanitizeFileName } from "builder-util/internal"
+import chalk from "chalk"
 import { mkdir } from "fs/promises"
 import * as path from "path"
 
@@ -18,23 +17,33 @@ export async function createSelfSignedCert(publisher: string) {
 
   try {
     await mkdir(path.dirname(tempPrefix), { recursive: true })
-    const vendorPath = path.join(await getSignVendorPath(), "windows-10", process.arch)
+    const vendorPath = (await getWindowsKitsBundle({ winCodeSign: "latest" })).kit
     await exec(path.join(vendorPath, "makecert.exe"), ["-r", "-h", "0", "-n", `CN=${quoteString(publisher)}`, "-eku", "1.3.6.1.5.5.7.3.3", "-pe", "-sv", pvk, cer])
 
     const pfx = path.join(targetDir, `${sanitizeFileName(publisher)}.pfx`)
     await unlinkIfExists(pfx)
     await exec(path.join(vendorPath, "pvk2pfx.exe"), ["-pvk", pvk, "-spc", cer, "-pfx", pfx])
-    log.info({ file: pfx }, `created. Please see https://electron.build/code-signing how to use it to sign.`)
+    log.info({ file: pfx }, `created. Please see https://electron.build/docs/features/code-signing how to use it to sign.`)
 
     const certLocation = "Cert:\\LocalMachine\\TrustedPeople"
-    log.info({ file: pfx, certLocation }, `importing. Operation will be succeed only if runned from root. Otherwise import file manually.`)
-    await spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Import-PfxCertificate", "-FilePath", `"${pfx}"`, "-CertStoreLocation", certLocation])
+    log.info({ file: pfx, certLocation }, `importing. Operation will be succeed only if runned from root. Otherwise import  file manually.`)
+    // this command loads no configuration: Windows PowerShell from its default location
+    await spawn(Executables.resolve("powershell"), [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "Import-PfxCertificate",
+      "-FilePath",
+      `"${pfx}"`,
+      "-CertStoreLocation",
+      certLocation,
+    ])
   } finally {
     await tmpDir.cleanup()
   }
 }
 
-function quoteString(s: string): string {
+export function quoteString(s: string): string {
   if (!s.includes(",") && !s.includes('"')) {
     return s
   }

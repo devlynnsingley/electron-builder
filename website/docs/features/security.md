@@ -1,0 +1,112 @@
+---
+title: "Security & Hardening"
+---
+
+# Security & Hardening
+
+electron-builder aims to be secure-by-default across the whole release pipeline — from how updates are verified, to how your app's contents are integrity-checked, to how artifacts are signed and published. This page is a map of those controls; each section links out to the detailed guide rather than repeating it.
+
+:::info[Upgrading]
+The defaults below cover auto-update web installers, update-metadata format, and explicit publishing. When upgrading, read this page alongside the [migration guide](../migration/v27-breaking-changes.md).
+:::
+
+## Update security (electron-updater)
+
+- **The embedded manifest key is the trust anchor.** An installed app verifies the update manifest against the Ed25519 public key embedded in it (`updateManifestPublicKey` in `app-update.yml`, or set at runtime), then installs the download once it matches the manifest's `sha512`. An app without a key (built with `updateManifest: false`, or an older build) skips that check with a warning, and its feed (the first provider in `app-update.yml`, or the one passed to `setFeedURL`) is the trust anchor: whoever can change the files on the feed can serve an update with a matching checksum, and only the update's code signature stops that, on Windows and macOS and only for a code-signed app. Serve the feed over `https` (see below).
+
+- **Signed update manifests (required by default).** The `latest*.yml` update metadata is Ed25519-signed at publish time and verified by electron-updater — before any download — against a public key embedded in the app. "Required" is enforced at build time: publishing a build that emits update metadata fails unless a signing key resolves. electron-updater enforces it whenever the app embeds a key, failing closed on unsigned or tampered manifests; `updateManifest: false` is the only opt-out and warns on every build. Unlike the `sha2`-only metadata deprecation below, this one is enforced. See [Signed Update Manifests](./signed-update-manifests.md).
+
+- **Web-installer payloads are disabled by default.** `AppUpdater.disableWebInstaller` defaults to **`true`**. NSIS *web* installers (the small installer that downloads its full payload at install time from a manifest-supplied URL) are not loaded unless you opt in, because that payload may not undergo signature verification. A web-installer update is rejected with `ERR_UPDATER_WEB_INSTALLER_DISABLED` — at download (including an update cached by a previous launch), before an install on next launch, and at install time. Installs made by an `nsis-web` installer opt in automatically (via the `resources/package-type` marker); set `autoUpdater.disableWebInstaller = false` yourself only for web-installer installs without that marker (built with electron-builder 26 or earlier, or with a custom script) or when switching an app from `nsis` to `nsis-web`. Cached web updates are re-verified against the freshly fetched manifest, and the `nsis-web` installer verifies the package electron-updater passes to it against the packages built with it (see [Web Installer](../nsis.md#web-installer)). [Signed update manifests](./signed-update-manifests.md) cover the web package's path, SHA-512 and size, so don't set `updateManifest: false` for `nsis-web` apps.
+
+- **The app chooses the headers sent to another origin.** electron-updater asks the app's required [`autoUpdater.crossOriginHeaders`](./auto-update.md#crossoriginheaders) which request headers to send on each request and redirect to another origin than the update feed (another scheme, host or port; an `http` → `https` upgrade of the same host on the default ports is the same origin). It gets the names of the headers about to be sent, never their values, and returns the ones to send; every other header, such as `Authorization`, `Cookie` or a custom `X-Api-Token`, stays on the original origin. The headers electron-updater builds for each request itself (its default `User-Agent`, `Cache-Control`, the `Accept` it sets and `Range`) are sent whatever it returns, and a request's `auth` option (Basic credentials) never follows a redirect to another origin. Without it, the update check fails with `ERR_UPDATER_CROSS_ORIGIN_HEADERS_NOT_CONFIGURED`; a throw or an invalid result fails that request instead of sending every header (`ERR_UPDATER_INVALID_CROSS_ORIGIN_HEADERS`). The update feed's origin (`Provider.feedBaseUrl`, which every provider returns; for private GitHub, the GitHub API, whose asset URLs need its token) gets every header. Keep a header only for an origin (`hop.to`) that may receive it. See [The app chooses the headers sent to another origin](../migration/v27-runtime-changes.md#cross-origin-headers).
+- **Update credentials stay on the feed's origin.** The headers from `requestHeaders` / `addAuthHeader` other than the ones `crossOriginHeaders` keeps (such as `Authorization` or a custom header) and the query string of the feed URL are only sent to the update feed's origin. A download on another origin, including the same host on another port or over `http` instead of `https`, is requested without them, as is a channel file (`latest*.yml`) on another origin. See [Auto Update](./auto-update.md#custom-options-instantiating-updater-directly).
+
+- **Update requests require `https`.** electron-updater rejects any update request over plain `http` — the feed, the update files, blockmaps, differential range requests and every redirect, so an `https` request redirected to `http` too — with `ERR_UPDATER_INSECURE_FEED`, except to a loopback host (`localhost`, `127.0.0.0/8`, `::1`), and a redirect to a loopback host from a URL that is not on one with `ERR_UPDATER_LOOPBACK_REDIRECT`. `autoUpdater.allowInsecureFeed = !app.isPackaged` opts out of the `https` rule in dev runs (a packaged app with it set logs a warning); a server's authentication challenge on a request that is neither `https` nor to a loopback host is then cancelled instead of reaching the `login` event. See [Auto Update](./auto-update.md#allowinsecurefeed).
+
+- **Linux update authenticity comes from signed update manifests.** Package-manager flags do not provide it: an AppImage has no package signature check, and a `.deb` has none whatever `allowUnverifiedLinuxPackages` is set to, because `apt` verifies no signature on a local `.deb` file. `AppUpdater.allowUnverifiedLinuxPackages` (default **`true`**, since electron-builder does not sign Linux packages itself) only matters for `.rpm` updates: if you sign them, set it to **`false`** to have `dnf`/`yum` and `zypper` verify the signature. Never pre-authorize the update install with a polkit rule or a sudoers `NOPASSWD` entry for the package manager: that lets any process running as the user install any package as root. See [Linux update authenticity](./auto-update.md#linux-update-authenticity).
+
+- **`app-update.yml` is readable by anyone with the app.** Every option of the provider that becomes the update feed is written to `app-update.yml` in plain text, so never put a token in the `publish` configuration. For a private GitHub repository, set `private: true` and provide `GH_TOKEN` at runtime, or pass a per-user token to `setFeedURL`: a token hard-coded in the app's code is as easy to extract as one in `app-update.yml`. See [Private GitHub Update Repo](./auto-update.md#private-github-update-repo).
+
+- **Modern, verified update metadata.** Generated `latest*.yml` targets the `files[]` format, and the default `electronUpdaterCompatibility` is `>=7` (see [Compatibility](./auto-update.md#compatibility)). Update metadata validated only by the legacy SHA-256 `sha2` checksum is deprecated.
+
+- **Windows update signature verification.** On Windows, downloaded NSIS updates are Authenticode-verified before they are applied. `win.verifyUpdateCodeSignature` (default `true`) embeds your signing `publisherName` into `app-update.yml`, and electron-updater checks each downloaded update against the certificate subject. Supply an array of `publisherName` values when rotating certificates so updates signed by either the old or new certificate still verify. Verification fails closed: an update is rejected when `app-update.yml` has no `publisherName`, and a build that would write such an `app-update.yml` fails; `win.verifyUpdateCodeSignature: false` is the only opt-out (see [the v27 migration guide](../migration/v27-build-changes.md#missing-publishername-fails-update-verification)).
+
+:::warning[sha2-only metadata is planned to be rejected in v28]
+A build that writes `sha2`-only update metadata and an update validated with it log a warning. **v28** is planned to **reject** it. Confirm your updates use modern `files[]` metadata before upgrading to v28.
+:::
+
+**See also:** [Auto Update](./auto-update.md) · [Update metadata & compatibility](./auto-update.md#compatibility)
+
+## Package integrity
+
+Two independent mechanisms protect the code inside your packaged app:
+
+- **ASAR integrity.** When your app is packaged into an `app.asar` archive (the default), electron-builder embeds integrity hashes so Electron can detect a tampered or swapped archive at runtime. It is on by default; `asar.disableIntegrity: true` disables it (not recommended). See the [ASAR options](../migration/v27-config-changes.md#asar-options-asar) for the v27 config shape. On macOS the hashes are stored in `Info.plist`, so with Electron 41 and later electron-builder also embeds a digest of them into the Electron Framework binary, which the code signature covers: with the `enableEmbeddedAsarIntegrityValidation` fuse (see below), the hashes can't be changed to match a modified archive either. The digest is embedded by default; `mac.asarIntegrityDigest: false` turns it off.
+
+- **Electron Fuses.** Fuses are "magic bits" flipped at package time — *before* code signing — that disable risky Electron features for the entire app (e.g. `runAsNode`, `enableNodeCliInspectArguments`, `enableNodeOptionsEnvironmentVariable`). Pairing `enableEmbeddedAsarIntegrityValidation` with `onlyLoadAppFromAsar` binds the app to its verified ASAR. Because the bits are flipped before signing, the OS (Gatekeeper / App Locker) is responsible for ensuring they can't be flipped back.
+
+**See also:** [Adding Electron Fuses](../tutorials/adding-electron-fuses.md)
+
+## Build configuration is trusted input
+
+The build configuration — the electron-builder config file, the `build` key of `package.json`, `-c` command-line overrides and the environment variables it reads — and the hooks it names (`beforeBuild`, `afterPack`, `afterSign`, custom `sign` scripts, custom publishers and the like) run code on the build machine by design. Anyone who can change them can already run any code during the build, with the build's signing keys and publish tokens. Treat them like source code: review changes to them, and don't build untrusted changes (such as pull requests from forks) with release credentials. Values from the configuration are escaped where electron-builder writes them into installer scripts and metadata, but that is hardening, not a boundary that makes an untrusted configuration safe to build.
+
+## Files from the build machine
+
+Only the build configuration is trusted, not the files it packages. Files reached through symlinks must resolve inside the workspace or the package-manager store, copies and the files electron-builder writes stay inside the output directory by real path, and Windows archives and installers refuse a symlink that leaves the app. Intended links can be allowed with `fileOptions.allowExternalLinks`; writes through a symlink are always refused.
+
+**See also:** [Symbolic links](../contents.md#symbolic-links)
+
+## Code signing & notarization
+
+Signing proves your app's identity and lets the OS confirm it hasn't been tampered with since it was signed. On macOS, notarization is additionally required for Gatekeeper when distributing outside the Mac App Store. electron-builder discovers signing credentials from the environment and signs automatically when they are present.
+
+- **macOS signing** (Developer ID, `mac.sign`) — [macOS Signing](./code-signing/code-signing-mac.md)
+- **Windows signing** — signtool, HSM, PKCS#11, and Azure Trusted Signing via the `win.sign` discriminated union — [Windows Signing](./code-signing/code-signing-win.md)
+- **Apple notarization** — [Notarization](./code-signing/notarization.md)
+
+**See also:** [Code Signing overview](./code-signing/code-signing.md)
+
+## Safe publishing
+
+electron-builder **publishes only when you ask it to**: pass `--publish <always|onTag|onTagOrDraft|never>` explicitly in your release scripts, or set the `publish` option in your configuration. A CI tag environment variable, a git tag or an npm lifecycle event alone never publishes, so secrets and unfinished releases are not shipped by accident.
+
+```bash
+electron-builder --publish always   # explicit
+```
+
+**See also:** [Publish configuration](../publish.md) · [Implicit `--publish` removed](../migration/v27-build-changes.md#implicit-publish-removed)
+
+## Update feed ownership
+
+When a GitHub or Bitbucket publish configuration omits `owner`/`repo`, electron-builder fills them in from the repository info (`package.json` `repository`, CI environment variables, then `.git/config`). The result becomes the publish/update destination and, for auto-update-capable targets, is written to `app-update.yml` inside the packaged app, so it is the update feed every installed copy keeps using — long after the build machine is gone. A build reports the repository it resolved to and the `source` it came from (info level for `package.json` `repository`, warn level for CI environment variables or `.git/config`), so read that line and confirm it is correct:
+
+```
+• update feed inferred from repository info; it will be used as the publish/update destination
+  (written to app-update.yml in auto-update-capable targets) - specify it explicitly to be sure
+  it stays under your control  reason=owner and repo not specified in the publish configuration
+  source=.git/config provider=github owner=my-org repo=my-app
+```
+
+That name has to stay yours. GitHub frees an owner or repository name for re-registration as soon as it is renamed, transferred or deleted, and whoever claims it next can publish a release that installed copies of your app will download and run. Set `owner` and `repo` explicitly rather than relying on detection, and do not retire the namespace while builds are still in the field.
+
+**See also:** [GitHub repository detection](../publish.md#github-repository-and-bintray-package)
+
+## Toolset integrity
+
+The external build toolsets electron-builder downloads (NSIS, winCodeSign, AppImage, Wine, FPM, …) are checksum-verified after download and cached, so a corrupted or substituted bundle is rejected. When you supply a **custom** toolset from a remote `url`, a `checksum` is **required**; a local `file://` directory is used as-is and needs no checksum.
+
+```json5
+{
+  "build": {
+    "toolsets": {
+      "nsis": {
+        "url": "https://example.com/my-nsis-bundle.tar.gz",
+        "checksum": "sha256:abc123…"
+      }
+    }
+  }
+}
+```
+
+**See also:** [Toolsets](../toolsets.md) · [Custom toolset bundles](../migration/v27-build-changes.md#toolset-env-var-overrides-removed)

@@ -1,9 +1,12 @@
-import { ElectronAppAdapter } from "electron-updater/out/ElectronAppAdapter"
+import { ElectronAppAdapter } from "electron-updater/src/ElectronAppAdapter"
 
 // do not implement AppAdapter directly, test that our ElectronAppAdapter implementation is correct
 export class TestAppAdapter extends ElectronAppAdapter {
-  constructor(version: string, private _baseCachePath: string) {
-    super(new MockApp(version))
+  constructor(
+    version: string,
+    private _baseCachePath: string
+  ) {
+    super(new MockApp(version) as any)
   }
 
   get baseCachePath(): string {
@@ -25,6 +28,10 @@ export class TestAppAdapter extends ElectronAppAdapter {
 
   quit(): void {
     // empty
+  }
+
+  onSessionEnd(): void {
+    // powerMonitor is not available outside of a real Electron app
   }
 }
 

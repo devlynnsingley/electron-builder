@@ -1,19 +1,27 @@
 import { CancellationToken, GithubOptions, githubUrl, HttpError, newError, parseXml, ReleaseNoteInfo, UpdateInfo, XElement } from "builder-util-runtime"
+import { urlWithoutQuery } from "builder-util-runtime/internal"
 import * as semver from "semver"
 import { URL } from "url"
-import { AppUpdater } from "../AppUpdater"
-import { ResolvedUpdateFileInfo } from "../main"
-import { getChannelFilename, newBaseUrl, newUrlFromBase } from "../util"
-import { parseUpdateInfo, Provider, ProviderRuntimeOptions, resolveFiles } from "./Provider"
+import { AppUpdater } from "../AppUpdater.js"
+import { ResolvedUpdateFileInfo } from "../types.js"
+import { getChannelFilename, newBaseUrl, newUrlFromBase } from "../util.js"
+import { channelFileNotFoundError, parseUpdateInfo, Provider, ProviderRuntimeOptions, resolveFiles } from "./Provider.js"
 
-const hrefRegExp = /\/tag\/v?([^/]+)$/
+const hrefRegExp = /\/tag\/(v?[^/]+)$/
 
+interface GithubUpdateInfo extends UpdateInfo {
+  tag: string
+}
 export abstract class BaseGitHubProvider<T extends UpdateInfo> extends Provider<T> {
   // so, we don't need to parse port (because node http doesn't support host as url does)
   protected readonly baseUrl: URL
   protected readonly baseApiUrl: URL
 
-  protected constructor(protected readonly options: GithubOptions, defaultHost: string, runtimeOptions: ProviderRuntimeOptions) {
+  protected constructor(
+    protected readonly options: GithubOptions,
+    defaultHost: string,
+    runtimeOptions: ProviderRuntimeOptions
+  ) {
     super({
       ...runtimeOptions,
       /* because GitHib uses S3 */
@@ -28,16 +36,29 @@ export abstract class BaseGitHubProvider<T extends UpdateInfo> extends Provider<
   protected computeGithubBasePath(result: string): string {
     // https://github.com/electron-userland/electron-builder/issues/1903#issuecomment-320881211
     const host = this.options.host
-    return host != null && host !== "github.com" && host !== "api.github.com" ? `/api/v3${result}` : result
+    return host && !["github.com", "api.github.com"].includes(host) ? `/api/v3${result}` : result
   }
 }
 
-export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
-  constructor(protected readonly options: GithubOptions, private readonly updater: AppUpdater, runtimeOptions: ProviderRuntimeOptions) {
+export class GitHubProvider extends BaseGitHubProvider<GithubUpdateInfo> {
+  constructor(
+    protected readonly options: GithubOptions,
+    private readonly updater: AppUpdater,
+    runtimeOptions: ProviderRuntimeOptions
+  ) {
     super(options, "github.com", runtimeOptions)
   }
 
-  async getLatestVersion(): Promise<UpdateInfo> {
+  get feedBaseUrl(): URL {
+    return this.baseUrl
+  }
+
+  private get channel(): string {
+    const result = this.updater.channel || this.options.channel
+    return result == null ? this.getDefaultChannelName() : this.getCustomChannelName(result)
+  }
+
+  async getLatestVersion(): Promise<GithubUpdateInfo> {
     const cancellationToken = new CancellationToken()
 
     const feedXml: string = (await this.httpRequest(
@@ -49,56 +70,95 @@ export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
     ))!
 
     const feed = parseXml(feedXml)
-    // noinspection TypeScriptValidateJSTypes
-    let latestRelease = feed.element("entry", false, `No published versions on GitHub`)
-    let version: string | null
+    const releaseEntries = feed.getElements("entry")
+    if (releaseEntries.length === 0) {
+      throw newError(`No releases in the GitHub Atom feed`, "ERR_XML_MISSED_ELEMENT")
+    }
+
+    let release: FeedRelease
     try {
-      if (this.updater.allowPrerelease) {
-        // noinspection TypeScriptValidateJSTypes
-        version = hrefRegExp.exec(latestRelease.element("link").attribute("href"))![1]
-      } else {
-        version = await this.getLatestVersionString(cancellationToken)
-        for (const element of feed.getElements("entry")) {
-          // noinspection TypeScriptValidateJSTypes
-          if (hrefRegExp.exec(element.element("link").attribute("href"))![1] === version) {
-            latestRelease = element
-            break
-          }
-        }
-      }
-    } catch (e) {
+      release = this.updater.allowPrerelease ? this.findHighestEligibleRelease(releaseEntries) : await this.findLatestRelease(releaseEntries, cancellationToken)
+    } catch (e: any) {
       throw newError(`Cannot parse releases feed: ${e.stack || e.message},\nXML:\n${feedXml}`, "ERR_UPDATER_INVALID_RELEASE_FEED")
     }
 
-    if (version == null) {
+    const { tag, entry: latestRelease } = release
+    if (tag == null) {
       throw newError(`No published versions on GitHub`, "ERR_UPDATER_NO_PUBLISHED_VERSIONS")
     }
 
-    const channelFile = getChannelFilename(this.getDefaultChannelName())
-    const channelFileUrl = newUrlFromBase(this.getBaseDownloadPath(version, channelFile), this.baseUrl)
-    const requestOptions = this.createRequestOptions(channelFileUrl)
-    let rawData: string
-    try {
-      rawData = (await this.executor.request(requestOptions, cancellationToken))!
-    } catch (e) {
-      if (!this.updater.allowPrerelease && e instanceof HttpError && e.statusCode === 404) {
-        throw newError(`Cannot find ${channelFile} in the latest release artifacts (${channelFileUrl}): ${e.stack || e.message}`, "ERR_UPDATER_CHANNEL_FILE_NOT_FOUND")
-      }
-      throw e
-    }
-
+    const { rawData, channelFile, channelFileUrl } = await this.fetchChannelFile(tag, cancellationToken)
     const result = parseUpdateInfo(rawData, channelFile, channelFileUrl)
-    if (result.releaseName == null) {
+    // latestRelease can be null in the allowPrerelease=false path when the resolved tag (from the
+    // /releases/latest API) is not present in the truncated Atom feed; the update still proceeds
+    // with the resolved tag, only the feed-derived release name/notes are omitted.
+    if (result.releaseName == null && latestRelease != null) {
       result.releaseName = latestRelease.elementValueOrEmpty("title")
     }
 
-    if (result.releaseNotes == null) {
-      result.releaseNotes = computeReleaseNotes(this.updater.currentVersion, this.updater.fullChangelog, feed, latestRelease)
+    if (result.releaseNotes == null && latestRelease != null) {
+      result.releaseNotes = computeReleaseNotes(this.updater.currentVersion, this.updater.fullChangelog, releaseEntries, latestRelease)
     }
-    return result
+    return {
+      tag: tag,
+      ...result,
+    }
   }
 
-  private async getLatestVersionString(cancellationToken: CancellationToken): Promise<string | null> {
+  // allowPrerelease=true: the highest semver release eligible for the current channel. The Atom feed is ordered by
+  // publication date, not by version, so the first eligible entry is not necessarily the newest one (#10287).
+  private findHighestEligibleRelease(releaseEntries: Array<XElement>): FeedRelease {
+    const currentChannel = this.updater?.channel || prereleaseChannelOf(this.updater.currentVersion)
+    // No explicit channel and a stable current version: any semver release (pre-release or stable) is a candidate,
+    // non-semver tags (e.g. unrelated package releases in a monorepo) are skipped. Whether the newest release is
+    // actually an update is decided later by AppUpdater.isUpdateAvailable.
+    if (currentChannel === null) {
+      return pickHighestRelease(releaseEntries, () => true)
+    }
+    return pickHighestRelease(releaseEntries, tag => isEligibleForChannel(prereleaseChannelOf(tag), currentChannel))
+  }
+
+  // allowPrerelease=false: the tag comes from the /releases/latest API; the feed only supplies the release name/notes.
+  private async findLatestRelease(releaseEntries: Array<XElement>, cancellationToken: CancellationToken): Promise<FeedRelease> {
+    const tag = await this.getLatestTagName(cancellationToken)
+    // only entries whose href has a /tag/ segment are compared with the latest tag
+    const entry =
+      releaseEntries.find(releaseEntry => {
+        const releaseTag = releaseTagOf(releaseEntry)
+        return releaseTag != null && releaseTag === tag
+      }) ?? null
+    return { tag, entry }
+  }
+
+  private async fetchChannelFile(tag: string, cancellationToken: CancellationToken): Promise<ChannelFileData> {
+    const tagChannel = prereleaseChannelOf(tag)
+    const channel = this.updater.allowPrerelease && tagChannel != null ? this.getCustomChannelName(String(tagChannel)) : this.channel
+    try {
+      return await this.requestChannelFile(tag, channel, cancellationToken)
+    } catch (e: any) {
+      if (!this.updater.allowPrerelease) {
+        throw e
+      }
+      // Allow fallback to `latest.yml`
+      return await this.requestChannelFile(tag, this.getDefaultChannelName(), cancellationToken)
+    }
+  }
+
+  private async requestChannelFile(tag: string, channelName: string, cancellationToken: CancellationToken): Promise<ChannelFileData> {
+    const channelFile = getChannelFilename(channelName)
+    const channelFileUrl = newUrlFromBase(this.getBaseDownloadPath(String(tag), channelFile), this.baseUrl)
+    try {
+      const rawData = (await this.channelFileRequest(channelFileUrl, undefined, cancellationToken))!
+      return { rawData, channelFile, channelFileUrl }
+    } catch (e: any) {
+      if (e instanceof HttpError && e.statusCode === 404) {
+        throw channelFileNotFoundError(channelFile, channelFileUrl, e)
+      }
+      throw e
+    }
+  }
+
+  private async getLatestTagName(cancellationToken: CancellationToken): Promise<string | null> {
     const options = this.options
     // do not use API for GitHub to avoid limit, only for custom host or GitHub Enterprise
     const url =
@@ -112,9 +172,12 @@ export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
       }
 
       const releaseInfo: GithubReleaseInfo = JSON.parse(rawData)
-      return releaseInfo.tag_name.startsWith("v") ? releaseInfo.tag_name.substring(1) : releaseInfo.tag_name
-    } catch (e) {
-      throw newError(`Unable to find latest version on GitHub (${url}), please ensure a production release exists: ${e.stack || e.message}`, "ERR_UPDATER_LATEST_VERSION_NOT_FOUND")
+      return releaseInfo.tag_name
+    } catch (e: any) {
+      throw newError(
+        `Unable to find latest version on GitHub (${urlWithoutQuery(url)}), please ensure a production release exists: ${e.stack || e.message}`,
+        "ERR_UPDATER_LATEST_VERSION_NOT_FOUND"
+      )
     }
   }
 
@@ -122,18 +185,81 @@ export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
     return `/${this.options.owner}/${this.options.repo}/releases`
   }
 
-  resolveFiles(updateInfo: UpdateInfo): Array<ResolvedUpdateFileInfo> {
+  resolveFiles(updateInfo: GithubUpdateInfo): Array<ResolvedUpdateFileInfo> {
     // still replace space to - due to backward compatibility
-    return resolveFiles(updateInfo, this.baseUrl, p => this.getBaseDownloadPath(updateInfo.version, p.replace(/ /g, "-")))
+    return resolveFiles(updateInfo, this.baseUrl, p => this.getBaseDownloadPath(updateInfo.tag, p.replace(/ /g, "-")))
   }
 
-  private getBaseDownloadPath(version: string, fileName: string): string {
-    return `${this.basePath}/download/${this.options.vPrefixedTagName === false ? "" : "v"}${version}/${fileName}`
+  private getBaseDownloadPath(tag: string, fileName: string): string {
+    // guard against path traversal: the tag is interpolated into the download URL, so a tag with
+    // a "." / ".." path segment could redirect the request outside the releases download path.
+    if (tag.split(/[/\\]/).some(segment => segment === "." || segment === "..")) {
+      throw newError(`Invalid release tag: ${tag}`, "ERR_UPDATER_INVALID_TAG")
+    }
+    return `${this.basePath}/download/${tag}/${fileName}`
   }
 }
 
 interface GithubReleaseInfo {
   readonly tag_name: string
+}
+
+interface FeedRelease {
+  readonly tag: string | null
+  readonly entry: XElement | null
+}
+
+interface ChannelFileData {
+  readonly rawData: string
+  readonly channelFile: string
+  readonly channelFileUrl: URL
+}
+
+const PROMOTABLE_CHANNELS = ["alpha", "beta"]
+
+// Tag of a feed entry from its link href; undefined when the href has no /tag/ segment.
+function releaseTagOf(releaseEntry: XElement): string | undefined {
+  // noinspection TypeScriptValidateJSTypes
+  return hrefRegExp.exec(releaseEntry.element("link").attribute("href"))?.[1]
+}
+
+// First pre-release identifier ("beta" for 1.0.0-beta.1), or null for a stable version. Numeric identifiers are kept
+// as-is (so 1.0.0-0 counts as stable, as 0 is falsy).
+function prereleaseChannelOf(version: string | semver.SemVer): string | null {
+  return (semver.prerelease(version)?.[0] as string) || null
+}
+
+// A release is eligible when it is on the current channel. Alpha/beta clients additionally accept stable releases
+// and may move from alpha to beta, but not down from beta to alpha; custom channels only follow themselves.
+function isEligibleForChannel(releaseChannel: string | null, currentChannel: string): boolean {
+  // "latest" is the stable channel: only stable releases are eligible (see release-using-channels docs)
+  if (currentChannel === "latest") {
+    return releaseChannel === null
+  }
+  if (releaseChannel === currentChannel) {
+    return true
+  }
+  if (!PROMOTABLE_CHANNELS.includes(currentChannel)) {
+    return false
+  }
+  return releaseChannel === null || (PROMOTABLE_CHANNELS.includes(String(releaseChannel)) && !(currentChannel === "beta" && releaseChannel === "alpha"))
+}
+
+// Highest semver-valid release accepted by `isEligible`; on equal versions the earlier feed entry wins.
+function pickHighestRelease(releaseEntries: Array<XElement>, isEligible: (tag: string) => boolean): FeedRelease {
+  let tag: string | null = null
+  let entry: XElement | null = null
+  for (const releaseEntry of releaseEntries) {
+    const releaseTag = releaseTagOf(releaseEntry)
+    if (releaseTag == null || !semver.valid(releaseTag) || !isEligible(releaseTag)) {
+      continue
+    }
+    if (tag == null || semver.gt(releaseTag, tag)) {
+      tag = releaseTag
+      entry = releaseEntry
+    }
+  }
+  return { tag, entry }
 }
 
 function getNoteValue(parent: XElement): string {
@@ -142,19 +268,53 @@ function getNoteValue(parent: XElement): string {
   return result === "No content." ? "" : result
 }
 
-export function computeReleaseNotes(currentVersion: semver.SemVer, isFullChangelog: boolean, feed: XElement, latestRelease: any): string | Array<ReleaseNoteInfo> | null {
+export function computeReleaseNotes(
+  currentVersion: semver.SemVer,
+  isFullChangelog: boolean,
+  releaseEntries: XElement[],
+  latestRelease: XElement
+): string | Array<ReleaseNoteInfo> | null {
   if (!isFullChangelog) {
     return getNoteValue(latestRelease)
   }
 
+  const releaseVersionRegExp = /\/tag\/v?([^/]+)$/
+
+  let latestVersion: string | undefined = undefined
+  try {
+    latestVersion = releaseVersionRegExp.exec(latestRelease.element("link").attribute("href"))![1]
+    latestVersion = semver.valid(latestVersion) ? latestVersion : undefined
+  } catch {
+    // If we cannot parse the latest release version, return null — notes cannot be determined
+  }
+
+  if (latestVersion == null) {
+    return null
+  }
+
   const releaseNotes: Array<ReleaseNoteInfo> = []
-  for (const release of feed.getElements("entry")) {
-    // noinspection TypeScriptValidateJSTypes
-    const versionRelease = /\/tag\/v?([^/]+)$/.exec(release.element("link").attribute("href"))![1]
-    if (semver.lt(currentVersion, versionRelease)) {
+  for (const releaseEntry of releaseEntries) {
+    let versionRelease: string
+    try {
+      const match = releaseVersionRegExp.exec(releaseEntry.element("link").attribute("href"))
+      if (!match) {
+        continue
+      }
+      versionRelease = match[1]
+    } catch {
+      continue
+    }
+    // skip non-semver tags (e.g. doc/website releases in monorepos)
+    if (!semver.valid(versionRelease)) {
+      continue
+    }
+
+    const isGreaterThanCurrent = semver.gt(versionRelease, currentVersion.raw)
+    const isLessOrEqualThanLatest = semver.lte(versionRelease, latestVersion)
+    if (isGreaterThanCurrent && isLessOrEqualThanLatest) {
       releaseNotes.push({
         version: versionRelease,
-        note: getNoteValue(release),
+        note: getNoteValue(releaseEntry),
       })
     }
   }

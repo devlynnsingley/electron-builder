@@ -1,13 +1,32 @@
 name: "Pull Request Labeler"
 on:
-- pull_request_target
+- pull_request
+
+# a newer event of the same pull request supersedes a run still in progress
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   triage:
-    runs-on: ubuntu-latest
+    name: Label pull request
+    permissions:
+      contents: read  # for actions/labeler to determine modified files
+      pull-requests: write  # for actions/labeler to add labels to PRs
+    runs-on: ubuntu-24.04
+    if: github.repository == 'electron-userland/electron-builder'
     steps:
-    - uses: actions/labeler@v3
+    - name: Checkout code repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
+      continue-on-error: true  # fork PRs have read-only tokens; fail silently
       with:
         repo-token: "${{ secrets.GITHUB_TOKEN }}"
         configuration-path: ".github/pr-labeler.yml"
-        sync-labels: false
+        sync-labels: true

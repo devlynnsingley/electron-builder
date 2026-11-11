@@ -1,0 +1,93 @@
+---
+title: "Configuration"
+---
+
+{!./partials/_upgrading-from-v26.md!}
+
+electron-builder configuration can be defined
+
+* in the `package.json` file of your project using the `build` key on the top level:
+   ```json
+   "build": {
+     "appId": "com.example.app"
+   }
+   ```
+* or through the `--config <path/to/yml-or-json5-or-toml-or-js>` option. Defaults to `electron-builder.yml`.
+   ```yaml
+   appId: "com.example.app"
+   ```
+
+    `json`, [json5](http://json5.org), [toml](https://github.com/toml-lang/toml) or `js`/`ts` (exported configuration or function that produces configuration) formats are also supported.
+
+    :::tip
+    If you want to use a `js` file, do not name it `electron-builder.js`. It will [conflict](https://github.com/electron-userland/electron-builder/issues/6227) with the `electron-builder` package name.
+    :::
+
+    :::tip
+    If you want to use [toml](https://en.wikipedia.org/wiki/TOML), install it with `npm install toml --save-dev`.
+    :::
+
+Most of the options accept `null` — for example, to explicitly set that DMG icon must be default volume icon from the OS and default rules must be not applied (i.e. use application icon as DMG icon), set `dmg.icon` to `null`.
+
+## Artifact File Name Template
+
+`${ext}` macro is supported in addition to [file macros](./file-patterns.md#file-macros).
+
+## Environment Variables from File
+
+Env file `electron-builder.env` in the current dir ([example](https://github.com/motdotla/dotenv-expand/blob/1cc80d02e1f8aa749253a04a2061c0fecb9bdb69/tests/.env)). Supported only for CLI usage.
+
+## Effective Configuration
+
+Before packaging, electron-builder writes the resolved configuration to `builder-effective-config.yaml` in the output directory (`directories.output`, `dist` by default). It is the merged result of `package.json`, the config file, presets and CLI overrides, plus values detected during the build such as `electronVersion`. Sensitive fields (passwords, tokens, `cscLink`) are masked.
+
+By default the file is written only for local interactive builds, not on CI or when stdout is piped. Set `writeEffectiveConfig` to `true` to always write it (e.g. `electron-builder -c.writeEffectiveConfig=true` in a CI step), or to `false` to never write it.
+
+## How to Read Docs
+
+* Name of optional property is normal, **required** is bold.
+* Type is specified after property name: `Array<String> | String`. Union like this means that you can specify or string (`**/*`), or array of strings (`["**/*", "!foo.js"]`).
+
+### Common Configuration
+
+  {!./app-builder-lib.Interface.CommonConfiguration.md!}
+
+---
+
+## Overridable per Platform Options
+
+Following options can be set also per platform (top-level keys [mac](mac.md), [linux](linux.md) and [win](win.md)) if need.
+
+## Base Configuration
+
+  {!./app-builder-lib.Interface.PlatformSpecificBuildOptions.md!}
+
+## Metadata
+Some standard fields should be defined in the `package.json`.
+
+  {!./app-builder-lib.Interface.Metadata.md!}
+
+## Electron Download & Mirror
+
+electron-builder downloads the Electron distribution to package via [`@electron/get`](https://github.com/electron/get). Point it at a mirror (e.g. a corporate proxy or a China mirror) with the `electronGet` option:
+
+```json5
+{
+  "build": {
+    "electronGet": {
+      "mirrorOptions": { "mirror": "https://npmmirror.com/mirrors/electron/" }
+    }
+  }
+}
+```
+
+:::note[v27: renamed from electronDownload]
+This key was `electronDownload` in v26. In v27 it is `electronGet`, reshaped to `@electron/get` v5 options: the flat `mirror` moved under `mirrorOptions.mirror`, `isVerifyChecksum: false` became `unsafelyDisableChecksums: true`, and `cache` / `customDir` / `customFilename` / `strictSSL` / `force` were dropped. `electron-builder migrate-schema` performs the rename. See [v27 Breaking Changes → electronGet](./migration/v27-config-changes.md#electrondownload-electronget).
+:::
+
+## Build Version Management
+`CFBundleVersion` (macOS) and `FileVersion` (Windows) will be set automatically to `version.build_number` on CI server (Travis, AppVeyor, CircleCI and Bamboo supported).
+
+## Build Hooks
+
+  {!./features/hooks.md!}

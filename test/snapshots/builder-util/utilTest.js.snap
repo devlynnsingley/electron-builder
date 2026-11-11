@@ -1,0 +1,53 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`removePassword: /b … /c block > handles /b … /c block (snapshot) 1`] = `"/b <fingerprint> /c"`;
+
+exports[`removePassword: /p > handles Mac host path without hashing (snapshot) 1`] = `"/p \\\\Mac\\Host\\Users\\user"`;
+
+exports[`removePassword: /p > handles double-quoted value (snapshot) 1`] = `"/p "<fingerprint>""`;
+
+exports[`removePassword: /p > handles single-quoted value (snapshot) 1`] = `"/p '<fingerprint>'"`;
+
+exports[`removePassword: /p > handles unquoted value (snapshot) 1`] = `"/p <fingerprint>"`;
+
+exports[`removePassword: --accessKey > handles double-quoted value (snapshot) 1`] = `"--accessKey "<fingerprint>""`;
+
+exports[`removePassword: --accessKey > handles single-quoted value (snapshot) 1`] = `"--accessKey '<fingerprint>'"`;
+
+exports[`removePassword: --accessKey > handles unquoted value (snapshot) 1`] = `"--accessKey <fingerprint>"`;
+
+exports[`removePassword: --secretKey > handles double-quoted value (snapshot) 1`] = `"--secretKey "<fingerprint>""`;
+
+exports[`removePassword: --secretKey > handles single-quoted value (snapshot) 1`] = `"--secretKey '<fingerprint>'"`;
+
+exports[`removePassword: --secretKey > handles unquoted value (snapshot) 1`] = `"--secretKey <fingerprint>"`;
+
+exports[`removePassword: -String > handles double-quoted value (snapshot) 1`] = `"-String "<fingerprint>""`;
+
+exports[`removePassword: -String > handles single-quoted value (snapshot) 1`] = `"-String '<fingerprint>'"`;
+
+exports[`removePassword: -String > handles unquoted value (snapshot) 1`] = `"-String <fingerprint>"`;
+
+exports[`removePassword: -p > handles double-quoted value (snapshot) 1`] = `"-p "<fingerprint>""`;
+
+exports[`removePassword: -p > handles single-quoted value (snapshot) 1`] = `"-p '<fingerprint>'"`;
+
+exports[`removePassword: -p > handles unquoted value (snapshot) 1`] = `"-p <fingerprint>"`;
+
+exports[`removePassword: -pass > handles double-quoted value (snapshot) 1`] = `"-pass "<fingerprint>""`;
+
+exports[`removePassword: -pass > handles single-quoted value (snapshot) 1`] = `"-pass '<fingerprint>'"`;
+
+exports[`removePassword: -pass > handles unquoted value (snapshot) 1`] = `"-pass <fingerprint>"`;
+
+exports[`removePassword: multiple keys in one string > handles mixed quoted and unquoted keys (snapshot) 1`] = `"-p '<fingerprint>' -pass <fingerprint>"`;
+
+exports[`removePassword: multiple keys in one string > handles several keys and /b … /c block (snapshot) 1`] = `"pass:<fingerprint> --accessKey "<fingerprint>" /b <fingerprint> /c"`;
+
+exports[`removePassword: multiple keys in one string > handles two keys unquoted (snapshot) 1`] = `"--accessKey <fingerprint> --secretKey <fingerprint>"`;
+
+exports[`removePassword: pass: > handles double-quoted value (snapshot) 1`] = `"pass:"<fingerprint>""`;
+
+exports[`removePassword: pass: > handles single-quoted value (snapshot) 1`] = `"pass:'<fingerprint>'"`;
+
+exports[`removePassword: pass: > handles unquoted value (snapshot) 1`] = `"pass:<fingerprint>"`;

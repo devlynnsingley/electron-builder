@@ -1,9 +1,21 @@
 import { OutgoingHttpHeaders } from "http"
+import { Nullish } from "./index.js"
 
-export type PublishProvider = "github" | "bintray" | "s3" | "spaces" | "generic" | "custom" | "snapStore"
+export type PublishProvider = "github" | "gitlab" | "s3" | "spaces" | "r2" | "generic" | "custom" | "snapStore" | "keygen" | "bitbucket"
 
 // typescript-json-schema generates only PublishConfiguration if it is specified in the list, so, it is not added here
-export type AllPublishOptions = string | GithubOptions | S3Options | SpacesOptions | GenericServerOptions | BintrayOptions | CustomPublishOptions
+export type AllPublishOptions =
+  | string
+  | GithubOptions
+  | GitlabOptions
+  | S3Options
+  | SpacesOptions
+  | R2Options
+  | GenericServerOptions
+  | CustomPublishOptions
+  | KeygenOptions
+  | SnapStoreOptions
+  | BitbucketOptions
 
 export interface PublishConfiguration {
   /**
@@ -19,15 +31,46 @@ export interface PublishConfiguration {
 
   /**
    * @private
+   * win-only. Written as `false` into `app-update.yml` by electron-builder for a build with `win.verifyUpdateCodeSignature: false`:
+   * the explicit opt-out that makes electron-updater install an update without verifying its Authenticode signature, which it
+   * otherwise rejects when there is no `publisherName`. Managed by electron-builder; setting it in the `publish` configuration is
+   * rejected as a configuration error.
+   */
+  verifyUpdateCodeSignature?: false | null
+
+  /**
+   * @private
    * win-only
    */
   readonly updaterCacheDirName?: string | null
+
+  /**
+   * The largest channel file (`latest*.yml`) electron-updater reads, in bytes: it is read into memory and parsed before anything
+   * verifies it. A larger one fails the update check with `ERR_HTTP_RESPONSE_TOO_LARGE`. Release feeds and provider API responses
+   * (release listings and lookups) are not limited. Written into `app-update.yml`, so installed apps use it; `autoUpdater.maxUpdateInfoSize`
+   * overrides it at runtime. A positive integer, or `0` for no limit.
+   * @default 10485760
+   */
+  readonly maxUpdateInfoSize?: number | null
+
+  /**
+   * Ed25519 public key(s) (PEM or base64 SPKI) used by electron-updater to verify the signed update
+   * manifest before downloading — the install's trust list. A manifest is accepted when any listed key
+   * validates one of its signatures. Embedded into `app-update.yml` at build time when update manifest
+   * signing is enabled: a single string for one key, an array for several. Managed by electron-builder —
+   * populated from `updateManifest.publicKey` or derived from the configured signing key(s); setting it
+   * manually in the `publish` configuration is rejected as a configuration error.
+   * @private
+   */
+  readonly updateManifestPublicKey?: string | Array<string> | null
 
   /**
    * Whether to publish auto update info files.
    *
    * Auto update relies only on the first provider in the list (you can specify several publishers).
    * Thus, probably, there`s no need to upload the metadata files for the other configured providers. But by default will be uploaded.
+   * A provider with `false` never becomes the feed embedded in `app-update.yml` while a later provider receives the metadata:
+   * the first provider that does is embedded instead.
    *
    * @default true
    */
@@ -37,6 +80,13 @@ export interface PublishConfiguration {
    * Any custom request headers
    */
   readonly requestHeaders?: OutgoingHttpHeaders
+
+  /**
+   * Request timeout in milliseconds. (Default is 2 minutes; O is ignored)
+   *
+   * @default 120000
+   */
+  readonly timeout?: number | null
 }
 
 // https://github.com/electron-userland/electron-builder/issues/3261
@@ -78,10 +128,11 @@ export interface GithubOptions extends PublishConfiguration {
   readonly owner?: string | null
 
   /**
-   * Whether to use `v`-prefixed tag name.
-   * @default true
+   * If defined, sets the prefix of the tag name that comes before the semver number.
+   * e.g. "v" in "v1.2.3" or "test" of "test1.2.3".
+   * @default "v"
    */
-  readonly vPrefixedTagName?: boolean
+  readonly tagNamePrefix?: string
 
   /**
    * The host (including the port if need).
@@ -90,20 +141,26 @@ export interface GithubOptions extends PublishConfiguration {
   readonly host?: string | null
 
   /**
-   * The protocol. GitHub Publisher supports only `https`.
+   * The protocol. GitHub Publisher supports only `https`. electron-updater rejects an `http` feed to a host that is not loopback unless the app sets `autoUpdater.allowInsecureFeed` (meant for dev runs: `autoUpdater.allowInsecureFeed = !app.isPackaged`).
    * @default https
    */
   readonly protocol?: "https" | "http" | null
 
   /**
-   * The access token to support auto-update from private github repositories. Never specify it in the configuration files. Only for [setFeedURL](/auto-update#appupdatersetfeedurloptions).
+   * The access token to support auto-update from private github repositories. Never specify it in the configuration files. Only for [setFeedURL](https://www.electron.build/docs/features/auto-update#custom-options-instantiating-updater-directly).
    */
   readonly token?: string | null
 
   /**
-   * Whether to use private github auto-update provider if `GH_TOKEN` environment variable is defined. See [Private GitHub Update Repo](/auto-update#private-github-update-repo).
+   * Whether to use private github auto-update provider if `GH_TOKEN` environment variable is defined. See [Private GitHub Update Repo](https://www.electron.build/docs/features/auto-update#private-github-update-repo).
    */
   readonly private?: boolean | null
+
+  /**
+   * The channel.
+   * @default latest
+   */
+  readonly channel?: string | null
 
   /**
    * The type of release. By default `draft` release will be created.
@@ -114,14 +171,90 @@ export interface GithubOptions extends PublishConfiguration {
   releaseType?: "draft" | "prerelease" | "release" | null
 }
 
+/** The default {@link PublishConfiguration.maxUpdateInfoSize}: 10 MiB. */
+export const DEFAULT_MAX_UPDATE_INFO_SIZE = 10 * 1024 * 1024
+
+/** Whether `value` is a valid {@link PublishConfiguration.maxUpdateInfoSize}: a positive integer, or `0` for no limit. */
+export function isValidMaxUpdateInfoSize(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+}
+
 /** @private */
 export function githubUrl(options: GithubOptions, defaultHost = "github.com") {
   return `${options.protocol || "https"}://${options.host || defaultHost}`
 }
 
+export function githubTagPrefix(options: GithubOptions) {
+  return options.tagNamePrefix ?? "v"
+}
+
+export function getGitlabAuthHeaders(token: string | null): { [key: string]: string } {
+  const headers: { [key: string]: string } = {}
+
+  if (token != null) {
+    // If the token starts with "Bearer", it is an OAuth application secret
+    // Note that the original gitlab token would not start with "Bearer"
+    // it might start with "gloas-", if so user needs to add "Bearer " prefix to the token
+    if (token.startsWith("Bearer")) {
+      headers.authorization = token
+    } else {
+      headers["PRIVATE-TOKEN"] = token
+    }
+  }
+
+  return headers
+}
+
+/**
+ * [GitLab](https://docs.gitlab.com/ee/user/project/releases/) options.
+ *
+ * GitLab [personal access token](https://docs.gitlab.com/ee/user/profile/personal_access_tokens.html) is required for private repositories. You can generate one by going to your GitLab profile settings.
+ * Define `GITLAB_TOKEN` environment variable.
+ */
+export interface GitlabOptions extends PublishConfiguration {
+  /**
+   * The provider. Must be `gitlab`.
+   */
+  readonly provider: "gitlab"
+
+  /**
+   * The GitLab project ID or path (e.g., "12345678" or "namespace/project").
+   */
+  readonly projectId?: string | number | null
+
+  /**
+   * The GitLab host (including the port if need).
+   * @default gitlab.com
+   */
+  readonly host?: string | null
+
+  /**
+   * The access token to support auto-update from private GitLab repositories. Never specify it in the configuration files.
+   */
+  readonly token?: string | null
+
+  /**
+   * Whether to use `v`-prefixed tag name.
+   * @default true
+   */
+  readonly vPrefixedTagName?: boolean
+
+  /**
+   * The channel.
+   * @default latest
+   */
+  readonly channel?: string | null
+
+  /**
+   * Upload target method. Can be "project_upload" for GitLab project uploads or "generic_package" for GitLab generic packages.
+   * @default "project_upload"
+   */
+  readonly uploadTarget?: "project_upload" | "generic_package" | null
+}
+
 /**
  * Generic (any HTTP(S) server) options.
- * In all publish options [File Macros](/file-patterns#file-macros) are supported.
+ * In all publish options [File Macros](https://www.electron.build/file-patterns#file-macros) are supported.
  */
 export interface GenericServerOptions extends PublishConfiguration {
   /**
@@ -146,6 +279,116 @@ export interface GenericServerOptions extends PublishConfiguration {
   readonly useMultipleRangeRequest?: boolean
 }
 
+/**
+ * Keygen options.
+ * https://keygen.sh/
+ * Define `KEYGEN_TOKEN` environment variable.
+ */
+export interface KeygenOptions extends PublishConfiguration {
+  /**
+   * The provider. Must be `keygen`.
+   */
+  readonly provider: "keygen"
+
+  /**
+   * Keygen host for self-hosted instances
+   * @default "api.keygen.sh"
+   */
+  readonly host?: string
+
+  /**
+   * Keygen account's UUID
+   */
+  readonly account: string
+
+  /**
+   * Keygen product's UUID
+   */
+  readonly product: string
+
+  /**
+   * The channel.
+   * @default stable
+   */
+  readonly channel?: "stable" | "rc" | "beta" | "alpha" | "dev" | null
+
+  /**
+   * The target Platform. Is set programmatically explicitly during publishing.
+   */
+  readonly platform?: string | null
+}
+
+/**
+ * Bitbucket options.
+ * https://bitbucket.org/
+ * Define `BITBUCKET_TOKEN` environment variable.
+ *
+ * Bitbucket Cloud is [retiring app passwords](https://www.atlassian.com/blog/bitbucket/bitbucket-cloud-transitions-to-api-tokens-enhancing-security-with-app-password-deprecation) in favor of API tokens and access tokens. Authentication is selected by whether a `username` is provided:
+ * - With `username` — the token is sent via HTTP Basic auth. Use a Bitbucket username + [app password](https://bitbucket.org/account/settings/app-passwords/), or an Atlassian account email + [API token](https://support.atlassian.com/bitbucket-cloud/docs/using-api-tokens/).
+ * - Without `username` — the token is sent as a repository/project/workspace [access token](https://support.atlassian.com/bitbucket-cloud/docs/using-access-tokens/) via Bearer auth.
+ *
+ * For the auto-updater on a private repository, pass the matching header to `autoUpdater.addAuthHeader(...)`:
+```typescript
+// access token (no username)
+autoUpdater.addAuthHeader(`Bearer ${token}`)
+// app password or API token (with username)
+autoUpdater.addAuthHeader(`Basic ${Buffer.from(`${username}:${token}`).toString("base64")}`)
+```
+ */
+export interface BitbucketOptions extends PublishConfiguration {
+  /**
+   * The provider. Must be `bitbucket`.
+   */
+  readonly provider: "bitbucket"
+
+  /**
+   * Repository owner
+   */
+  readonly owner: string
+
+  /**
+   * The token to support auto-update from private bitbucket repositories. Depending on `username`, this is a Bitbucket [app password](https://bitbucket.org/account/settings/app-passwords/), an Atlassian [API token](https://support.atlassian.com/bitbucket-cloud/docs/using-api-tokens/), or a repository/project/workspace [access token](https://support.atlassian.com/bitbucket-cloud/docs/using-access-tokens/).
+   */
+  readonly token?: string | null
+
+  /**
+   * The user name to support auto-update from private bitbucket repositories. Provide a Bitbucket username (for an app password) or an Atlassian account email (for an API token) to authenticate with HTTP Basic auth. Leave unset to send `token` as a Bearer access token.
+   */
+  readonly username?: string | null
+
+  /**
+   * Repository slug/name
+   */
+  readonly slug: string
+
+  /**
+   * The channel.
+   * @default latest
+   */
+  readonly channel?: string | null
+}
+
+/**
+ * [Snap Store](https://snapcraft.io/) options. To publish directly to Snapcraft, see <a href="https://snapcraft.io/docs/snapcraft-authentication">Snapcraft authentication options</a> for local or CI/CD authentication options.
+ */
+export interface SnapStoreOptions extends PublishConfiguration {
+  /**
+   * The provider. Must be `snapStore`.
+   */
+  readonly provider: "snapStore"
+
+  /**
+   * snapcraft repo name
+   */
+  readonly repo?: string
+
+  /**
+   * The list of channels the snap would be released.
+   * @default ["edge"]
+   */
+  readonly channels?: string | Array<string> | null
+}
+
 export interface BaseS3Options extends PublishConfiguration {
   /**
    * The update channel.
@@ -167,6 +410,32 @@ export interface BaseS3Options extends PublishConfiguration {
   readonly acl?: "private" | "public-read" | null
 }
 
+/**
+ * [Amazon S3](https://aws.amazon.com/s3/) options.
+ * AWS credentials are required, please see [getting your credentials](https://docs.aws.amazon.com/sdkref/latest/guide/access.html).
+ * Publishing requires choosing where they come from with [awsCredentials](#awsCredentials) `source` (there is no default):
+ * - `source: "env"` reads only the `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and optional `AWS_SESSION_TOKEN` environment variables (or custom names);
+ * - `source: "profile"` reads the named `profile` from the [shared config and credentials files](https://docs.aws.amazon.com/sdkref/latest/guide/file-format.html)
+ *   (static keys, IAM Identity Center / SSO, `credential_process`, assume-role with `source_profile`; `credential_source`, web identity and `login_session` are rejected).
+ * - `source: "sso-role-chain"` reads the named assume-role `profile` from the same files and resolves its `source_profile` chain, which must start at an
+ *   IAM Identity Center (SSO) profile, with the configured files only.
+ *
+ * No credentials are read implicitly: `AWS_PROFILE`, `AWS_SDK_LOAD_CONFIG`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE` and the `~/.aws` files are never consulted on their own.
+ *
+ * Example configuration:
+ *
+```json
+{
+  "build":
+    "publish": {
+      "provider": "s3",
+      "bucket": "bucket-name",
+      "awsCredentials": { "source": "env" }
+    }
+  }
+}
+```
+ */
 export interface S3Options extends BaseS3Options {
   /**
    * The provider. Must be `s3`.
@@ -208,6 +477,99 @@ export interface S3Options extends BaseS3Options {
    * The endpoint should be a string like `https://{service}.{region}.amazonaws.com`.
    */
   readonly endpoint?: string | null
+
+  /**
+   * If set to true, this will enable the s3 accelerated endpoint
+   * These endpoints have a particular format of:
+   *  ${bucketname}.s3-accelerate.amazonaws.com
+   */
+  readonly accelerate?: boolean
+
+  /**
+   * When true, force a path-style endpoint to be used where the bucket name is part of the path.
+   * [Path-style Access](https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html#path-style-access)
+   */
+  readonly forcePathStyle?: boolean
+
+  /**
+   * Where the AWS credentials used for publishing come from. Required to publish (there is no default source);
+   * builds that don't publish don't need it. Build-time only: never written to `app-update.yml`.
+   *
+   * Example using an IAM Identity Center (SSO) profile:
+   *
+   * ```json
+   * "awsCredentials": { "source": "profile", "profile": "release" }
+   * ```
+   *
+   * Example assuming a role (`role_arn` + `source_profile`) on top of an SSO profile:
+   *
+   * ```json
+   * "awsCredentials": { "source": "sso-role-chain", "profile": "deploy", "configFile": "~/.aws/config" }
+   * ```
+   */
+  readonly awsCredentials?: S3AwsCredentialsOptions | null
+}
+
+/**
+ * How the S3 publisher obtains AWS credentials. Only the sources named here are consulted.
+ */
+export interface S3AwsCredentialsOptions {
+  /**
+   * The credential source (required, no default):
+   * - `env`: read only `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` (or the variable names given in `env`).
+   * - `profile`: read the named `profile` from the shared config/credentials files. Static keys, IAM Identity Center (SSO), `credential_process` and assume-role profiles are supported.
+   *   An assume-role profile whose `source_profile` chain starts at an SSO profile is rejected; use `sso-role-chain` for it.
+   *   `credential_source`, web identity (`web_identity_token_file`) and `aws login` sessions (`login_session`) anywhere in the chain are rejected: they read ambient credentials or settings.
+   * - `sso-role-chain`: `profile` names an assume-role profile (`role_arn` + `source_profile`). Its `source_profile` chain (up to 5 assume-role hops, no cycles)
+   *   must end at an IAM Identity Center (SSO) profile. electron-builder resolves that SSO profile from the configured files, then calls STS AssumeRole for each hop
+   *   with the previous hop's credentials. `role_session_name`, `external_id` and `duration_seconds` are honoured per hop; STS uses the named profile's `region`
+   *   (else `us-east-1`) and `sts_regional_endpoints`. `AWS_REGION` and other `AWS_*` variables are not read. `credential_source`, `mfa_serial`, `web_identity_token_file`
+   *   and `credential_process` are rejected in the chain.
+   */
+  readonly source: "env" | "profile" | "sso-role-chain"
+
+  /**
+   * The profile name for `source: "profile"` or `source: "sso-role-chain"` (required for those sources; `AWS_PROFILE` is not used as a fallback).
+   * Use `default` to select the `[default]` profile.
+   */
+  readonly profile?: string | null
+
+  /**
+   * The shared credentials file for `source: "profile"` or `source: "sso-role-chain"`. `AWS_SHARED_CREDENTIALS_FILE` is not consulted.
+   * @default ~/.aws/credentials
+   */
+  readonly credentialsFile?: string | null
+
+  /**
+   * The shared config file for `source: "profile"` or `source: "sso-role-chain"`. `AWS_CONFIG_FILE` is not consulted.
+   * @default ~/.aws/config
+   */
+  readonly configFile?: string | null
+
+  /**
+   * Custom environment variable names for `source: "env"`, e.g. to keep publish-only keys separate from ambient `AWS_*` variables.
+   */
+  readonly env?: S3AwsCredentialsEnvNames | null
+}
+
+/**
+ * Environment variable names holding the S3 publishing credentials.
+ */
+export interface S3AwsCredentialsEnvNames {
+  /**
+   * The environment variable holding the access key ID.
+   */
+  readonly accessKeyId: string
+
+  /**
+   * The environment variable holding the secret access key.
+   */
+  readonly secretAccessKey: string
+
+  /**
+   * The environment variable holding the session token, if any.
+   */
+  readonly sessionToken?: string | null
 }
 
 /**
@@ -221,14 +583,115 @@ export interface SpacesOptions extends BaseS3Options {
   readonly provider: "spaces"
 
   /**
-   * The space name.
+   * The space name: 3-63 letters, digits and dashes, starting with a letter or digit.
    */
   readonly name: string
 
   /**
-   * The region (e.g. `nyc3`).
+   * The DigitalOcean region slug (e.g. `nyc3`): three letters followed by one or two digits.
    */
   readonly region: string
+}
+
+/**
+ * [Cloudflare R2](https://developers.cloudflare.com/r2/) options.
+ * Credentials are required; define `CF_R2_ACCESS_KEY_ID` and `CF_R2_SECRET_ACCESS_KEY` environment variables
+ * with an R2 API token (see https://developers.cloudflare.com/r2/api/s3/tokens/).
+ *
+ * **Public access for auto-updates:** R2 buckets are private by default. The S3-compatible API endpoint
+ * always requires authentication, so `electron-updater` cannot download updates directly from it.
+ * You must either enable a custom domain or an r2.dev subdomain for the bucket in the Cloudflare
+ * dashboard (see https://developers.cloudflare.com/r2/buckets/public-buckets/) and then set
+ * `publicUrl` to that base URL so the updater knows where to fetch update metadata and binaries.
+ *
+ * **ACLs:** R2 does not support S3 ACLs. The `acl` option from `BaseS3Options` is intentionally
+ * excluded here. Configure public bucket access in the Cloudflare dashboard instead.
+ *
+ * Example configuration:
+ *
+```json
+{
+  "build": {
+    "publish": {
+      "provider": "r2",
+      "bucket": "my-releases",
+      "accountId": "abcdef1234567890abcdef1234567890",
+      "publicUrl": "https://pub-abcdef1234567890abcdef1234567890.r2.dev"
+    }
+  }
+}
+```
+ */
+export interface R2Options extends BaseS3Options {
+  /**
+   * The provider. Must be `r2`.
+   */
+  readonly provider: "r2"
+
+  /**
+   * The R2 bucket name.
+   */
+  readonly bucket: string
+
+  /**
+   * Your Cloudflare account ID (32-character hex string). Found on the R2 overview page
+   * in the Cloudflare dashboard. Used to construct the S3-compatible upload endpoint:
+   * `https://<accountId>.r2.cloudflarestorage.com`
+   */
+  readonly accountId: string
+
+  /**
+   * The public base URL from which `electron-updater` will download update metadata and
+   * binaries. This must be the URL of your bucket's **custom domain** or **r2.dev subdomain**
+   * (e.g. `https://pub-xxx.r2.dev` or `https://cdn.example.com`).
+   *
+   * Required when `publishAutoUpdate` is not `false`. The R2 S3 API endpoint requires
+   * authentication and cannot serve unauthenticated download requests.
+   *
+   * See https://developers.cloudflare.com/r2/buckets/public-buckets/
+   */
+  readonly publicUrl?: string | null
+
+  /**
+   * The jurisdiction of the R2 bucket, if the bucket was created with a jurisdictional
+   * restriction. Buckets created in a jurisdiction live on a separate endpoint —
+   * `https://<accountId>.<jurisdiction>.r2.cloudflarestorage.com` — so this must match
+   * the jurisdiction the bucket was created with. Omit for regular buckets.
+   *
+   * See https://developers.cloudflare.com/r2/reference/data-location/#jurisdictional-restrictions
+   */
+  readonly jurisdiction?: "eu" | "fedramp" | null
+
+  /**
+   * R2 does not support S3 ACLs. This option is not applicable and will be ignored.
+   * Configure bucket-level public access in the Cloudflare dashboard instead.
+   */
+  readonly acl?: never
+}
+
+export interface GitlabReleaseInfo {
+  name: string
+  tag_name: string
+  description: string
+  created_at: string
+  released_at: string
+  upcoming_release: boolean
+  assets: GitlabReleaseAsset
+}
+
+export interface GitlabReleaseAsset {
+  count: number
+  sources: Array<{
+    format: string
+    url: string
+  }>
+  links: Array<{
+    id: number
+    name: string
+    url: string
+    direct_asset_url: string
+    link_type: string
+  }>
 }
 
 export function getS3LikeProviderBaseUrl(configuration: PublishConfiguration) {
@@ -239,12 +702,17 @@ export function getS3LikeProviderBaseUrl(configuration: PublishConfiguration) {
   if (provider === "spaces") {
     return spacesUrl(configuration as SpacesOptions)
   }
+  if (provider === "r2") {
+    return r2Url(configuration as R2Options)
+  }
   throw new Error(`Not supported provider: ${provider}`)
 }
 
 function s3Url(options: S3Options) {
   let url: string
-  if (options.endpoint != null) {
+  if (options.accelerate == true) {
+    url = `https://${options.bucket}.s3-accelerate.amazonaws.com`
+  } else if (options.endpoint != null) {
     url = `${options.endpoint}/${options.bucket}`
   } else if (options.bucket.includes(".")) {
     if (options.region == null) {
@@ -265,7 +733,7 @@ function s3Url(options: S3Options) {
   return appendPath(url, options.path)
 }
 
-function appendPath(url: string, p: string | null | undefined): string {
+function appendPath(url: string, p: string | Nullish): string {
   if (p != null && p.length > 0) {
     if (!p.startsWith("/")) {
       url += "/"
@@ -285,47 +753,20 @@ function spacesUrl(options: SpacesOptions) {
   return appendPath(`https://${options.name}.${options.region}.digitaloceanspaces.com`, options.path)
 }
 
-/**
- * [Bintray](https://bintray.com/) options. Requires an API key. An API key can be obtained from the user [profile](https://bintray.com/profile/edit) page ("Edit Your Profile" -> API Key).
- * Define `BT_TOKEN` environment variable.
- */
-export interface BintrayOptions extends PublishConfiguration {
-  /**
-   * The provider. Must be `bintray`.
-   */
-  readonly provider: "bintray"
-
-  /**
-   * The Bintray package name.
-   */
-  readonly package?: string | null
-
-  /**
-   * The Bintray repository name.
-   * @default generic
-   */
-  readonly repo?: string | null
-
-  /**
-   * The owner.
-   */
-  readonly owner?: string | null
-
-  /**
-   * The Bintray component (Debian only).
-   */
-  readonly component?: string | null
-
-  /**
-   * The Bintray distribution (Debian only).
-   * @default stable
-   */
-  readonly distribution?: string | null
-
-  /**
-   * The Bintray user account. Used in cases where the owner is an organization.
-   */
-  readonly user?: string | null
-
-  readonly token?: string | null
+function r2Url(options: R2Options) {
+  if (options.bucket == null || options.bucket.trim() === "") {
+    throw new Error(`bucket is missing`)
+  }
+  if (options.accountId == null || options.accountId.trim() === "") {
+    throw new Error(`accountId is missing`)
+  }
+  // Use the public URL (custom domain / r2.dev subdomain) when provided — the S3 API endpoint
+  // always requires authentication and cannot serve unauthenticated download requests.
+  if (options.publicUrl != null && options.publicUrl.trim() !== "") {
+    return appendPath(options.publicUrl.replace(/\/$/, ""), options.path)
+  }
+  // Jurisdictional buckets (e.g. "eu", "fedramp") live on a separate endpoint:
+  // https://<accountId>.<jurisdiction>.r2.cloudflarestorage.com
+  const jurisdiction = options.jurisdiction == null || options.jurisdiction.trim() === "" ? "" : `${options.jurisdiction.trim()}.`
+  return appendPath(`https://${options.accountId}.${jurisdiction}r2.cloudflarestorage.com/${options.bucket}`, options.path)
 }

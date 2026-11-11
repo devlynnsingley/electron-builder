@@ -1,5 +1,5 @@
 import { Transform } from "stream"
-import { CancellationToken } from "builder-util-runtime"
+import { CancellationError, CancellationToken } from "builder-util-runtime"
 
 enum OperationKind {
   COPY,
@@ -39,7 +39,7 @@ export class ProgressDifferentialDownloadCallbackTransform extends Transform {
 
   _transform(chunk: any, encoding: string, callback: any) {
     if (this.cancellationToken.cancelled) {
-      callback(new Error("cancelled"), null)
+      callback(new CancellationError(), null)
       return
     }
 
@@ -65,7 +65,7 @@ export class ProgressDifferentialDownloadCallbackTransform extends Transform {
         delta: this.delta,
         transferred: this.transferred,
         percent: (this.transferred / this.progressDifferentialDownloadInfo.grandTotal) * 100,
-        bytesPerSecond: Math.round(this.transferred / ((now - this.start) / 1000)),
+        bytesPerSecond: this.getBytesPerSecond(now),
       })
       this.delta = 0
     }
@@ -91,15 +91,16 @@ export class ProgressDifferentialDownloadCallbackTransform extends Transform {
         delta: this.delta,
         transferred: this.transferred,
         percent: (this.transferred / this.progressDifferentialDownloadInfo.grandTotal) * 100,
-        bytesPerSecond: Math.round(this.transferred / ((Date.now() - this.start) / 1000)),
+        bytesPerSecond: this.getBytesPerSecond(),
       })
+      this.delta = 0
     }
   }
 
   // Called when we are 100% done with the connection/download
   _flush(callback: any): void {
     if (this.cancellationToken.cancelled) {
-      callback(new Error("cancelled"))
+      callback(new CancellationError())
       return
     }
 
@@ -108,11 +109,15 @@ export class ProgressDifferentialDownloadCallbackTransform extends Transform {
       delta: this.delta,
       transferred: this.transferred,
       percent: 100,
-      bytesPerSecond: Math.round(this.transferred / ((Date.now() - this.start) / 1000)),
+      bytesPerSecond: this.getBytesPerSecond(),
     })
     this.delta = 0
     this.transferred = 0
 
     callback(null)
+  }
+
+  private getBytesPerSecond(now = Date.now()): number {
+    return Math.round((this.transferred * 1000) / Math.max(now - this.start, 1))
   }
 }

@@ -1,7 +1,6 @@
-import { log } from "builder-util"
-import { statOrNull } from "builder-util/out/fs"
+import { log, statOrNull } from "builder-util"
 import * as path from "path"
-import { Configuration } from "../configuration"
+import { Configuration } from "../configuration.js"
 
 /** @internal */
 export async function reactCra(projectDir: string): Promise<Configuration> {
@@ -14,7 +13,9 @@ export async function reactCra(projectDir: string): Promise<Configuration> {
     directories: {
       buildResources: "assets",
     },
-    files: ["build/**/*"],
+    fileOptions: {
+      files: ["build/**/*"],
+    },
     extraMetadata: {
       main: "build/electron.js",
     },

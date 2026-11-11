@@ -1,16 +1,27 @@
 import { Arch, defaultArchFromString } from "builder-util"
 import * as path from "path"
-import { Platform, Target, TargetSpecificOptions } from "../core"
-import { copyFiles, getFileMatchers } from "../fileMatcher"
-import { PlatformPackager } from "../platformPackager"
-import { archive, tar } from "./archive"
-import { appendBlockmap, createBlockmap } from "./differentialUpdateInfoBuilder"
+import { Platform, Target, TargetSpecificOptions } from "../core.js"
+import { copyFiles, getFileMatchers } from "../fileMatcher.js"
+import { PlatformPackager, trackPackWork } from "../platformPackager.js"
+import { archive, shouldPreserveSymlinks, tar } from "./archive.js"
+import { appendBlockmap, createBlockmap } from "./differentialUpdateInfoBuilder.js"
+import { getTrustedSourceRoots } from "../util/trustedSourceRoots.js"
 
 export class ArchiveTarget extends Target {
-  readonly options: TargetSpecificOptions = (this.packager.config as any)[this.name]
+  readonly options: TargetSpecificOptions
 
-  constructor(name: string, readonly outDir: string, private readonly packager: PlatformPackager<any>, private readonly isWriteUpdateInfo = false) {
+  constructor(
+    name: string,
+    readonly outDir: string,
+    private readonly packager: PlatformPackager<any>,
+    private readonly isWriteUpdateInfo = false
+  ) {
     super(name)
+    this.options = (this.packager.config as any)[this.name]
+  }
+
+  get writesUpdateInfo(): boolean {
+    return this.isWriteUpdateInfo
   }
 
   async build(appOutDir: string, arch: Arch): Promise<any> {
@@ -19,7 +30,7 @@ export class ArchiveTarget extends Target {
     const format = this.name
 
     let defaultPattern: string
-    const defaultArch: Arch = defaultArchFromString(packager.platformSpecificBuildOptions.defaultArch)
+    const defaultArch: Arch = defaultArchFromString(packager.platformOptions.defaultArch)
     if (packager.platform === Platform.LINUX) {
       // tslint:disable-next-line:no-invalid-template-strings
       defaultPattern = "${name}-${version}" + (arch === defaultArch ? "" : "-${arch}") + ".${ext}"
@@ -28,67 +39,83 @@ export class ArchiveTarget extends Target {
       defaultPattern = "${productName}-${version}" + (arch === defaultArch ? "" : "-${arch}") + "-${os}.${ext}"
     }
 
-    const artifactName = packager.expandArtifactNamePattern(this.options, format, arch, defaultPattern, false)
-    const artifactPath = path.join(this.outDir, artifactName)
+    const work = (async () => {
+      const artifactName = packager.expandArtifactNamePattern(this.options, format, arch, defaultPattern, false)
+      const artifactPath = path.join(this.outDir, artifactName)
 
-    await packager.info.callArtifactBuildStarted({
-      targetPresentableName: `${isMac ? "macOS " : ""}${format}`,
-      file: artifactPath,
-      arch,
-    })
-    let updateInfo: any = null
-    if (format.startsWith("tar.")) {
-      await tar(packager.compression, format, artifactPath, appOutDir, isMac, packager.info.tempDirManager)
-    } else {
-      let withoutDir = !isMac
-      let dirToArchive = appOutDir
-      if (isMac) {
-        dirToArchive = path.dirname(appOutDir)
-        const fileMatchers = getFileMatchers(
-          packager.config,
-          "extraDistFiles",
-          dirToArchive,
-          packager.createGetFileMatchersOptions(this.outDir, arch, packager.platformSpecificBuildOptions)
-        )
-        if (fileMatchers == null) {
-          dirToArchive = appOutDir
-        } else {
-          await copyFiles(fileMatchers, null, true)
-          withoutDir = true
-        }
-      }
-
-      const archiveOptions = {
-        compression: packager.compression,
-        withoutDir,
-      }
-      await archive(format, artifactPath, dirToArchive, archiveOptions)
-
-      if (this.isWriteUpdateInfo && format === "zip") {
-        if (isMac) {
-          updateInfo = await createBlockmap(artifactPath, this, packager, artifactName)
-        } else {
-          updateInfo = await appendBlockmap(artifactPath)
-        }
-      }
-    }
-
-    await packager.info.callArtifactBuildCompleted({
-      updateInfo,
-      file: artifactPath,
-      // tslint:disable-next-line:no-invalid-template-strings
-      safeArtifactName: packager.computeSafeArtifactName(
-        artifactName,
-        format,
+      await packager.emitArtifactBuildStarted({
+        targetPresentableName: `${isMac ? "macOS " : ""}${format}`,
+        file: artifactPath,
         arch,
-        false,
-        packager.platformSpecificBuildOptions.defaultArch,
-        defaultPattern.replace("${productName}", "${name}")
-      ),
-      target: this,
-      arch,
-      packager,
-      isWriteUpdateInfo: this.isWriteUpdateInfo,
-    })
+      })
+      let updateInfo: any = null
+      if (format.startsWith("tar.")) {
+        await tar({
+          compression: packager.compression,
+          format,
+          outFile: artifactPath,
+          dirToArchive: appOutDir,
+          isMacApp: isMac,
+          tempDirManager: packager.tempDirManager,
+          archiveToolset: packager.config.toolsets?.archive,
+          buildResourcesDir: packager.buildResourcesDir,
+        })
+      } else {
+        let withoutDir = !isMac
+        let dirToArchive = appOutDir
+        if (isMac) {
+          dirToArchive = path.dirname(appOutDir)
+          const fileMatchers = getFileMatchers(packager.config, "extraDistFiles", dirToArchive, packager.createGetFileMatchersOptions(this.outDir, arch, packager.platformOptions))
+          if (fileMatchers == null) {
+            dirToArchive = appOutDir
+          } else {
+            await copyFiles(fileMatchers, null, true, {
+              roots: [dirToArchive, this.outDir],
+              allowedSymlinkRoots: await getTrustedSourceRoots(packager),
+              externalLinks: await packager.getExternalLinkPolicy(),
+            })
+            withoutDir = true
+          }
+        }
+
+        const archiveOptions = {
+          compression: packager.compression,
+          withoutDir,
+          preserveSymlinks: shouldPreserveSymlinks(packager.platform),
+          externalLinks: await packager.getExternalLinkPolicy(),
+        }
+        await archive(format, artifactPath, dirToArchive, archiveOptions)
+
+        if (this.isWriteUpdateInfo && format === "zip") {
+          if (isMac) {
+            updateInfo = await createBlockmap(artifactPath, this, packager, artifactName, arch)
+          } else {
+            updateInfo = await appendBlockmap(artifactPath)
+          }
+        }
+      }
+
+      await packager.emitArtifactBuildCompleted({
+        updateInfo,
+        file: artifactPath,
+        // tslint:disable-next-line:no-invalid-template-strings
+        safeArtifactName: packager.computeSafeArtifactName(
+          artifactName,
+          format,
+          arch,
+          false,
+          packager.platformOptions.defaultArch,
+          defaultPattern.replace("${productName}", "${name}")
+        ),
+        target: this,
+        arch,
+        packager,
+        isWriteUpdateInfo: this.isWriteUpdateInfo,
+      })
+    })()
+    this.buildQueueManager.addTask(work)
+    // a target writing into appOutDir (Squirrel.Windows) waits for the archive
+    trackPackWork(packager, appOutDir, work)
+    return Promise.resolve()
   }
 }

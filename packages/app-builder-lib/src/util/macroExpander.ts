@@ -1,7 +1,8 @@
-import { InvalidConfigurationError } from "builder-util"
-import { AppInfo } from "../appInfo"
+import { InvalidConfigurationError, log } from "builder-util"
+import { Nullish } from "builder-util-runtime"
+import { AppInfo } from "../appInfo.js"
 
-export function expandMacro(pattern: string, arch: string | null | undefined, appInfo: AppInfo, extra: any = {}, isProductNameSanitized = true): string {
+export function expandMacro(pattern: string, arch: string | Nullish, appInfo: AppInfo, extra: any = {}, isProductNameSanitized = true): string {
   if (arch == null) {
     pattern = pattern
       // tslint:disable-next-line:no-invalid-template-strings
@@ -14,7 +15,7 @@ export function expandMacro(pattern: string, arch: string | null | undefined, ap
       .replace("/${arch}", "")
   }
 
-  return pattern.replace(/\${([_a-zA-Z./*+]+)}/g, (match, p1): string => {
+  return pattern.replace(/\${([_a-zA-Z0-9./*+]+)}/g, (match, p1): string => {
     switch (p1) {
       case "productName":
         return isProductNameSanitized ? appInfo.sanitizedProductName : appInfo.productName
@@ -50,6 +51,9 @@ export function expandMacro(pattern: string, arch: string | null | undefined, ap
           const envValue = process.env[envName]
           if (envValue == null) {
             throw new InvalidConfigurationError(`cannot expand pattern "${pattern}": env ${envName} is not defined`, "ERR_ELECTRON_BUILDER_ENV_NOT_DEFINED")
+          }
+          if (/TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL/i.test(envName)) {
+            log.warn({ envName, pattern }, "macro expansion includes an env var that may contain a secret — verify this is intentional")
           }
           return envValue
         }

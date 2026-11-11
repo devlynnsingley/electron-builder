@@ -1,9 +1,8 @@
-import { Arch, archFromString, ArchType } from "builder-util"
-import { AllPublishOptions } from "builder-util-runtime"
-import { SnapStoreOptions } from "./publish/SnapStorePublisher"
+import { Arch, archFromString, ArchType, AsyncTaskManager } from "builder-util"
+import { AllPublishOptions, CancellationToken, Nullish } from "builder-util-runtime"
 
 // https://github.com/YousefED/typescript-json-schema/issues/80
-export type Publish = AllPublishOptions | SnapStoreOptions | Array<AllPublishOptions | SnapStoreOptions> | null
+export type Publish = AllPublishOptions | Array<AllPublishOptions> | null
 
 export type TargetConfigType = Array<string | TargetConfiguration> | string | TargetConfiguration | null
 
@@ -24,7 +23,11 @@ export class Platform {
   static LINUX = new Platform("linux", "linux", "linux")
   static WINDOWS = new Platform("windows", "win", "win32")
 
-  constructor(public name: string, public buildConfigurationKey: string, public nodeName: NodeJS.Platform) {}
+  constructor(
+    public name: string,
+    public buildConfigurationKey: string,
+    public nodeName: NodeJS.Platform
+  ) {}
 
   toString() {
     return this.name
@@ -70,24 +73,42 @@ export class Platform {
 
 export abstract class Target {
   abstract readonly outDir: string
-  abstract readonly options: TargetSpecificOptions | null | undefined
+  abstract readonly options: TargetSpecificOptions | Nullish
 
-  protected constructor(readonly name: string, readonly isAsyncSupported: boolean = true) {}
+  // use only for tasks that cannot be executed in parallel (such as signing on windows and hdiutil on macOS due to file locking)
+  readonly buildQueueManager = new AsyncTaskManager(new CancellationToken())
+
+  public constructor(
+    readonly name: string,
+    readonly isAsyncSupported: boolean = true
+  ) {}
 
   async checkOptions(): Promise<any> {
     // ignore
   }
 
+  /**
+   * Whether this target's artifacts carry auto-update metadata (`isWriteUpdateInfo`), known before anything is built.
+   * The publish preflight uses it to enforce update-manifest signing before the first upload of the whole build.
+   * A target that emits update info without saying so here is still enforced when its artifact is created - only
+   * uploads of other targets that finished earlier can slip through - so custom targets should override it.
+   * "Emits update info" means an artifact event with `isWriteUpdateInfo: true` and no explicit `publishConfig`: an
+   * artifact with an explicit `publishConfig` is only uploaded, and electron-builder writes no manifest for it.
+   */
+  get writesUpdateInfo(): boolean {
+    return false
+  }
+
   abstract build(appOutDir: string, arch: Arch): Promise<any>
 
-  finishBuild(): Promise<any> {
-    return Promise.resolve()
+  async finishBuild(): Promise<any> {
+    await this.buildQueueManager.awaitTasks()
   }
 }
 
 export interface TargetSpecificOptions {
   /**
-   The [artifact file name template](/configuration/configuration#artifact-file-name-template).
+   The [artifact file name template](https://www.electron.build/configuration#artifact-file-name-template).
    */
   readonly artifactName?: string | null
 
@@ -111,4 +132,9 @@ export interface SourceRepositoryInfo {
   domain?: string
   user: string
   project: string
+  /**
+   * Where the repository info was detected from: `package.json` (the `repository` field), the name of the CI
+   * environment variable(s) it was read from, or `.git/config`. Absent when the info was supplied programmatically.
+   */
+  source?: string
 }

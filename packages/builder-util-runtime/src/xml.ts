@@ -1,9 +1,9 @@
-import * as sax from "sax"
-import { newError } from "./index"
+import sax from "sax"
+import { newError } from "./error.js"
 
 export class XElement {
   value = ""
-  attributes: { [key: string]: string } | null = null
+  attributes: Record<string, string> | null = null
   isCData = false
   elements: Array<XElement> | null = null
 
@@ -83,7 +83,7 @@ export function parseXml(data: string): XElement {
 
   parser.onopentag = saxElement => {
     const element = new XElement(saxElement.name)
-    element.attributes = saxElement.attributes as { [key: string]: string }
+    element.attributes = saxElement.attributes as Record<string, string>
 
     if (rootElement === null) {
       rootElement = element
@@ -103,13 +103,13 @@ export function parseXml(data: string): XElement {
 
   parser.ontext = text => {
     if (elements.length > 0) {
-      elements[elements.length - 1].value = text
+      elements[elements.length - 1].value += text
     }
   }
 
   parser.oncdata = cdata => {
     const element = elements[elements.length - 1]
-    element.value = cdata
+    element.value += cdata
     element.isCData = true
   }
 
@@ -117,6 +117,9 @@ export function parseXml(data: string): XElement {
     throw err
   }
 
-  parser.write(data)
-  return rootElement!
+  parser.write(data).close()
+  if (rootElement == null) {
+    throw newError("No root element", "ERR_XML_MISSED_ELEMENT")
+  }
+  return rootElement
 }

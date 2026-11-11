@@ -1,36 +1,24 @@
-import { statOrNull } from "builder-util/out/fs"
-import { Node, readAsar } from "./asar"
+import * as asar from "@electron/asar"
 
-/** @internal */
-export async function checkFileInArchive(asarFile: string, relativeFile: string, messagePrefix: string) {
+// @electron/asar v4 no longer exports its filesystem entry types from the package root, so derive them from `statFile`'s return type.
+type FilesystemEntry = ReturnType<typeof asar.statFile>
+type FilesystemFileEntry = Extract<FilesystemEntry, { size: number }>
+
+export function checkFileInArchive(asarFile: string, relativeFile: string, messagePrefix: string): FilesystemEntry {
   function error(text: string) {
     return new Error(`${messagePrefix} "${relativeFile}" in the "${asarFile}" ${text}`)
   }
-
-  let fs
+  let stat: FilesystemEntry
   try {
-    fs = await readAsar(asarFile)
-  } catch (e) {
+    stat = asar.statFile(asarFile, relativeFile, false)
+  } catch (e: any) {
+    if (e.message.includes("Cannot read properties of undefined (reading 'link')")) {
+      throw error("does not exist. Seems like a wrong configuration.")
+    }
     throw error(`is corrupted: ${e}`)
   }
-
-  let stat: Node | null
-  try {
-    stat = fs.getFile(relativeFile)
-  } catch (e) {
-    const fileStat = await statOrNull(asarFile)
-    if (fileStat == null) {
-      throw error(`does not exist. Seems like a wrong configuration.`)
-    }
-
-    // asar throws error on access to undefined object (info.link)
-    stat = null
-  }
-
-  if (stat == null) {
-    throw error(`does not exist. Seems like a wrong configuration.`)
-  }
-  if (stat.size === 0) {
+  if ((stat as FilesystemFileEntry).size === 0) {
     throw error(`is corrupted: size 0`)
   }
+  return stat
 }

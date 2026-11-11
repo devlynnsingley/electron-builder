@@ -1,6 +1,5 @@
-import { exec, safeStringifyJson } from "builder-util"
-import { unlinkIfExists } from "builder-util/out/fs"
-import { emptyDir } from "fs-extra"
+import { exec, safeStringifyJson, unlinkIfExists } from "builder-util"
+import fsExtra from "fs-extra"
 import * as fs from "fs/promises"
 import { homedir } from "os"
 import * as path from "path"
@@ -14,12 +13,19 @@ export class WineManager {
 
   userDir: string | null = null
 
+  constructor(
+    private readonly winePath: string = "wine",
+    private readonly toolsetEnv: Record<string, string> = {}
+  ) {}
+
   async prepare() {
     if (this.env != null) {
       return
     }
 
-    this.wineDir = path.join(homedir(), "wine-test")
+    // Each WineManager gets its own prefix under ~/wine-test-XXXX so concurrent
+    // workers in the same Docker container don't race on wineboot --init.
+    this.wineDir = await fs.mkdtemp(path.join(homedir(), "wine-test-"))
 
     const env = process.env
     const user = env.SUDO_USER || env.LOGNAME || env.USER || env.LNAME || env.USERNAME || (env.HOME === "/root" ? "root" : null)
@@ -34,19 +40,28 @@ export class WineManager {
   }
 
   exec(...args: Array<string>) {
-    return exec("wine", args, { env: this.env })
+    return exec(this.winePath, args, { env: this.env })
+  }
+
+  async dispose() {
+    if (this.wineDir != null) {
+      await fs.rm(this.wineDir, { recursive: true, force: true })
+      this.wineDir = null
+    }
   }
 
   async prepareWine(wineDir: string) {
-    await emptyDir(wineDir)
+    await fsExtra.emptyDir(wineDir)
     //noinspection SpellCheckingInspection
     const env = {
       ...process.env,
+      ...this.toolsetEnv,
       WINEDLLOVERRIDES: "winemenubuilder.exe=d",
       WINEPREFIX: wineDir,
     }
 
-    await exec("wineboot", ["--init"], { env })
+    const wineboot = path.join(path.dirname(this.winePath), "wineboot")
+    await exec(wineboot, ["--init"], { env })
 
     // regedit often doesn't modify correctly
     let systemReg = await fs.readFile(path.join(wineDir, "system.reg"), "utf8")
@@ -59,7 +74,7 @@ export class WineManager {
     await fs.writeFile(path.join(wineDir, "system.reg"), systemReg)
 
     // remove links to host OS
-    const userDir = this.userDir!!
+    const userDir = this.userDir!
     const desktopDir = path.join(userDir, "Desktop")
     await Promise.all([
       unlinkIfExists(desktopDir),

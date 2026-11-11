@@ -1,72 +1,191 @@
-import { DIR_TARGET, Platform } from "electron-builder"
-import { TmpDir } from "builder-util"
-import { copyDir } from "builder-util/out/fs"
-import { outputFile } from "fs-extra"
+import { archFromString, copyDir } from "builder-util"
+import { Configuration, DIR_TARGET, Platform } from "electron-builder"
+import fsExtra from "fs-extra"
 import * as fs from "fs/promises"
 import * as path from "path"
-import { Mode, RWX } from "stat-mode"
-import { assertThat } from "./helpers/fileAssert"
-import { app, appThrows, assertPack, checkDirContents, linuxDirTarget, modifyPackageJson } from "./helpers/packTester"
+import { assertThat } from "./helpers/fileAssert.js"
+import { app, appThrows, assertPack, checkDirContents, linuxDirTarget, modifyPackageJson } from "./helpers/packTester.js"
+import { ExpectStatic } from "vitest"
 
-test.ifDevOrLinuxCi(
-  "expand not defined env",
-  appThrows({
+test.ifNotWindows("expand not defined env", ({ expect }) =>
+  appThrows(expect, {
     targets: linuxDirTarget,
     config: {
       asar: false,
       // tslint:disable:no-invalid-template-strings
-      files: ["${env.FOO_NOT_DEFINED}"],
+      fileOptions: { files: ["${env.FOO_NOT_DEFINED}"] },
     },
   })
 )
 
 process.env.__NOT_BAR__ = "!**/bar"
 
-test.ifDevOrLinuxCi(
-  "files",
+test.ifNotWindows("files", ({ expect }) =>
   app(
+    expect,
     {
       targets: linuxDirTarget,
       config: {
         asar: false,
         // tslint:disable:no-invalid-template-strings
-        files: ["**/*", "!ignoreMe${/*}", "${env.__NOT_BAR__}", "dist/electron/**/*"],
+        fileOptions: { files: ["**/*", "!ignoreMe${/*}", "${env.__NOT_BAR__}", "dist/electron/**/*"] },
       },
     },
     {
       projectDirCreated: projectDir =>
         Promise.all([
-          outputFile(path.join(projectDir, "ignoreMe", "foo"), "data"),
-          outputFile(path.join(projectDir, "ignoreEmptyDir", "bar"), "data"),
-          outputFile(path.join(projectDir, "test.h"), "test that"),
-          outputFile(path.join(projectDir, "dist/electron/foo.js"), "data"),
+          fsExtra.outputFile(path.join(projectDir, "ignoreMe", "foo"), "data"),
+          fsExtra.outputFile(path.join(projectDir, "ignoreEmptyDir", "bar"), "data"),
+          fsExtra.outputFile(path.join(projectDir, "test.h"), "test that"),
+          fsExtra.outputFile(path.join(projectDir, "dist/electron/foo.js"), "data"),
         ]),
       packed: context => {
         const resources = path.join(context.getResources(Platform.LINUX), "app")
-        return checkDirContents(resources)
+        return checkDirContents(expect, resources)
       },
     }
   )
 )
 
-test.ifDevOrLinuxCi(
-  "files.from asar",
+// https://github.com/electron-userland/electron-builder/issues/6126
+// a default-excluded extension (.obj) is shipped when the user adds an explicit re-include glob
+test.ifNotWindows("re-include default-excluded extension via files glob", ({ expect }) =>
   app(
+    expect,
     {
       targets: linuxDirTarget,
       config: {
-        asar: true,
-        files: [
-          {
-            from: ".",
-            to: ".",
-            filter: ["package.json"],
-          },
-          {
-            from: "app/node",
-            to: "app/node",
-          },
-        ],
+        asar: false,
+        fileOptions: { files: ["**/*", "**/*.obj"] },
+      },
+    },
+    {
+      projectDirCreated: projectDir =>
+        Promise.all([fsExtra.outputFile(path.join(projectDir, "assets", "model.obj"), "obj-data"), fsExtra.outputFile(path.join(projectDir, "assets", "index.js"), "js")]),
+      packed: context => {
+        const appDir = path.join(context.getResources(Platform.LINUX), "app")
+        return Promise.all([assertThat(expect, path.join(appDir, "assets", "model.obj")).isFile(), assertThat(expect, path.join(appDir, "assets", "index.js")).isFile()])
+      },
+    }
+  )
+)
+
+// control for the test above: without an explicit re-include, the default exclusion still applies
+test.ifNotWindows("default-excluded extension stays excluded without a re-include glob", ({ expect }) =>
+  app(
+    expect,
+    {
+      targets: linuxDirTarget,
+      config: {
+        asar: false,
+        fileOptions: { files: ["**/*"] },
+      },
+    },
+    {
+      projectDirCreated: projectDir =>
+        Promise.all([fsExtra.outputFile(path.join(projectDir, "assets", "model.obj"), "obj-data"), fsExtra.outputFile(path.join(projectDir, "assets", "index.js"), "js")]),
+      packed: context => {
+        const appDir = path.join(context.getResources(Platform.LINUX), "app")
+        return Promise.all([assertThat(expect, path.join(appDir, "assets", "model.obj")).doesNotExist(), assertThat(expect, path.join(appDir, "assets", "index.js")).isFile()])
+      },
+    }
+  )
+)
+
+// .pdb symbol files, in the app and in an installed dependency, are excluded by default (pdb is one of the "default"
+// fileOptions.excludedExts) and kept with ["default", "!pdb"], the replacement of `includePdb: true`
+function assertPdbFilesPacked(expect: ExpectStatic, excludedExts: Array<string> | null, isIncluded: boolean) {
+  return app(
+    expect,
+    {
+      targets: linuxDirTarget,
+      config: {
+        asar: false,
+        fileOptions: { excludedExts },
+      },
+    },
+    {
+      projectDirCreated: async projectDir => {
+        await Promise.all([
+          modifyPackageJson(projectDir, data => {
+            data.dependencies = {
+              semver: "6.3.1",
+              ...data.dependencies,
+            }
+          }),
+          fsExtra.outputFile(path.join(projectDir, "assets", "symbols.pdb"), "pdb-data"),
+          fsExtra.outputFile(path.join(projectDir, "assets", "index.js"), "js"),
+        ])
+        return () => fsExtra.outputFile(path.join(projectDir, "node_modules", "semver", "semver.pdb"), "pdb-data")
+      },
+      packed: context => {
+        const appDir = path.join(context.getResources(Platform.LINUX), "app")
+        const pdbFiles = [path.join(appDir, "assets", "symbols.pdb"), path.join(appDir, "node_modules", "semver", "semver.pdb")]
+        return Promise.all([
+          assertThat(expect, path.join(appDir, "assets", "index.js")).isFile(),
+          assertThat(expect, path.join(appDir, "node_modules", "semver", "semver.js")).isFile(),
+          ...pdbFiles.map(file => (isIncluded ? assertThat(expect, file).isFile() : assertThat(expect, file).doesNotExist())),
+        ])
+      },
+    }
+  )
+}
+
+test.ifNotWindows("pdb files are excluded by default", ({ expect }) => assertPdbFilesPacked(expect, null, false))
+
+test.ifNotWindows('pdb files are kept with fileOptions.excludedExts ["default", "!pdb"]', ({ expect }) => assertPdbFilesPacked(expect, ["default", "!pdb"], true))
+
+// a files entry naming one .pdb file re-includes only that file, not every .pdb in the app
+test.ifNotWindows("a files entry naming one pdb file ships only that pdb file", ({ expect }) =>
+  app(
+    expect,
+    {
+      targets: linuxDirTarget,
+      config: {
+        asar: false,
+        fileOptions: { files: ["**/*", "native/addon.pdb"] },
+      },
+    },
+    {
+      projectDirCreated: projectDir =>
+        Promise.all([
+          fsExtra.outputFile(path.join(projectDir, "native", "addon.pdb"), "pdb-data"),
+          fsExtra.outputFile(path.join(projectDir, "native", "other.pdb"), "pdb-data"),
+          fsExtra.outputFile(path.join(projectDir, "assets", "symbols.pdb"), "pdb-data"),
+          fsExtra.outputFile(path.join(projectDir, "assets", "index.js"), "js"),
+        ]),
+      packed: context => {
+        const appDir = path.join(context.getResources(Platform.LINUX), "app")
+        return Promise.all([
+          assertThat(expect, path.join(appDir, "native", "addon.pdb")).isFile(),
+          assertThat(expect, path.join(appDir, "native", "other.pdb")).doesNotExist(),
+          assertThat(expect, path.join(appDir, "assets", "symbols.pdb")).doesNotExist(),
+          assertThat(expect, path.join(appDir, "assets", "index.js")).isFile(),
+        ])
+      },
+    }
+  )
+)
+
+test.ifNotWindows("files.from asar", ({ expect }) =>
+  app(
+    expect,
+    {
+      targets: linuxDirTarget,
+      config: {
+        fileOptions: {
+          files: [
+            {
+              from: ".",
+              to: ".",
+              filter: ["package.json"],
+            },
+            {
+              from: "app/node",
+              to: "app/node",
+            },
+          ],
+        },
       },
     },
     {
@@ -81,153 +200,147 @@ test.ifDevOrLinuxCi(
   )
 )
 
-test.ifDevOrLinuxCi(
-  "map resources",
+test.ifNotWindows("map resources", ({ expect }) =>
   app(
+    expect,
     {
       targets: linuxDirTarget,
       config: {
         asar: false,
-        extraResources: [
-          {
-            from: "foo/old",
-            to: "foo/new",
-          },
-          {
-            from: "license.txt",
-            to: ".",
-          },
-        ],
+        fileOptions: {
+          extraResources: [
+            {
+              from: "foo/old",
+              to: "foo/new",
+            },
+            {
+              from: "license.txt",
+              to: ".",
+            },
+          ],
+        },
       },
     },
     {
-      projectDirCreated: projectDir => Promise.all([outputFile(path.join(projectDir, "foo", "old"), "data"), outputFile(path.join(projectDir, "license.txt"), "data")]),
+      projectDirCreated: projectDir =>
+        Promise.all([fsExtra.outputFile(path.join(projectDir, "foo", "old"), "data"), fsExtra.outputFile(path.join(projectDir, "license.txt"), "data")]),
       packed: context => {
-        const resources = path.join(context.getResources(Platform.LINUX))
+        const resources = context.getResources(Platform.LINUX)
         return Promise.all([
-          assertThat(path.join(resources, "app", "foo", "old")).doesNotExist(),
-          assertThat(path.join(resources, "foo", "new")).isFile(),
-          assertThat(path.join(resources, "license.txt")).isFile(),
+          assertThat(expect, path.join(resources, "app", "foo", "old")).doesNotExist(),
+          assertThat(expect, path.join(resources, "foo", "new")).isFile(),
+          assertThat(expect, path.join(resources, "license.txt")).isFile(),
         ])
       },
     }
   )
 )
 
-async function doExtraResourcesTest(platform: Platform) {
+// Sets flat keys (not in the `Configuration` type, hence the cast), which are moved into `fileOptions` with a warning.
+// The snapshot is the same as for the nested form ("extraResources - two-package" uses that).
+async function doExtraResourcesTest(expect: ExpectStatic, platform: Platform) {
   const osName = platform.buildConfigurationKey
-  //noinspection SpellCheckingInspection
   await assertPack(
+    expect,
     "test-app-one",
     {
-      // to check NuGet package
-      targets: platform.createTarget(platform === Platform.WINDOWS ? "squirrel" : DIR_TARGET),
+      targets: platform.createTarget(DIR_TARGET),
       config: {
         extraResources: ["foo", "bar/hello.txt", "./dir-relative/f.txt", "bar/${arch}.txt", "${os}/${arch}.txt"],
         [osName]: {
           extraResources: ["platformSpecificR"],
           extraFiles: ["platformSpecificF"],
         },
-      },
+      } as Configuration,
     },
     {
-      projectDirCreated: projectDir => {
+      projectDirCreated: async projectDir => {
         return Promise.all([
-          outputFile(path.join(projectDir, "foo/nameWithoutDot"), "nameWithoutDot"),
-          outputFile(path.join(projectDir, "bar/hello.txt"), "data"),
-          outputFile(path.join(projectDir, "dir-relative/f.txt"), "data"),
-          outputFile(path.join(projectDir, `bar/${process.arch}.txt`), "data"),
-          outputFile(path.join(projectDir, `${osName}/${process.arch}.txt`), "data"),
-          outputFile(path.join(projectDir, "platformSpecificR"), "platformSpecificR"),
-          outputFile(path.join(projectDir, "ignoreMe.txt"), "ignoreMe"),
+          fsExtra.outputFile(path.resolve(projectDir, "foo/nameWithoutDot"), "nameWithoutDot"),
+          fsExtra.outputFile(path.resolve(projectDir, "bar/hello.txt"), "data"),
+          fsExtra.outputFile(path.resolve(projectDir, "dir-relative/f.txt"), "data"),
+          fsExtra.outputFile(path.resolve(projectDir, `bar/${process.arch}.txt`), "data"),
+          fsExtra.outputFile(path.resolve(projectDir, `${osName}/${process.arch}.txt`), "data"),
+          fsExtra.outputFile(path.resolve(projectDir, "platformSpecificR"), "platformSpecificR"),
+          fsExtra.outputFile(path.resolve(projectDir, "ignoreMe.txt"), "ignoreMe"),
         ])
       },
-      packed: context => {
-        const base = path.join(context.outDir, `${platform.buildConfigurationKey}${platform === Platform.MAC ? "" : "-unpacked"}`)
-        let resourcesDir = path.join(base, "resources")
-        if (platform === Platform.MAC) {
-          resourcesDir = path.join(base, `${context.packager.appInfo.productFilename}.app`, "Contents", "Resources")
-        }
-
+      packed: async context => {
+        const resourcesDir = context.getResources(platform, archFromString(process.arch))
         return Promise.all([
-          assertThat(path.join(resourcesDir, "foo")).isDirectory(),
-          assertThat(path.join(resourcesDir, "foo", "nameWithoutDot")).isFile(),
-          assertThat(path.join(resourcesDir, "bar", "hello.txt")).isFile(),
-          assertThat(path.join(resourcesDir, "dir-relative", "f.txt")).isFile(),
-          assertThat(path.join(resourcesDir, "bar", `${process.arch}.txt`)).isFile(),
-          assertThat(path.join(resourcesDir, osName, `${process.arch}.txt`)).isFile(),
-          assertThat(path.join(resourcesDir, "platformSpecificR")).isFile(),
-          assertThat(path.join(resourcesDir, "ignoreMe.txt")).doesNotExist(),
+          assertThat(expect, path.resolve(resourcesDir, "foo")).isDirectory(),
+          assertThat(expect, path.resolve(resourcesDir, "foo", "nameWithoutDot")).isFile(),
+          assertThat(expect, path.resolve(resourcesDir, "bar", "hello.txt")).isFile(),
+          assertThat(expect, path.resolve(resourcesDir, "dir-relative", "f.txt")).isFile(),
+          assertThat(expect, path.resolve(resourcesDir, "bar", `${process.arch}.txt`)).isFile(),
+          assertThat(expect, path.resolve(resourcesDir, osName, `${process.arch}.txt`)).isFile(),
+          assertThat(expect, path.resolve(resourcesDir, "platformSpecificR")).isFile(),
+          assertThat(expect, path.resolve(resourcesDir, "ignoreMe.txt")).doesNotExist(),
         ])
       },
     }
   )
 }
 
-test.ifDevOrLinuxCi("extraResources on Linux", () => doExtraResourcesTest(Platform.LINUX))
+// The Windows variant builds a Squirrel.Windows package to check the NuGet payload — see files.e2e.ts.
+test.ifNotWindows("extraResources on Linux", ({ expect }) => doExtraResourcesTest(expect, Platform.LINUX))
 
-// Squirrel.Windows is not supported on macOS anymore (32-bit)
-// Skipped due to bug in rimraf on Windows: `at fixWinEPERM (../node_modules/.pnpm/fs-extra@8.1.0/node_modules/fs-extra/lib/remove/rimraf.js:117:5)`
-test.skip.ifNotMac.ifDevOrWinCi("extraResources on Windows", () => doExtraResourcesTest(Platform.WINDOWS))
+test.ifMac("extraResources on macOS", ({ expect }) => doExtraResourcesTest(expect, Platform.MAC))
 
-test.ifMac("extraResources on macOS", async () => {
-  await doExtraResourcesTest(Platform.MAC)
-})
-
-test.ifNotWindows.ifNotCiWin("extraResources - two-package", () => {
+test.ifNotWindows("extraResources - two-package", ({ expect }) => {
   const platform = Platform.LINUX
   const osName = platform.buildConfigurationKey
 
   //noinspection SpellCheckingInspection
   return assertPack(
+    expect,
     "test-app",
     {
       // to check NuGet package
       targets: platform.createTarget(DIR_TARGET),
       config: {
-        asar: true,
-        extraResources: ["foo", "bar/hello.txt", "bar/${arch}.txt", "${os}/${arch}.txt", "executable*"],
+        fileOptions: {
+          extraResources: ["foo", "bar/hello.txt", "bar/${arch}.txt", "${os}/${arch}.txt", "executable*"],
+        },
         [osName]: {
-          extraResources: ["platformSpecificR"],
-          extraFiles: ["platformSpecificF"],
+          fileOptions: {
+            extraResources: ["platformSpecificR"],
+            extraFiles: ["platformSpecificF"],
+          },
         },
       },
     },
     {
       projectDirCreated: projectDir => {
         return Promise.all([
-          outputFile(path.join(projectDir, "foo/nameWithoutDot"), "nameWithoutDot"),
-          outputFile(path.join(projectDir, "bar/hello.txt"), "data", { mode: 0o400 }),
-          outputFile(path.join(projectDir, `bar/${process.arch}.txt`), "data"),
-          outputFile(path.join(projectDir, `${osName}/${process.arch}.txt`), "data"),
-          outputFile(path.join(projectDir, "platformSpecificR"), "platformSpecificR"),
-          outputFile(path.join(projectDir, "ignoreMe.txt"), "ignoreMe"),
-          outputFile(path.join(projectDir, "executable"), "executable", { mode: 0o755 }),
-          outputFile(path.join(projectDir, "executableOnlyOwner"), "executable", { mode: 0o740 }),
+          fsExtra.outputFile(path.join(projectDir, "foo/nameWithoutDot"), "nameWithoutDot"),
+          fsExtra.outputFile(path.join(projectDir, "bar/hello.txt"), "data", { mode: 0o400 }),
+          fsExtra.outputFile(path.join(projectDir, `bar/${process.arch}.txt`), "data"),
+          fsExtra.outputFile(path.join(projectDir, `${osName}/${process.arch}.txt`), "data"),
+          fsExtra.outputFile(path.join(projectDir, "platformSpecificR"), "platformSpecificR"),
+          fsExtra.outputFile(path.join(projectDir, "ignoreMe.txt"), "ignoreMe"),
+          fsExtra.outputFile(path.join(projectDir, "executable"), "executable", { mode: 0o755 }),
+          fsExtra.outputFile(path.join(projectDir, "executableOnlyOwner"), "executable", { mode: 0o740 }),
         ])
       },
       packed: async context => {
-        const base = path.join(context.outDir, `${platform.buildConfigurationKey}-unpacked`)
-        let resourcesDir = path.join(base, "resources")
-        if (platform === Platform.MAC) {
-          resourcesDir = path.join(base, "TestApp.app", "Contents", "Resources")
-        }
+        const resourcesDir = context.getResources(platform, archFromString(process.arch))
         const appDir = path.join(resourcesDir, "app")
 
         await Promise.all([
-          assertThat(path.join(resourcesDir, "foo")).isDirectory(),
-          assertThat(path.join(appDir, "foo")).doesNotExist(),
+          assertThat(expect, path.join(resourcesDir, "foo")).isDirectory(),
+          assertThat(expect, path.join(appDir, "foo")).doesNotExist(),
 
-          assertThat(path.join(resourcesDir, "foo", "nameWithoutDot")).isFile(),
-          assertThat(path.join(appDir, "foo", "nameWithoutDot")).doesNotExist(),
+          assertThat(expect, path.join(resourcesDir, "foo", "nameWithoutDot")).isFile(),
+          assertThat(expect, path.join(appDir, "foo", "nameWithoutDot")).doesNotExist(),
 
-          assertThat(path.join(resourcesDir, "bar", "hello.txt")).isFile(),
-          assertThat(path.join(resourcesDir, "bar", `${process.arch}.txt`)).isFile(),
-          assertThat(path.join(appDir, "bar", `${process.arch}.txt`)).doesNotExist(),
+          assertThat(expect, path.join(resourcesDir, "bar", "hello.txt")).isFile(),
+          assertThat(expect, path.join(resourcesDir, "bar", `${process.arch}.txt`)).isFile(),
+          assertThat(expect, path.join(appDir, "bar", `${process.arch}.txt`)).doesNotExist(),
 
-          assertThat(path.join(resourcesDir, osName, `${process.arch}.txt`)).isFile(),
-          assertThat(path.join(resourcesDir, "platformSpecificR")).isFile(),
-          assertThat(path.join(resourcesDir, "ignoreMe.txt")).doesNotExist(),
+          assertThat(expect, path.join(resourcesDir, osName, `${process.arch}.txt`)).isFile(),
+          assertThat(expect, path.join(resourcesDir, "platformSpecificR")).isFile(),
+          assertThat(expect, path.join(resourcesDir, "ignoreMe.txt")).doesNotExist(),
 
           allCan(path.join(resourcesDir, "executable"), true),
           allCan(path.join(resourcesDir, "executableOnlyOwner"), true),
@@ -243,40 +356,25 @@ test.ifNotWindows.ifNotCiWin("extraResources - two-package", () => {
 
 // https://github.com/electron-userland/electron-builder/pull/998
 // copyDir walks to a symlink referencing a file that has not yet been copied by postponing the linking step until after the full walk is complete
-test.ifNotWindows("postpone symlink", async () => {
-  const tmpDir = new TmpDir("files-test")
+test.ifNotWindows("postpone symlink", async ({ tmpDir }) => {
   const source = await tmpDir.getTempDir()
   const aSourceFile = path.join(source, "z", "Z")
   const bSourceFileLink = path.join(source, "B")
-  await outputFile(aSourceFile, "test")
+  await fsExtra.outputFile(aSourceFile, "test")
   await fs.symlink(aSourceFile, bSourceFileLink)
 
   const dest = await tmpDir.getTempDir()
   await copyDir(source, dest)
-
-  await tmpDir.cleanup()
 })
 
 async function allCan(file: string, execute: boolean) {
-  const mode = new Mode(await fs.stat(file))
-
-  function checkExecute(value: RWX) {
-    if (value.execute !== execute) {
-      throw new Error(`${file} is ${execute ? "not " : ""}executable`)
-    }
+  const { mode } = await fs.stat(file)
+  const executeBits = mode & 0o111
+  if (executeBits !== (execute ? 0o111 : 0)) {
+    throw new Error(`${file} is ${execute ? "not " : ""}executable`)
   }
 
-  function checkRead(value: RWX) {
-    if (!value.read) {
-      throw new Error(`${file} is not readable`)
-    }
+  if ((mode & 0o444) !== 0o444) {
+    throw new Error(`${file} is not readable`)
   }
-
-  checkExecute(mode.owner)
-  checkExecute(mode.group)
-  checkExecute(mode.others)
-
-  checkRead(mode.owner)
-  checkRead(mode.group)
-  checkRead(mode.others)
 }

@@ -1,4 +1,5 @@
 !include UAC.nsh
+!include WordFunc.nsh
 
 !ifndef INSTALL_MODE_PER_ALL_USERS
   !include multiUserUi.nsh
@@ -11,7 +12,38 @@
   !endif
 
   !ifmacrodef licensePage
-    !insertmacro skipPageIfUpdated
+    # Skip only a license accepted in the outer instance, not an .onInit elevation.
+    # Back must still reach it, otherwise NSIS closes the installer when all earlier pages are skipped.
+    Var isLicensePageSkippedInInnerInstance
+    Var isAssistedLicenseAccepted
+
+    Function assistedLicensePagePre
+      ${if} ${isUpdated}
+        Abort
+      ${endif}
+
+      ${if} ${UAC_IsInnerInstance}
+      ${andIf} $isLicensePageSkippedInInnerInstance != "1"
+        !insertmacro UAC_AsUser_GetGlobalVar $isAssistedLicenseAccepted
+        ${if} $isAssistedLicenseAccepted == "1"
+          StrCpy $isLicensePageSkippedInInnerInstance "1"
+          Abort
+        ${endif}
+      ${endif}
+    FunctionEnd
+
+    Function assistedLicensePageLeave
+      !ifdef MUI_PAGE_CUSTOMFUNCTION_LEAVE
+        Call "${MUI_PAGE_CUSTOMFUNCTION_LEAVE}"
+        !undef MUI_PAGE_CUSTOMFUNCTION_LEAVE
+      !endif
+      ${ifNot} ${UAC_IsInnerInstance}
+        StrCpy $isAssistedLicenseAccepted "1"
+      ${endif}
+    FunctionEnd
+
+    !define MUI_PAGE_CUSTOMFUNCTION_PRE assistedLicensePagePre
+    !define MUI_PAGE_CUSTOMFUNCTION_LEAVE assistedLicensePageLeave
     !insertmacro licensePage
   !endif
 
@@ -31,20 +63,18 @@
 
     # sanitize the MUI_PAGE_DIRECTORY result to make sure it has a application name sub-folder
     Function instFilesPre
-      ${If} ${FileExists} "$INSTDIR\*"
-        ${StrContains} $0 "${APP_FILENAME}" $INSTDIR
-        ${If} $0 == ""
-          StrCpy $INSTDIR "$INSTDIR\${APP_FILENAME}"
-        ${endIf}
+      ${StrContains} $0 "${APP_FILENAME}" $INSTDIR
+      ${If} $0 == ""
+        StrCpy $INSTDIR "$INSTDIR\${APP_FILENAME}"
       ${endIf}
     FunctionEnd
   !endif
-  
+
   # after change installation directory and before install start, you can show custom page here.
   !ifmacrodef customPageAfterChangeDir
     !insertmacro customPageAfterChangeDir
   !endif
-  
+
   !insertmacro MUI_PAGE_INSTFILES
   !ifmacrodef customFinishPage
     !insertmacro customFinishPage
@@ -65,7 +95,14 @@
     !insertmacro MUI_PAGE_FINISH
   !endif
 !else
-  !insertmacro MUI_UNPAGE_WELCOME
+  !ifndef removeDefaultUninstallWelcomePage
+    !ifmacrodef customUnWelcomePage
+      !insertmacro customUnWelcomePage
+    !else
+      !insertmacro MUI_UNPAGE_WELCOME
+  !endif
+
+  !endif
   !ifndef INSTALL_MODE_PER_ALL_USERS
     !insertmacro PAGE_INSTALL_MODE
   !endif
@@ -105,11 +142,15 @@
 
     # set installation mode to setting from a previous installation
     ReadRegStr $perMachineInstallationFolder HKLM "${INSTALL_REGISTRY_KEY}" InstallLocation
+    # a double quote is invalid in a path: drop the closing quote that an earlier installer kept from a quoted /D= argument
+    ${WordReplace} $perMachineInstallationFolder '"' "" "+" $perMachineInstallationFolder
     ${if} $perMachineInstallationFolder != ""
       StrCpy $hasPerMachineInstallation "1"
     ${endif}
 
     ReadRegStr $perUserInstallationFolder HKCU "${INSTALL_REGISTRY_KEY}" InstallLocation
+    # a double quote is invalid in a path: drop the closing quote that an earlier installer kept from a quoted /D= argument
+    ${WordReplace} $perUserInstallationFolder '"' "" "+" $perUserInstallationFolder
     ${if} $perUserInstallationFolder != ""
       StrCpy $hasPerUserInstallation "1"
     ${endif}
@@ -138,7 +179,11 @@
       !ifdef INSTALL_MODE_PER_ALL_USERS
         !insertmacro setInstallModePerAllUsers
       !else
-        !insertmacro setInstallModePerUser
+        !ifdef INSTALL_MODE_PER_ALL_USERS_DEFAULT
+          !insertmacro setInstallModePerAllUsers
+        !else
+          !insertmacro setInstallModePerUser
+        !endif
       !endif
     ${endif}
   !endif

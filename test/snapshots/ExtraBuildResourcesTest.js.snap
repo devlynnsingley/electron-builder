@@ -1,0 +1,154 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`custom buildResources and output dirs: linux 1`] = `
+{
+  "linux": [],
+}
+`;
+
+exports[`custom buildResources and output dirs: mac 1`] = `
+{
+  "mac": [],
+}
+`;
+
+exports[`custom buildResources and output dirs: win 1`] = `
+{
+  "win": [],
+}
+`;
+
+exports[`do not exclude build entirely (respect files) 1`] = `
+{
+  "linux": [],
+}
+`;
+
+exports[`electronDist as callback function for path to local electron zipped artifact  1`] = `
+{
+  "linux": [],
+}
+`;
+
+exports[`electronDist as callback function for path to locally unzipped 1`] = `
+{
+  "linux": [],
+}
+`;
+
+exports[`electronDist as callback function for path to locally unzipped 2`] = `
+[
+  "LICENSE.electron.txt",
+  "LICENSES.chromium.html",
+  "chrome-sandbox",
+  "chrome_100_percent.pak",
+  "chrome_200_percent.pak",
+  "chrome_crashpad_handler",
+  "icudtl.dat",
+  "libEGL.so",
+  "libGLESv2.so",
+  "libffmpeg.so",
+  "libvk_swiftshader.so",
+  "libvulkan.so.1",
+  "locales",
+  "resources",
+  "resources.pak",
+  "snapshot_blob.bin",
+  "testapp",
+  "v8_context_snapshot.bin",
+  "vk_swiftshader_icd.json",
+]
+`;
+
+exports[`electronDist as path to local folder with electron builds zipped  1`] = `
+{
+  "linux": [],
+}
+`;
+
+exports[`electronDist as standard path to node_modules electron 1`] = `
+{
+  "linux": [],
+}
+`;
+
+exports[`electronDist as standard path to node_modules electron 2`] = `
+[
+  "LICENSE.electron.txt",
+  "LICENSES.chromium.html",
+  "chrome-sandbox",
+  "chrome_100_percent.pak",
+  "chrome_200_percent.pak",
+  "chrome_crashpad_handler",
+  "icudtl.dat",
+  "libEGL.so",
+  "libGLESv2.so",
+  "libffmpeg.so",
+  "libvk_swiftshader.so",
+  "libvulkan.so.1",
+  "locales",
+  "resources",
+  "resources.pak",
+  "snapshot_blob.bin",
+  "testapp",
+  "v8_context_snapshot.bin",
+  "version",
+  "vk_swiftshader_icd.json",
+]
+`;
+
+exports[`override targets in the config - only arch 1`] = `
+{
+  "win": [],
+}
+`;
+
+exports[`override targets in the config - only arch 2`] = `
+{
+  "channel": "beta",
+  "provider": "generic",
+  "updaterCacheDirName": "testapp-updater",
+  "url": "https://develar.s3.amazonaws.com/test",
+  "verifyUpdateCodeSignature": false,
+}
+`;
+
+exports[`override targets in the config 1`] = `
+{
+  "linux": [],
+}
+`;
+
+exports[`overriding the publish channel 1`] = `
+{
+  "linux": [],
+}
+`;
+
+exports[`overriding the publish channel 2`] = `
+[
+  {
+    "bucket": "my-s3-bucket",
+    "channel": "beta",
+    "provider": "s3",
+  },
+]
+`;
+
+exports[`prepackaged 1`] = `
+{
+  "linux": [],
+}
+`;
+
+exports[`retrieve latest electron version 1`] = `
+{
+  "linux": [],
+}
+`;
+
+exports[`retrieve latest electron-nightly version 1`] = `
+{
+  "linux": [],
+}
+`;

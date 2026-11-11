@@ -2,13 +2,12 @@
   "extends": "../tsconfig-base.json",
   "compilerOptions": {
     "outDir": "out",
-    "rootDir": "src"
+    "rootDir": "src",
   },
-  "jsdoc": {
-    "out": "../../scripts/jsdoc/out/builder-lib",
-    "examples": "../../scripts/jsdoc/examples",
-    "access": "public"
-  },
+  "include": [
+      "src/**/*.ts",
+      "../../typings/*.d.ts"
+  ],
   "references": [
     {
       "path": "../builder-util"
@@ -19,12 +18,5 @@
     {
       "path": "../electron-publish"
     }
-  ],
-  "include": [
-    "src/**/*.ts",
-    "../../typings/*.d.ts"
-  ],
-  "exclude": [
-    "../../typings/electron.d.ts"
   ]
 }

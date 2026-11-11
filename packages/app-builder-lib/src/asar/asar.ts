@@ -1,11 +1,22 @@
-import { createFromBuffer } from "chromium-pickle-js"
-import { close, open, read, readFile, Stats } from "fs-extra"
+import chromiumPickleJs from "chromium-pickle-js"
+import fsExtra from "fs-extra"
 import * as path from "path"
 
-/** @internal */
+export interface ReadAsarHeader {
+  readonly header: string
+  readonly size: number
+}
+
+export interface NodeIntegrity {
+  algorithm: "SHA256"
+  hash: string
+  blockSize: number
+  blocks: Array<string>
+}
+
 export class Node {
   // we don't use Map because later it will be stringified
-  files?: { [key: string]: Node }
+  files?: Record<string, Node>
 
   unpacked?: boolean
 
@@ -16,15 +27,20 @@ export class Node {
   executable?: boolean
 
   link?: string
+
+  integrity?: NodeIntegrity
 }
 
-/** @internal */
 export class AsarFilesystem {
   private offset = 0
 
-  constructor(readonly src: string, readonly header = new Node(), readonly headerSize: number = -1) {
+  constructor(
+    readonly src: string,
+    readonly header = new Node(),
+    readonly headerSize: number = -1
+  ) {
     if (this.header.files == null) {
-      this.header.files = {}
+      this.header.files = this.newNode()
     }
   }
 
@@ -32,13 +48,16 @@ export class AsarFilesystem {
     let node = this.header
     for (const dir of p.split(path.sep)) {
       if (dir !== ".") {
+        if (node == null) {
+          throw new Error(`Cannot find node for path: ${p} (node is null at ${dir})`)
+        }
         let child = node.files![dir]
         if (child == null) {
           if (!isCreate) {
             return null
           }
           child = new Node()
-          child.files = {}
+          child.files = this.newNode()
           node.files![dir] = child
         }
         node = child
@@ -54,8 +73,11 @@ export class AsarFilesystem {
 
     const name = path.basename(p)
     const dirNode = this.searchNodeFromDirectory(path.dirname(p), true)!
+    if (dirNode == null) {
+      throw new Error(`Cannot find node for path: ${p} (node is null at ${path.dirname(p)})`)
+    }
     if (dirNode.files == null) {
-      dirNode.files = {}
+      dirNode.files = this.newNode()
     }
 
     let result = dirNode.files[name]
@@ -66,13 +88,16 @@ export class AsarFilesystem {
     return result
   }
 
-  addFileNode(file: string, dirNode: Node, size: number, unpacked: boolean, stat: Stats): Node {
+  addFileNode(file: string, dirNode: Node, size: number, unpacked: boolean, stat: fsExtra.Stats, integrity?: NodeIntegrity): Node {
     if (size > 4294967295) {
       throw new Error(`${file}: file size cannot be larger than 4.2GB`)
     }
 
     const node = new Node()
     node.size = size
+    if (integrity) {
+      node.integrity = integrity
+    }
     if (unpacked) {
       node.unpacked = true
     } else {
@@ -86,7 +111,7 @@ export class AsarFilesystem {
 
     let children = dirNode.files
     if (children == null) {
-      children = {}
+      children = this.newNode()
       dirNode.files = children
     }
     children[path.basename(file)] = node
@@ -96,6 +121,9 @@ export class AsarFilesystem {
 
   getNode(p: string): Node | null {
     const node = this.searchNodeFromDirectory(path.dirname(p), false)!
+    if (node == null) {
+      throw new Error(`Cannot find node for path: ${p} (node is null at ${path.dirname(p)})`)
+    }
     return node.files![path.basename(p)]
   }
 
@@ -112,30 +140,38 @@ export class AsarFilesystem {
   readFile(file: string): Promise<Buffer> {
     return readFileFromAsar(this, file, this.getFile(file))
   }
+
+  private newNode() {
+    return Object.create(null) as Record<string, Node>
+  }
 }
 
-export async function readAsar(archive: string): Promise<AsarFilesystem> {
-  const fd = await open(archive, "r")
+export async function readAsarHeader(archive: string): Promise<ReadAsarHeader> {
+  const fd = await fsExtra.open(archive, "r")
   let size: number
   let headerBuf
   try {
     const sizeBuf = Buffer.allocUnsafe(8)
-    if ((await read(fd, sizeBuf, 0, 8, null as any)).bytesRead !== 8) {
+    if ((await fsExtra.read(fd, sizeBuf, 0, 8, null)).bytesRead !== 8) {
       throw new Error("Unable to read header size")
     }
 
-    const sizePickle = createFromBuffer(sizeBuf)
+    const sizePickle = chromiumPickleJs.createFromBuffer(sizeBuf)
     size = sizePickle.createIterator().readUInt32()
     headerBuf = Buffer.allocUnsafe(size)
-    if ((await read(fd, headerBuf, 0, size, null as any)).bytesRead !== size) {
+    if ((await fsExtra.read(fd, headerBuf, 0, size, null)).bytesRead !== size) {
       throw new Error("Unable to read header")
     }
   } finally {
-    await close(fd)
+    await fsExtra.close(fd)
   }
 
-  const headerPickle = createFromBuffer(headerBuf)
-  const header = headerPickle.createIterator().readString()
+  const headerPickle = chromiumPickleJs.createFromBuffer(headerBuf)
+  return { header: headerPickle.createIterator().readString(), size }
+}
+
+export async function readAsar(archive: string): Promise<AsarFilesystem> {
+  const { header, size } = await readAsarHeader(archive)
   return new AsarFilesystem(archive, JSON.parse(header), size)
 }
 
@@ -152,15 +188,15 @@ async function readFileFromAsar(filesystem: AsarFilesystem, filename: string, in
   }
 
   if (info.unpacked) {
-    return await readFile(path.join(`${filesystem.src}.unpacked`, filename))
+    return await fsExtra.readFile(path.join(`${filesystem.src}.unpacked`, filename))
   }
 
-  const fd = await open(filesystem.src, "r")
+  const fd = await fsExtra.open(filesystem.src, "r")
   try {
     const offset = 8 + filesystem.headerSize + parseInt(info.offset!, 10)
-    await read(fd, buffer, 0, size, offset)
+    await fsExtra.read(fd, buffer, 0, size, offset)
   } finally {
-    await close(fd)
+    await fsExtra.close(fd)
   }
   return buffer
 }

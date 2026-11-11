@@ -1,6 +1,6 @@
 {
-  "extends": [
-    "config:base",
+  extends: [
+    "config:recommended",
     ":semanticCommitType(chore)",
     ":label(renovate)",
     ":prHourlyLimit2",
@@ -8,38 +8,27 @@
     ":prNotPending",
     "group:recommended",
     "group:monorepos",
-    ":enableVulnerabilityAlerts"
+    ":enableVulnerabilityAlerts",
+    "helpers:pinGitHubActionDigests",
   ],
-  "npm": {
-    "extends": [
-      // ":automergePatch",
+  npm: {
+    extends: [
       ":noUnscheduledUpdates",
       ":maintainLockFilesWeekly",
-      "npm:unpublishSafe",
-      "helpers:disableTypesNodeMajor"
+      "security:minimumReleaseAgeNpm",
+      "helpers:disableTypesNodeMajor",
     ],
-    "schedule": ["every weekend"],
-    "packageRules": [
+    schedule: ["before 3am on the first day of the month"],
+    packageRules: [
       {
-        "groupName": "ESLint and Prettier",
-        "matchPackageNames": ["eslint", "prettier"],
-        "matchPackagePatterns": ["^eslint-config-", "^eslint-plugin-"]
+        // oxlint and oxlint-tsgolint are version-coupled; keep the oxc tooling on one PR
+        groupName: "oxc (oxlint, oxfmt)",
+        matchPackageNames: [
+          "oxlint",
+          "oxlint-tsgolint",
+          "oxfmt",
+        ],
       },
-    ]
+    ],
   },
-  "circleci": {
-    "enabled": true,
-    // "automerge": true,
-    // "automergeType": "branch",
-    "schedule": ["before 9am on Friday"],
-    "pinDigests": true,
-    "semanticCommitScope": "docker",
-    "semanticCommitType": "ci",
-    "packageRules": [
-      {
-        "groupName": "Node Docker digests in CircleCI",
-        "matchPackageNames": ["circleci/node", "node"]
-      }
-    ]
-  }
 }

@@ -1,0 +1,267 @@
+import type { ToolsetConfig } from "app-builder-lib/internal"
+import * as fs from "fs"
+import * as path from "path"
+import type * as _BlackboxWinSuite from "../../src/updater/blackboxUpdateWinSuite.js"
+import type * as _BlackboxWebWinSuite from "../../src/updater/blackboxUpdateWebWinSuite.js"
+import type * as _DifferentialWinSuite from "../../src/updater/differentialUpdateWinSuite.js"
+import type * as _AppxSuite from "../../src/windows/appxTestSuite.js"
+import type * as _AssistedInstallerSuite from "../../src/windows/assistedInstallerTestSuite.js"
+import type * as _MsiSuite from "../../src/windows/msiTestSuite.js"
+import type * as _MsiWrappedSuite from "../../src/windows/msiWrappedTestSuite.js"
+import type * as _MsixSuite from "../../src/windows/msixTestSuite.js"
+import type * as _PortableSuite from "../../src/windows/portableTestSuite.js"
+import type * as _SquirrelWindowsSuite from "../../src/windows/squirrelWindowsTestSuite.js"
+import type * as _WinCodeSignSuite from "../../src/windows/winCodeSignTestSuite.js"
+import type * as _WinPackagerSuite from "../../src/windows/winPackagerTestSuite.js"
+import type { SuiteConfig } from "./generate-toolset-tests-shared.js"
+import {
+  buildDescribeCall,
+  cleanAndEnsureDir,
+  GENERATED_TESTS_DIR,
+  getPlatformSuffix,
+  getTestFileSuffix,
+  namedFn,
+  resolveImportPath,
+  TEST_SRC_DIR,
+} from "./generate-toolset-tests-shared.js"
+import { latestToolsetVersion, NSIS_VERSIONS, WINE_VERSIONS, WIN_CODE_SIGN_VERSIONS, WIX_VERSIONS } from "./generate-toolset-versions.js"
+
+interface WindowsSuiteConfig extends SuiteConfig {
+  readonly winCodeSignVersions?: ToolsetConfig["winCodeSign"][]
+  readonly nsisVersions?: ToolsetConfig["nsis"][]
+  readonly wineVersions?: ToolsetConfig["wine"][]
+  /** One generated file per WiX bundle, on top of the other dimensions; unset leaves `toolsets.wix` unset. */
+  readonly wixVersions?: ToolsetConfig["wix"][]
+}
+
+/** The newest version of a toolset version list as a one-element list, e.g. for a suite that is built with the newest toolset only. */
+function newestVersion<T>(versions: ReadonlyArray<T>): T[] {
+  const latest = latestToolsetVersion(versions)
+  return latest == null ? [] : [latest]
+}
+
+// nsis-web update cycles (blackboxUpdateWebWinSuite.ts): one suite per test, so each generated file holds a single ~15 min test
+// (the CI sharder packs whole files). Update and NextLaunch run on native Windows only, Rejected on native Windows or a Parallels
+// VM; elsewhere they are skipped at runtime like blackboxWin (so a local TEST_FILES run reports them as skipped). Built with the
+// newest winCodeSign only: the served update config has no publisherName, so the signing toolset doesn't take part in the update.
+// The names don't contain "blackboxWin", so TEST_FILES=blackboxWin doesn't select them.
+const blackboxWebWinSuite = (name: string, registerFn: SuiteConfig["registerFn"], nsisVersions: ToolsetConfig["nsis"][]): WindowsSuiteConfig => ({
+  name,
+  e2e: true,
+  registerFn,
+  importPath: "updater/blackboxUpdateWebWinSuite",
+  describeConfig: { name: "blackboxWebWin" },
+  describeOptions: { concurrent: false, retry: 1 },
+  winCodeSignVersions: newestVersion(WIN_CODE_SIGN_VERSIONS),
+  nsisVersions,
+  wineVersions: WINE_VERSIONS,
+})
+
+const SUITES: WindowsSuiteConfig[] = [
+  {
+    name: "winPackager",
+    registerFn: namedFn("registerWinPackagerTests" satisfies keyof typeof _WinPackagerSuite),
+    importPath: "windows/winPackagerTestSuite",
+    describeConfig: { name: "winPackager", chain: ["ifWindowsOrWine"] },
+    // Every test in this suite either builds a dir target or exits early via afterPackTestHook once the app
+    // directory is assembled, so no NSIS installer is built and wine is never needed — only the winCodeSign
+    // toolset (signing happens in doPack) varies the outcome.
+  },
+  {
+    name: "portable",
+    e2e: true,
+    registerFn: namedFn("registerPortableTests" satisfies keyof typeof _PortableSuite),
+    importPath: "windows/portableTestSuite",
+    describeConfig: { name: "portable", chain: ["ifWindows"] },
+    nsisVersions: NSIS_VERSIONS,
+  },
+  {
+    name: "assistedInstaller",
+    e2e: true,
+    registerFn: namedFn("registerAssistedInstallerTests" satisfies keyof typeof _AssistedInstallerSuite),
+    importPath: "windows/assistedInstallerTestSuite",
+    describeConfig: { name: "assisted", chain: ["ifWindowsOrWine"] },
+    // sequential: tests share ~/wine-test WINEPREFIX; concurrent access causes wineboot --init races
+    describeOptions: { concurrent: false },
+    nsisVersions: NSIS_VERSIONS,
+    wineVersions: WINE_VERSIONS,
+  },
+  {
+    name: "msi",
+    e2e: true,
+    registerFn: namedFn("registerMsiTests" satisfies keyof typeof _MsiSuite),
+    importPath: "windows/msiTestSuite",
+    describeConfig: { name: "msi", chain: ["ifWindows"] },
+    describeOptions: { concurrent: false },
+    // MSI does not vary by winCodeSign version — one file per WiX bundle suffices.
+    // winCodeSignVersions: [] triggers the single-file path in the generator.
+    winCodeSignVersions: [],
+    wixVersions: WIX_VERSIONS,
+  },
+  {
+    name: "msiWrapped",
+    e2e: true,
+    registerFn: namedFn("registerMsiWrappedTests" satisfies keyof typeof _MsiWrappedSuite),
+    importPath: "windows/msiWrappedTestSuite",
+    describeConfig: { name: "msiWrapped", chain: ["ifWindows"] },
+    describeOptions: { concurrent: false },
+    nsisVersions: NSIS_VERSIONS,
+    wineVersions: WINE_VERSIONS,
+  },
+  {
+    // the wrapper MSI with the legacy WiX bundle, once, on the newest NSIS and winCodeSign (the msiWrapped suite above leaves toolsets.wix
+    // unset, which is WiX 3)
+    name: "msiWrappedLegacyWix",
+    e2e: true,
+    registerFn: namedFn("registerMsiWrappedTests" satisfies keyof typeof _MsiWrappedSuite),
+    importPath: "windows/msiWrappedTestSuite",
+    describeConfig: { name: "msiWrapped", chain: ["ifWindows"] },
+    describeOptions: { concurrent: false },
+    winCodeSignVersions: newestVersion(WIN_CODE_SIGN_VERSIONS),
+    nsisVersions: newestVersion(NSIS_VERSIONS),
+    wineVersions: WINE_VERSIONS,
+    wixVersions: ["0.0.0"],
+  },
+  {
+    name: "squirrelWindows",
+    e2e: true,
+    registerFn: namedFn("registerSquirrelWindowsTests" satisfies keyof typeof _SquirrelWindowsSuite),
+    importPath: "windows/squirrelWindowsTestSuite",
+    describeConfig: { name: "squirrel-windows", chain: ["ifWindows"] },
+    describeOptions: { concurrent: false },
+  },
+  {
+    name: "appx",
+    e2e: true,
+    registerFn: namedFn("registerAppxTests" satisfies keyof typeof _AppxSuite),
+    importPath: "windows/appxTestSuite",
+    describeConfig: { name: "AppX", chain: ["ifWindows"] },
+    winCodeSignVersions: WIN_CODE_SIGN_VERSIONS.filter(version => version !== "0.0.0"), // AppX tests are currently incompatible with win-codesign 0.0.0 due to bundled osslsigncode version differences
+  },
+  {
+    name: "msix",
+    e2e: true,
+    registerFn: namedFn("registerMsixTests" satisfies keyof typeof _MsixSuite),
+    importPath: "windows/msixTestSuite",
+    describeConfig: { name: "MSIX", chain: ["ifWindows"] },
+    winCodeSignVersions: WIN_CODE_SIGN_VERSIONS.filter(version => version !== "0.0.0"), // MSIX tests are currently incompatible with win-codesign 0.0.0 due to bundled osslsigncode version differences
+  },
+  {
+    name: "differentialWin",
+    e2e: true,
+    registerFn: namedFn("registerDifferentialWinTests" satisfies keyof typeof _DifferentialWinSuite),
+    importPath: "updater/differentialUpdateWinSuite",
+    describeConfig: { name: "differential-win", chain: ["ifWindows"] },
+    describeOptions: { concurrent: false },
+    nsisVersions: NSIS_VERSIONS,
+  },
+  {
+    name: "blackboxWin",
+    e2e: true,
+    registerFn: namedFn("registerBlackboxWinTests" satisfies keyof typeof _BlackboxWinSuite),
+    importPath: "updater/blackboxUpdateWinSuite",
+    describeConfig: { name: "blackboxWin" },
+    describeOptions: { concurrent: false, retry: 1 },
+    nsisVersions: NSIS_VERSIONS,
+    wineVersions: WINE_VERSIONS,
+  },
+  // the web installer that is installed and updated is built with the NSIS toolset: once per NSIS version. The NSIS 0.0.0 run cases
+  // of nsisWebPackageSelectionTest run the package selection and checks of a fixture installer; this runs the whole web installer
+  // of that toolset (install from an adjacent package, then an update through electron-updater with --package-file).
+  blackboxWebWinSuite("blackboxWebWinUpdate", namedFn("registerBlackboxWebWinUpdateTests" satisfies keyof typeof _BlackboxWebWinSuite), NSIS_VERSIONS),
+  blackboxWebWinSuite("blackboxWebWinNextLaunch", namedFn("registerBlackboxWebWinNextLaunchTests" satisfies keyof typeof _BlackboxWebWinSuite), newestVersion(NSIS_VERSIONS)),
+  // installs plain nsis and never runs the web installer
+  blackboxWebWinSuite("blackboxWebWinRejected", namedFn("registerBlackboxWebWinRejectedTests" satisfies keyof typeof _BlackboxWebWinSuite), newestVersion(NSIS_VERSIONS)),
+  {
+    name: "winCodeSign",
+    registerFn: namedFn("registerWinCodeSignTests" satisfies keyof typeof _WinCodeSignSuite),
+    importPath: "windows/winCodeSignTestSuite",
+    describeConfig: { name: "winCodeSign" },
+    describeOptions: { concurrent: false },
+    // dir targets / stub packagers only — unit-level like winPackager, so no `e2e` flag.
+  },
+]
+
+function renderFile({
+  suite,
+  winCodeSign,
+  nsis,
+  wine,
+  wix,
+}: {
+  suite: WindowsSuiteConfig
+  winCodeSign: ToolsetConfig["winCodeSign"] | undefined
+  nsis?: ToolsetConfig["nsis"]
+  wine?: ToolsetConfig["wine"]
+  wix?: ToolsetConfig["wix"]
+}): string {
+  const fnName = suite.registerFn.name
+  const toolsets: Record<string, unknown> = {}
+  if (winCodeSign !== undefined) {
+    toolsets.winCodeSign = winCodeSign
+  }
+  if (nsis !== undefined) {
+    toolsets.nsis = nsis
+  }
+  if (wine !== undefined) {
+    toolsets.wine = wine
+  }
+  if (wix !== undefined) {
+    toolsets.wix = wix
+  }
+  const toolsetsArg = JSON.stringify(toolsets)
+  const describeCall = buildDescribeCall(suite.describeConfig.chain)
+  const optionsPart = suite.describeOptions ? `, ${JSON.stringify(suite.describeOptions)}` : ""
+
+  const body = `${describeCall}("${suite.describeConfig.name}"${optionsPart}, () => {
+  ${fnName}(${toolsetsArg})
+})`
+
+  const generatedDir = path.resolve(GENERATED_TESTS_DIR, suite.name)
+  const importPath = resolveImportPath(generatedDir, TEST_SRC_DIR, suite.importPath)
+  return `// @generated — do not edit. Regenerated by generate-toolset-tests-windows.ts on each test run.
+import { ${fnName} } from "${importPath}"
+
+${body}
+`
+}
+
+export const WINDOWS_SUITE_METADATA = SUITES.map(s => ({ name: s.name, chain: s.describeConfig.chain }))
+
+export function generateWindowsToolsetTests(): void {
+  for (const suite of SUITES) {
+    const generatedDir = path.resolve(GENERATED_TESTS_DIR, suite.name)
+    cleanAndEnsureDir(generatedDir)
+    const platformSuffix = getPlatformSuffix(suite.describeConfig.chain)
+    const fileSuffix = getTestFileSuffix(suite)
+
+    const wcsVersions = suite.winCodeSignVersions ?? WIN_CODE_SIGN_VERSIONS
+    const nsisVersions = suite.nsisVersions
+    const wineVersions = suite.wineVersions
+    for (const wix of suite.wixVersions ?? [undefined]) {
+      const wixPart = wix === undefined ? "" : `__wix-${String(wix)}`
+      const write = (name: string, toolsets: Omit<Parameters<typeof renderFile>[0], "suite" | "wix">) =>
+        fs.writeFileSync(path.join(generatedDir, `${name}${wixPart}${platformSuffix}${fileSuffix}`), renderFile({ suite, wix, ...toolsets }), "utf8")
+      if (nsisVersions) {
+        for (const nsis of nsisVersions) {
+          for (const wcs of wcsVersions) {
+            if (wineVersions) {
+              for (const wine of wineVersions) {
+                write(`${suite.name}__wcs-${wcs}__nsis-${nsis}__wine-${wine}`, { winCodeSign: wcs, nsis, wine })
+              }
+            } else {
+              write(`${suite.name}__wcs-${wcs}__nsis-${nsis}`, { winCodeSign: wcs, nsis })
+            }
+          }
+        }
+      } else if (wcsVersions.length === 0) {
+        // No winCodeSign/NSIS dimensions — a single file per WiX version (or one with empty toolsets), e.g. the msi suite
+        write(suite.name, { winCodeSign: undefined })
+      } else {
+        for (const wcs of wcsVersions) {
+          write(`${suite.name}__wcs-${wcs}`, { winCodeSign: wcs })
+        }
+      }
+    }
+  }
+}

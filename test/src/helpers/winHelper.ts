@@ -1,43 +1,70 @@
-import { walk } from "builder-util/out/fs"
+import { readAsarJson } from "app-builder-lib/internal"
+import { getWineToolset } from "app-builder-lib/src/toolsets/wine"
+import type { ToolsetConfig } from "app-builder-lib/internal"
+import { walk } from "builder-util"
 import { Arch, Platform } from "electron-builder"
-import { readAsarJson } from "app-builder-lib/out/asar/asar"
-import { outputFile } from "fs-extra"
+import fsExtra from "fs-extra"
 import * as fs from "fs/promises"
 import { load } from "js-yaml"
 import * as path from "path"
-import { assertThat } from "./fileAssert"
-import { PackedContext } from "./packTester"
-import { diff, WineManager } from "./wine"
+import { WIN_SIGNING_SUBJECT } from "./codeSignData.js"
+import { assertThat } from "./fileAssert.js"
+import { PackedContext } from "./packTester.js"
+import { diff, WineManager } from "./wine.js"
+import { ExpectStatic } from "vitest"
 
-export async function expectUpdateMetadata(context: PackedContext, arch: Arch = Arch.ia32, requireCodeSign: boolean = false): Promise<void> {
+/**
+ * The explicit publisherName of the one-click tests: a name for certificate rotation (with a value that needs quoting) and the
+ * full subject of the Windows test identity (an explicit pin stricter than the derived `CN=<common name>`).
+ */
+export const EXPLICIT_PUBLISHER_NAMES: ReadonlyArray<string> = ['CN="Foo, Inc"', WIN_SIGNING_SUBJECT]
+
+export async function expectUpdateMetadata(expect: ExpectStatic, context: PackedContext, arch: Arch = Arch.ia32, requireCodeSign: boolean = false): Promise<void> {
   const data = load(await fs.readFile(path.join(context.getResources(Platform.WINDOWS, arch), "app-update.yml"), "utf-8")) as any
   if (requireCodeSign) {
-    expect(data.publisherName).toEqual(["Foo, Inc"])
+    expect(data.publisherName).toEqual(EXPLICIT_PUBLISHER_NAMES)
     delete data.publisherName
   }
 
   expect(data).toMatchSnapshot()
 }
 
-export async function checkHelpers(resourceDir: string, isPackElevateHelper: boolean) {
+export async function checkHelpers(expect: ExpectStatic, resourceDir: string, isPackElevateHelper: boolean) {
+  // elevate.exe is copied into win-unpacked/resources only after every target has finished reading
+  // appOutDir, so the dir-target output still ships it while concurrent targets (Squirrel, ZIP,
+  // appx) never capture it mid-build (#9852).
   const elevateHelperExecutable = path.join(resourceDir, "elevate.exe")
   if (isPackElevateHelper) {
-    await assertThat(elevateHelperExecutable).isFile()
+    await assertThat(expect, elevateHelperExecutable).isFile()
   } else {
-    await assertThat(elevateHelperExecutable).doesNotExist()
+    await assertThat(expect, elevateHelperExecutable).doesNotExist()
   }
 }
 
-export async function doTest(outDir: string, perUser: boolean, productFilename = "TestApp Setup", name = "TestApp", menuCategory: string | null = null, packElevateHelper = true) {
-  if (process.env.DO_WINE !== "true") {
+export async function doTest(
+  expect: ExpectStatic,
+  outDir: string,
+  perUser: boolean,
+  productFilename = "TestApp Setup",
+  name = "TestApp",
+  menuCategory: string | null = null,
+  packElevateHelper = true,
+  toolsets?: ToolsetConfig
+) {
+  // Install verification runs the produced .exe under wine.
+  // Skip on macOS: wine-11.0-darwin-x86_64 SIGSEGVs running PE files on arm64 (Apple Silicon CI).
+  // Skip on Linux: use null toolsets instead; null defaults to host wine in Docker environments.
+  // wine="0.0.0" is the legacy macOS-only bundle — skip it too.
+  if (process.platform === "win32" || process.platform === "darwin" || toolsets?.wine == null || toolsets.wine === "0.0.0") {
     return Promise.resolve()
   }
 
-  const wine = new WineManager()
+  const { execPath: winePath, env: wineEnv } = await getWineToolset(toolsets.wine, "")
+  const wine = new WineManager(winePath, wineEnv)
   await wine.prepare()
-  const driveC = path.join(wine.wineDir!!, "drive_c")
-  const driveCWindows = path.join(wine.wineDir!!, "drive_c", "windows")
-  const perUserTempDir = path.join(wine.userDir!!, "Temp")
+  const driveC = path.join(wine.wineDir!, "drive_c")
+  const driveCWindows = path.join(wine.wineDir!, "drive_c", "windows")
+  const perUserTempDir = path.join(wine.userDir!, "Temp")
   const walkFilter = (it: string) => {
     return it !== driveCWindows && it !== perUserTempDir
   }
@@ -50,7 +77,7 @@ export async function doTest(outDir: string, perUser: boolean, productFilename =
 
   await wine.exec(path.join(outDir, `${productFilename} Setup 1.1.0.exe`), "/S")
 
-  let instDir = perUser ? path.join(wine.userDir!!, "Local Settings", "Application Data", "Programs") : path.join(driveC, "Program Files")
+  let instDir = perUser ? path.join(wine.userDir!, "Local Settings", "Application Data", "Programs") : path.join(driveC, "Program Files")
   if (menuCategory != null) {
     instDir = path.join(instDir, menuCategory)
   }
@@ -65,13 +92,13 @@ export async function doTest(outDir: string, perUser: boolean, productFilename =
     if (menuCategory != null) {
       startMenuDir = path.join(startMenuDir, menuCategory)
     }
-    await assertThat(path.join(startMenuDir, `${productFilename}.lnk`)).isFile()
+    await assertThat(expect, path.join(startMenuDir, `${productFilename}.lnk`)).isFile()
   }
 
   if (packElevateHelper) {
-    await assertThat(path.join(instDir, name, "resources", "elevate.exe")).isFile()
+    await assertThat(expect, path.join(instDir, name, "resources", "elevate.exe")).isFile()
   } else {
-    await assertThat(path.join(instDir, name, "resources", "elevate.exe")).doesNotExist()
+    await assertThat(expect, path.join(instDir, name, "resources", "elevate.exe")).doesNotExist()
   }
 
   let fsAfter = await listFiles()
@@ -81,8 +108,8 @@ export async function doTest(outDir: string, perUser: boolean, productFilename =
   expect(fsChanges.deleted).toEqual([])
 
   // run installer again to test uninstall
-  const appDataFile = path.join(wine.userDir!!, "Application Data", name, "doNotDeleteMe")
-  await outputFile(appDataFile, "app data must be not removed")
+  const appDataFile = path.join(wine.userDir!, "Application Data", name, "doNotDeleteMe")
+  await fsExtra.outputFile(appDataFile, "app data must be not removed")
   fsBefore = await listFiles()
   await wine.exec(path.join(outDir, `${productFilename} Setup 1.1.0.exe`), "/S")
   fsAfter = await listFiles()
@@ -91,8 +118,8 @@ export async function doTest(outDir: string, perUser: boolean, productFilename =
   expect(fsChanges.added).toEqual([])
   expect(fsChanges.deleted).toEqual([])
 
-  await assertThat(appDataFile).isFile()
+  await assertThat(expect, appDataFile).isFile()
 
   await wine.exec(path.join(outDir, `${productFilename} Setup 1.1.0.exe`), "/S", "--delete-app-data")
-  await assertThat(appDataFile).doesNotExist()
+  await assertThat(expect, appDataFile).doesNotExist()
 }

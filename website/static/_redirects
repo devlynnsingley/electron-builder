@@ -1,0 +1,5 @@
+/publishing-artifacts /docs/publish
+/configuration/linux-other /docs/linux
+/configuration/deb /docs/linux
+/docker /docs/features/multi-platform-build
+/configuration/target /cli

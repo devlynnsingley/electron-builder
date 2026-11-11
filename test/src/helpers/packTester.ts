@@ -1,46 +1,267 @@
-import { path7x, path7za } from "7zip-bin"
-import { addValue, deepAssign, exec, log, spawn } from "builder-util"
-import { CancellationToken } from "builder-util-runtime"
-import { copyDir, FileCopier, USE_HARD_LINKS, walk } from "builder-util/out/fs"
-import { executeFinally } from "builder-util/out/promise"
-import DecompressZip from "decompress-zip"
-import { Arch, ArtifactCreated, Configuration, DIR_TARGET, getArchSuffix, MacOsTargetName, Packager, PackagerOptions, Platform, Target } from "electron-builder"
 import { PublishManager } from "app-builder-lib"
-import { computeArchToTargetNamesMap } from "app-builder-lib/out/targets/targetFactory"
-import { getLinuxToolsPath } from "app-builder-lib/out/targets/tools"
-import { convertVersion } from "electron-builder-squirrel-windows/out/squirrelPack"
+import { verifyAsarFileTree as _verifyAsarFileTree } from "./asarVerifier"
+import { computeArchToTargetNamesMap, getArchiveToolsetBinDir, parsePlistFile, PlistObject } from "app-builder-lib/internal"
+import { addValue, copyDir, deepAssign, exec, executeFinally, exists, FileCopier, isEmptyOrSpaces, log, retry, USE_HARD_LINKS, walk } from "builder-util"
+import { CancellationToken, UpdateFileInfo } from "builder-util-runtime"
+import {
+  AfterPackContext,
+  Arch,
+  ArtifactCreated,
+  Configuration,
+  DIR_TARGET,
+  getArchSuffix,
+  MacOsTargetName,
+  Packager,
+  PackagerOptions,
+  Platform,
+  SquirrelWindowsOptions,
+  Target,
+} from "electron-builder"
+import { convertVersion } from "electron-builder-squirrel-windows/src/windowsInstaller"
 import { PublishPolicy } from "electron-publish"
-import { emptyDir, writeJson } from "fs-extra"
+import { copyFile, emptyDir, mkdir, writeJson } from "fs-extra"
 import * as fs from "fs/promises"
-import { load } from "js-yaml"
+import { realpath as realpathCb } from "fs"
+import { dump, load } from "js-yaml"
 import * as path from "path"
-import { promisify } from "util"
 import pathSorter from "path-sort"
+import { Format, NtExecutable, NtExecutableResource } from "resedit"
 import { TmpDir } from "temp-file"
-import { readAsar } from "app-builder-lib/out/asar/asar"
-import { executeAppBuilderAsJson } from "app-builder-lib/out/util/appBuilder"
-import { CSC_LINK, WIN_CSC_LINK } from "./codeSignData"
+import { getCollectorByPackageManager, PM } from "app-builder-lib/internal"
+import { promisify } from "util"
+import { macSigningCredentialsInfo, WIN_SIGNING_PUBLISHER_NAME, winSigningCredentialsInfo } from "./codeSignData"
 import { assertThat } from "./fileAssert"
+import AdmZip from "adm-zip"
+// @ts-ignore
+import sanitizeFileName from "sanitize-filename"
+import type { ExpectStatic } from "vitest"
+import { computeDefaultAppDirectory, installDependencies } from "app-builder-lib/internal"
+import { ELECTRON_VERSION } from "./testConfig"
+import { execSync, spawnSync } from "child_process"
+import { detectPackageManager } from "app-builder-lib/src/node-module-collector/packageManager"
+import { SelfSignedIdentity } from "./selfSignedIdentity"
 
-if (process.env.TRAVIS !== "true") {
-  process.env.CIRCLE_BUILD_NUM = "42"
+const PACKAGE_MANAGER_VERSION_MAP = {
+  [PM.NPM]: { cli: "npm", version: "12.0.2" },
+  [PM.YARN]: { cli: "yarn", version: "1.22.22" },
+  [PM.YARN_BERRY]: { cli: "yarn", version: "4.18.0" },
+  [PM.PNPM]: { cli: "pnpm", version: "11.26.0" },
+  [PM.BUN]: { cli: "bun", version: "1.4.2" },
+  [PM.TRAVERSAL]: { cli: "npm", version: "12.0.2" }, // use npm to install, we're testing manual node traversal, but we still need something to install the dependencies
 }
 
-export const linuxDirTarget = Platform.LINUX.createTarget(DIR_TARGET)
-export const snapTarget = Platform.LINUX.createTarget("snap")
+// `fs.promises.realpath` keeps 8.3 short components on Windows; only the `.native` variant
+// (GetFinalPathNameByHandle) expands them to the long form.
+const realpathNative = promisify(realpathCb.native)
+
+export function getPackageManagerWithVersion(pm: PM, packageManagerAndVersionString?: string) {
+  const packageManagerInfo = PACKAGE_MANAGER_VERSION_MAP[pm]
+  const prepare = packageManagerAndVersionString == null ? `${packageManagerInfo.cli}@${packageManagerInfo.version}` : packageManagerAndVersionString
+  return {
+    cli: packageManagerInfo.cli,
+    version: packageManagerInfo.version,
+    prepareEntry: prepare,
+  }
+}
+
+function getLockedInstallArgs(pm: PM): Array<string> | undefined {
+  switch (pm) {
+    case PM.YARN:
+    case PM.PNPM:
+    case PM.BUN:
+      return ["--frozen-lockfile"]
+    case PM.YARN_BERRY:
+      return ["--immutable"]
+    default:
+      return undefined
+  }
+}
+
+function getUnlockedInstallArgs(pm: PM): Array<string> | undefined {
+  // Yarn handles CI immutable installs via YARN_ENABLE_IMMUTABLE_INSTALLS=false in runtimeEnv.
+  // pnpm has no env var equivalent; must explicitly pass --no-frozen-lockfile.
+  if (pm === PM.PNPM) {
+    return ["--no-frozen-lockfile"]
+  }
+  return undefined
+}
+
+// Fixture dependencies come straight from the registry and must never run their own install hooks (supply chain).
+// Nothing is lost: native modules are built by electron-builder's own @electron/rebuild step right after the
+// install, which is the product feature under test. npm, yarn 1, pnpm and bun all take `--ignore-scripts` on
+// `install`; yarn berry has no such flag and is handled through YARN_ENABLE_SCRIPTS on the install env instead.
+function getIgnoreScriptsInstallArgs(pm: PM): Array<string> {
+  return pm === PM.YARN_BERRY ? [] : ["--ignore-scripts"]
+}
+
+// Writes AssertPackOptions.packageManagerSettings into the config file the detected package manager actually reads for the
+// fixture install, and returns a function that undoes the write (removes the file, or puts the fixture's own bytes back).
+// Every merge goes through `deepAssign` so a fixture's existing keys survive, nested objects are merged rather than
+// replaced, arrays are unioned, and `__proto__`/`constructor`/`prototype` keys are dropped (prototype pollution).
+//
+//   pnpm         -> pnpm-workspace.yaml (nearest between `appDir` and `projectDir`, else created in `appDir`), see below
+//   yarn berry   -> .yarnrc.yml in `appDir` (yaml; berry merges every .yarnrc.yml up the tree, the nearest one wins)
+//   npm / yarn 1 -> .npmrc in `appDir` (ini `key=value` lines; comments and unrelated keys of an existing file are kept)
+//   bun          -> bunfig.toml is not supported (no toml writer in the test toolchain), passing settings throws
+//
+// pnpm >= 11 fails the install with ERR_PNPM_IGNORED_BUILDS when a dependency has a build script that has not been
+// allowlisted (`strictDepBuilds` defaults to true and is only honored from pnpm-workspace.yaml, not from the env).
+// `--ignore-scripts` (see getIgnoreScriptsInstallArgs) skips that check as of pnpm 11.26, but rather than relying on it
+// or disabling the check, allowlist electron alone: nothing else in a fixture is ever allowed to run its install hooks in
+// CI (natives are built by electron-builder's own @electron/rebuild step). Fixtures that ship or generate their own
+// pnpm-workspace.yaml keep every other key. The file is therefore always written for pnpm, even without settings.
+//
+// pnpm 11 also stopped reading its own settings from `.npmrc` and from the `pnpm` key of package.json, so a test's install
+// settings (`nodeLinker`, `shamefullyHoist`, `publicHoistPattern`, `supportedArchitectures`, ...) go into the same file.
+//
+// pnpm locates its workspace root with a plain upward search for pnpm-workspace.yaml, and `pnpm install` run inside a
+// workspace installs the workspace's packages, not the cwd's. installDependencies runs pnpm in `appDir`, so the file has to
+// live there for two-package fixtures such as `test-app`: written to `projectDir` instead, it turned that parent into a
+// workspace root whose only member was the root package.json, and the install in `app/` silently became a no-op that never
+// produced `sqlite3` (updater blackbox suites). Conversely, a fixture that already has a workspace root above `appDir`
+// must keep it, since a second pnpm-workspace.yaml below it would split the workspace, so the nearest existing file between
+// `appDir` and `projectDir` wins.
+//
+// The restore runs once the install is done: the file is only needed by the install itself (the packager's rebuild step is
+// @electron/rebuild, and the pnpm collector's `pnpm list` reads the lockfile and node_modules), pnpm appends placeholder
+// `allowBuilds` entries for every unreviewed build script it met, and for single-package fixtures `appDir` is the packaged
+// directory, so leaving the file there would add it to app.asar and shift every offset in the asar snapshots.
+async function writePackageManagerSettings(projectDir: string, appDir: string, pm: PM, settings: Record<string, any> | undefined): Promise<(() => Promise<void>) | null> {
+  switch (pm) {
+    case PM.PNPM: {
+      const workspaceFile = (await findPnpmWorkspaceFile(appDir, projectDir)) ?? path.join(appDir, "pnpm-workspace.yaml")
+      return await writeYamlSettings(workspaceFile, settings, { allowBuilds: { electron: true } })
+    }
+    case PM.YARN_BERRY:
+      return settings == null ? null : await writeYamlSettings(path.join(appDir, ".yarnrc.yml"), settings)
+    case PM.NPM:
+    case PM.YARN:
+    case PM.TRAVERSAL:
+      return settings == null ? null : await writeNpmrcSettings(path.join(appDir, ".npmrc"), settings)
+    case PM.BUN:
+      if (settings != null) {
+        throw new Error(`packageManagerSettings is not supported for ${pm} (bunfig.toml); pass them via the fixture or projectDirCreated instead`)
+      }
+      return null
+  }
+}
+
+// Merges `layers` (left to right) over the yaml document in `file` and returns the restore function.
+async function writeYamlSettings(file: string, ...layers: Array<Record<string, any> | undefined>): Promise<() => Promise<void>> {
+  const original = (await exists(file)) ? await fs.readFile(file, "utf8") : null
+  const existing = original == null ? null : load(original)
+  const config = deepAssign<Record<string, any>>({}, existing != null && typeof existing === "object" ? existing : null, ...layers)
+  await fs.writeFile(file, dump(config))
+  return restoreFile(file, original)
+}
+
+// `.npmrc` is ini: one `key=value` per line, arrays as repeated `key[]=value` lines. Lines for keys that are not being set
+// (and comments/blank lines) are kept verbatim; the settings are appended after them.
+async function writeNpmrcSettings(file: string, settings: Record<string, any>): Promise<() => Promise<void>> {
+  const original = (await exists(file)) ? await fs.readFile(file, "utf8") : null
+  const existing: Record<string, any> = {}
+  const untouchedLines: Array<string> = []
+  for (const line of (original ?? "").split(/\r?\n/)) {
+    const match = /^\s*([^;#=\s][^=]*?)(\[\])?\s*=\s*(.*?)\s*$/.exec(line)
+    if (match == null) {
+      untouchedLines.push(line)
+      continue
+    }
+    const [, key, isArray, value] = match
+    if (isArray != null) {
+      existing[key] = [...(Array.isArray(existing[key]) ? existing[key] : []), value]
+    } else {
+      existing[key] = value
+    }
+  }
+  const merged = deepAssign<Record<string, any>>({}, existing, settings)
+  const lines = untouchedLines.filter((line, index, all) => !(index === all.length - 1 && line === ""))
+  for (const [key, value] of Object.entries(merged)) {
+    if (Array.isArray(value)) {
+      lines.push(...value.map(it => `${key}[]=${String(it)}`))
+    } else if (value != null && typeof value === "object") {
+      throw new Error(`.npmrc setting "${key}" must be a scalar or an array, got ${JSON.stringify(value)}`)
+    } else if (value != null) {
+      lines.push(`${key}=${String(value)}`)
+    }
+  }
+  await fs.writeFile(file, `${lines.join("\n")}\n`)
+  return restoreFile(file, original)
+}
+
+function restoreFile(file: string, original: string | null): () => Promise<void> {
+  return async () => {
+    if (original == null) {
+      await fs.rm(file, { force: true })
+    } else {
+      await fs.writeFile(file, original)
+    }
+  }
+}
+
+// Nearest pnpm-workspace.yaml from `startDir` up to and including `stopDir` (the fixture root), mirroring pnpm's own lookup.
+async function findPnpmWorkspaceFile(startDir: string, stopDir: string): Promise<string | null> {
+  const stop = path.resolve(stopDir)
+  for (let dir = path.resolve(stopDir, startDir); ; dir = path.dirname(dir)) {
+    const candidate = path.join(dir, "pnpm-workspace.yaml")
+    if (await exists(candidate)) {
+      return candidate
+    }
+    if (dir === stop || path.dirname(dir) === dir) {
+      return null
+    }
+  }
+}
+
+function getLockfileFixtureNameCandidates(currentTestName: string): Array<string> {
+  const names: Array<string> = []
+  const normalizedTestName = currentTestName.trim()
+
+  const leafTestName = normalizedTestName.split(" > ").at(-1)?.trim()
+  if (leafTestName != null && leafTestName.length > 0) {
+    names.push(sanitizeFileName(leafTestName))
+  }
+
+  if (normalizedTestName.length > 0) {
+    names.push(sanitizeFileName(normalizedTestName))
+  }
+
+  return [...new Set(names.filter(Boolean))]
+}
+
+export const EXTENDED_TIMEOUT = 20 * 60 * 1000
+export const linuxDirTarget = Platform.LINUX.createTarget(DIR_TARGET, Arch.x64)
+export const snapTarget = Platform.LINUX.createTarget("snap", Arch.x64)
 
 export interface AssertPackOptions {
-  readonly projectDirCreated?: (projectDir: string, tmpDir: TmpDir) => Promise<any>
+  readonly projectDirCreated?: (projectDir: string, tmpDir: TmpDir, testEnv: NodeJS.ProcessEnv) => Promise<any> | (() => Promise<any>)
   readonly packed?: (context: PackedContext) => Promise<any>
+  /**
+   * Test-only early exit. Called once per platform/arch after the app directory is assembled and signed but before any
+   * target (nsis/dmg/deb/zip…) is built. Return `true` to skip the target builds for that arch; the artifact snapshot then
+   * records an empty list (like a `dir` target) and the target post-checks are skipped. `packed` still runs afterwards.
+   *
+   * Fires once per platform/arch, plus once per `mas`/`mas-dev` target on macOS — `toMatchSnapshot` calls inside the hook
+   * produce one snapshot key per invocation.
+   */
+  readonly afterPackTestHook?: (context: PackedContext & { readonly arch: Arch; readonly packContext: AfterPackContext }) => Promise<boolean>
   readonly expectedArtifacts?: Array<string>
 
   readonly checkMacApp?: (appDir: string, info: any) => Promise<any>
 
+  readonly packageManager?: PM
+  /**
+   * Settings merged (with `deepAssign`) into the package manager's own config file for the fixture install and restored
+   * afterwards, before packing (see writePackageManagerSettings): pnpm-workspace.yaml keys for pnpm (`nodeLinker`,
+   * `shamefullyHoist`, `publicHoistPattern`, `supportedArchitectures`, ...), .yarnrc.yml keys for yarn berry, .npmrc keys
+   * for npm and yarn 1. Not supported for bun.
+   */
+  readonly packageManagerSettings?: Record<string, any>
   readonly useTempDir?: boolean
-  readonly signed?: boolean
+  readonly signedMac?: boolean
   readonly signedWin?: boolean
 
-  readonly isInstallDepsBefore?: boolean
+  readonly storeDepsLockfileSnapshot?: boolean
 
   readonly publish?: PublishPolicy
 
@@ -51,57 +272,96 @@ export interface PackedContext {
   readonly projectDir: string
   readonly outDir: string
 
+  readonly getAppPath: (platform: Platform, arch?: Arch) => string
   readonly getResources: (platform: Platform, arch?: Arch) => string
-  readonly getContent: (platform: Platform) => string
+  readonly getContent: (platform: Platform, arch?: Arch) => string
 
   readonly packager: Packager
 
   readonly tmpDir: TmpDir
 }
 
-export function appThrows(packagerOptions: PackagerOptions, checkOptions: AssertPackOptions = {}, customErrorAssert?: (error: Error) => void) {
-  return () => assertThat(assertPack("test-app-one", packagerOptions, checkOptions)).throws(customErrorAssert)
+export function appThrows(expect: ExpectStatic, packagerOptions: PackagerOptions, checkOptions: AssertPackOptions = {}, customErrorAssert?: (error: Error) => void) {
+  return assertThat(expect, assertPack(expect, "test-app-one", packagerOptions, checkOptions)).throws(customErrorAssert)
 }
 
-export function appTwoThrows(packagerOptions: PackagerOptions, checkOptions: AssertPackOptions = {}) {
-  return () => assertThat(assertPack("test-app", packagerOptions, checkOptions)).throws()
+export function appTwoThrows(expect: ExpectStatic, packagerOptions: PackagerOptions, checkOptions: AssertPackOptions = {}, customErrorAssert?: (error: Error) => void) {
+  return assertThat(expect, assertPack(expect, "test-app", packagerOptions, checkOptions)).throws(customErrorAssert)
 }
 
-export function app(packagerOptions: PackagerOptions, checkOptions: AssertPackOptions = {}) {
-  return () => assertPack(packagerOptions.config != null && (packagerOptions.config as any).protonNodeVersion != null ? "proton" : "test-app-one", packagerOptions, checkOptions)
+export function app(expect: ExpectStatic, packagerOptions: PackagerOptions, checkOptions: AssertPackOptions = {}) {
+  return assertPack(expect, "test-app-one", packagerOptions, checkOptions)
 }
 
-export function appTwo(packagerOptions: PackagerOptions, checkOptions: AssertPackOptions = {}) {
-  return () => assertPack("test-app", packagerOptions, checkOptions)
+export function appTwo(expect: ExpectStatic, packagerOptions: PackagerOptions, checkOptions: AssertPackOptions = {}) {
+  return assertPack(expect, "test-app", packagerOptions, checkOptions)
 }
 
-export async function assertPack(fixtureName: string, packagerOptions: PackagerOptions, checkOptions: AssertPackOptions = {}): Promise<void> {
+export async function assertPack(expect: ExpectStatic, fixtureName: string, packagerOptions: PackagerOptions, checkOptions: AssertPackOptions = {}): Promise<void> {
   let configuration = packagerOptions.config as Configuration
   if (configuration == null) {
     configuration = {}
     ;(packagerOptions as any).config = configuration
   }
 
-  if (checkOptions.signed) {
-    packagerOptions = signed(packagerOptions)
+  // Signing auto-update manifests is required by default, but the fixture suites assert UNSIGNED `latest*.yml`
+  // snapshots, so opt out unless the test configures signing itself. This also makes those snapshots hermetic: a
+  // developer with ELECTRON_BUILDER_UPDATE_SIGN_KEY exported would otherwise sign every fixture build and rewrite
+  // every manifest snapshot. Set before the reassignments below so it survives them.
+  // `=== undefined` on purpose - a test writes `updateManifest: null` to exercise the required path.
+  if (configuration.updateManifest === undefined) {
+    ;(configuration as any).updateManifest = false
   }
-  if (checkOptions.signedWin) {
-    configuration.cscLink = WIN_CSC_LINK
-    configuration.cscKeyPassword = ""
-  } else if ((configuration as Configuration).cscLink == null) {
-    packagerOptions = deepAssign({}, packagerOptions, { config: { mac: { identity: null } } })
+  // The same for Windows update signature verification: fixture builds are unsigned unless the test signs them (signedWin), and since
+  // v27 a build that writes app-update.yml without a publisherName fails. Opt them out explicitly - app-update.yml then carries
+  // `verifyUpdateCodeSignature: false`, as the snapshots show - unless the test configures win.sign or the verification itself
+  // (the tests of the requirement set win.sign: false / null, or a sign object without a certificate).
+  const buildsWindows = packagerOptions.targets?.has(Platform.WINDOWS) === true
+  if (buildsWindows && !checkOptions.signedWin && configuration.win?.sign === undefined && configuration.win?.verifyUpdateCodeSignature === undefined) {
+    ;(configuration as any).win = { ...configuration.win, verifyUpdateCodeSignature: false }
   }
 
-  const projectDirCreated = checkOptions.projectDirCreated
+  if (checkOptions.signedMac) {
+    packagerOptions = await signed(packagerOptions, "mac")
+  } else if (process.env.CSC_LINK == null && process.platform === "darwin") {
+    packagerOptions = deepAssign({}, packagerOptions, { config: { mac: { sign: { identity: null } } } })
+  }
+  if (checkOptions.signedWin) {
+    packagerOptions = await signed(packagerOptions, "win")
+  }
+
   let projectDir = path.join(__dirname, "..", "..", "fixtures", fixtureName)
-  // const isDoNotUseTempDir = platform === "darwin"
   const customTmpDir = process.env.TEST_APP_TMP_DIR
   const tmpDir = checkOptions.tmpDir || new TmpDir(`pack-tester: ${fixtureName}`)
   // non-macOS test uses the same dir as macOS test, but we cannot share node_modules (because tests executed in parallel)
-  const dir = customTmpDir == null ? await tmpDir.createTempDir({ prefix: "test-project" }) : path.resolve(customTmpDir)
+  const rawDir = customTmpDir == null ? await tmpDir.createTempDir({ prefix: "test_project" }) : path.resolve(customTmpDir)
+  // On Windows the OS temp dir can be an 8.3 short path (e.g. `RUNNER~1` on CI agents). Installing a
+  // workspace under a short path makes package managers bake short paths into node_modules, which
+  // breaks `npm list` workspace resolution during node-module collection — it then lists the entire
+  // physical tree (devDependencies included) instead of just the production subtree, corrupting the
+  // asar snapshots. Canonicalize to the long form so the layout matches a real project directory.
+  // Windows-only: on POSIX `realpath.native` would rewrite symlinked temp roots (e.g. macOS
+  // `/var` → `/private/var`) and churn unrelated path-sensitive tests.
+  const dir = process.platform === "win32" ? await realpathNative(rawDir).catch(() => rawDir) : rawDir
   if (customTmpDir != null) {
     await emptyDir(dir)
     log.info({ customTmpDir }, "custom temp dir used")
+  }
+
+  const state = expect.getState()
+  const lockfileFixtureName = path.basename(state.testPath!, path.extname(state.testPath!))
+  const lockfilePathPrefix = path.join(__dirname, "..", "..", "fixtures", "lockfiles", lockfileFixtureName)
+  const lockfileFixtureNameCandidates = getLockfileFixtureNameCandidates(state.currentTestName || "")
+  if (lockfileFixtureNameCandidates.length === 0) {
+    lockfileFixtureNameCandidates.push("unknown-test")
+  }
+  const lockfileFixturePathCandidates = lockfileFixtureNameCandidates.map(name => path.join(lockfilePathPrefix, `${name}.txt`))
+  let testFixtureLockfile = lockfileFixturePathCandidates[0]
+  for (const lockfilePath of lockfileFixturePathCandidates) {
+    if (await exists(lockfilePath)) {
+      testFixtureLockfile = lockfilePath
+      break
+    }
   }
 
   await copyDir(projectDir, dir, {
@@ -110,21 +370,123 @@ export async function assertPack(fixtureName: string, packagerOptions: PackagerO
       // if custom project dir specified, copy node_modules (i.e. do not ignore it)
       return (packagerOptions.projectDir != null || basename !== "node_modules") && (!basename.startsWith(".") || basename === ".babelrc")
     },
-    isUseHardLink: USE_HARD_LINKS,
+    isUseHardLink: USE_HARD_LINKS, // TODO: consider use hard links for tests
   })
   projectDir = dir
 
   await executeFinally(
     (async () => {
-      if (projectDirCreated != null) {
-        await projectDirCreated(projectDir, tmpDir)
+      const packageManagerOverride = checkOptions.packageManager
+      await modifyPackageJson(projectDir, data => {
+        if (data.packageManager == null || packageManagerOverride) {
+          data.packageManager = getPackageManagerWithVersion(packageManagerOverride || PM.NPM).prepareEntry
+        }
+      })
+
+      const tmpCache = await tmpDir.createTempDir({ prefix: "cache-" })
+      const tmpHome = await tmpDir.createTempDir({ prefix: "home-" })
+      const runtimeEnv = {
+        ...process.env,
+        // corepack
+        // COREPACK_HOME,
+        // COREPACK_ENABLE_DOWNLOADS: "1",
+        // yarn
+        HOME: tmpHome,
+        USERPROFILE: tmpHome, // for Windows compatibility
+        YARN_CACHE_FOLDER: tmpCache, // this doesn't seem to always work in concurrent tests? So we must set manually
+        // YARN_DISABLE_TELEMETRY: "1",
+        // YARN_ENABLE_TELEMETRY: "false",
+        YARN_IGNORE_PATH: "1", // ignore globally installed yarn binaries
+        YARN_ENABLE_IMMUTABLE_INSTALLS: "false", // to be sure that --frozen-lockfile is not used
+        // YARN_NODE_LINKER: "node-modules", // force to not use pnp (as there's no way to access virtual packages within the paths returned by pnpm)
+        npm_config_cache: tmpCache, // prevent npm fallback caching
+      }
+      const postNodeModulesInstallHook = checkOptions.projectDirCreated ? await checkOptions.projectDirCreated(projectDir, tmpDir, runtimeEnv) : null
+
+      // Check again. Package manager could have been changed in package.json during `projectDirCreated`
+      const { pm, corepackConfig: packageManager } = await detectPackageManager([projectDir])
+      const { cli, prepareEntry, version } = getPackageManagerWithVersion(pm, packageManager)
+
+      if (pm === PM.BUN) {
+        log.info({ pm, version: version, projectDir }, "installing dependencies with bun; corepack does not support it currently and it must be installed separately")
+      } else {
+        log.info({ pm, version: version, projectDir }, "activating corepack")
+        try {
+          execSync(`corepack enable ${cli}`, { env: runtimeEnv, cwd: projectDir, stdio: ["ignore", "ignore", "ignore"] })
+        } catch (err: any) {
+          log.warn({ message: err.message }, "⚠️ corepack enable failed (possibly already enabled)")
+        }
+        try {
+          await retry(async () => execSync(`corepack prepare ${prepareEntry} --activate`, { env: runtimeEnv, cwd: projectDir, stdio: ["ignore", "ignore", "pipe"] }), {
+            retries: 3,
+            interval: 1000,
+            backoff: 2000,
+            shouldRetry: (e: any) => {
+              const detail = `${e?.message ?? ""}\n${String(e?.stderr ?? "")}`
+              const isTransient = /ENOTFOUND|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|repo\.yarnpkg\.com|Corepack is about to download|performing the request/i.test(detail)
+              if (isTransient) {
+                log.warn({ error: detail.split("\n")[0] }, "transient corepack download error, retrying")
+              }
+              return isTransient
+            },
+          })
+        } catch (err: any) {
+          log.warn({ message: err.message }, "⚠️ corepack prepare failed")
+        }
+      }
+      const collector = getCollectorByPackageManager(pm, projectDir, tmpDir)
+      const collectorOptions = collector.installOptions
+
+      const destLockfile = path.join(projectDir, collectorOptions.lockfile)
+      let lockfileFixtureApplied = false
+
+      const shouldUpdateLockfiles = process.env.UPDATE_LOCKFILE_FIXTURES === "true" && !!checkOptions.storeDepsLockfileSnapshot
+      // check for lockfile fixture so we can use `--frozen-lockfile`
+      if ((await exists(testFixtureLockfile)) && !shouldUpdateLockfiles) {
+        await copyFile(testFixtureLockfile, destLockfile)
+        lockfileFixtureApplied = true
       }
 
-      if (checkOptions.isInstallDepsBefore) {
-        // bin links required (e.g. for node-pre-gyp - if package refers to it in the install script)
-        await spawn(process.platform === "win32" ? "npm.cmd" : "npm", ["install", "--production"], {
-          cwd: projectDir,
-        })
+      if (shouldUpdateLockfiles || !(await exists(destLockfile))) {
+        // When updating: clear the stale base-fixture lockfile so the package manager regenerates fresh.
+        // When no lockfile exists yet: create an empty stub to prevent package manager prompts.
+        await fs.writeFile(destLockfile, "")
+      }
+
+      const appDir = await computeDefaultAppDirectory(projectDir, configuration.directories?.app)
+      const restorePackageManagerSettings = await writePackageManagerSettings(projectDir, appDir, pm, checkOptions.packageManagerSettings)
+      const lockfileInstallArgs = lockfileFixtureApplied ? getLockedInstallArgs(pm) : checkOptions.storeDepsLockfileSnapshot ? getUnlockedInstallArgs(pm) : undefined
+      const additionalInstallArgs = [...getIgnoreScriptsInstallArgs(pm), ...(lockfileInstallArgs ?? [])]
+      // Scoped to this install only: `runtimeEnv` also reaches the packager, whose install-or-rebuild path must keep
+      // building natives. YARN_ENABLE_SCRIPTS is read by yarn berry alone (see getIgnoreScriptsInstallArgs).
+      const installEnv = pm === PM.YARN_BERRY ? { ...runtimeEnv, YARN_ENABLE_SCRIPTS: "0" } : runtimeEnv
+
+      await installDependencies(
+        configuration,
+        {
+          projectDir: projectDir,
+          appDir: appDir,
+          workspaceRoot: null,
+        },
+        {
+          frameworkInfo: { version: ELECTRON_VERSION, useCustomDist: false },
+          additionalArgs: additionalInstallArgs,
+        },
+        installEnv
+      )
+
+      if (typeof postNodeModulesInstallHook === "function") {
+        await postNodeModulesInstallHook()
+      }
+      await restorePackageManagerSettings?.()
+
+      // save or update lockfile fixture
+      if (shouldUpdateLockfiles) {
+        const fixtureDir = path.dirname(testFixtureLockfile)
+        if (!(await exists(fixtureDir))) {
+          await mkdir(fixtureDir, { recursive: true })
+        }
+        await copyFile(destLockfile, testFixtureLockfile)
       }
 
       if (packagerOptions.projectDir != null) {
@@ -132,30 +494,63 @@ export async function assertPack(fixtureName: string, packagerOptions: PackagerO
       }
 
       const { packager, outDir } = await packAndCheck(
+        expect,
         {
           projectDir,
           ...packagerOptions,
         },
-        checkOptions
+        checkOptions,
+        runtimeEnv,
+        { projectDir, tmpDir }
       )
 
       if (checkOptions.packed != null) {
-        const base = function (platform: Platform, arch?: Arch): string {
-          return path.join(outDir, `${platform.buildConfigurationKey}${getArchSuffix(arch == null ? Arch.x64 : arch)}${platform === Platform.MAC ? "" : "-unpacked"}`)
-        }
-
-        await checkOptions.packed({
-          projectDir,
-          outDir,
-          getResources: (platform, arch) => path.join(base(platform, arch), "resources"),
-          getContent: platform => base(platform),
-          packager,
-          tmpDir,
-        })
+        await checkOptions.packed(createPackedContext(outDir, packager, projectDir, tmpDir))
       }
     })(),
     (): any => (tmpDir === checkOptions.tmpDir ? null : tmpDir.cleanup())
   )
+}
+
+function createPackedContext(outDir: string, packager: Packager, projectDir: string, tmpDir: TmpDir): PackedContext {
+  const getAppPath = function (platform: Platform, arch?: Arch): string {
+    return path.join(outDir, `${platform.buildConfigurationKey}${getArchSuffix(arch ?? Arch.x64)}${platform === Platform.MAC ? "" : "-unpacked"}`)
+  }
+  const getContent = (platform: Platform, arch: Arch | undefined): string => {
+    return path.join(getAppPath(platform, arch), platform === Platform.MAC ? `${packager.appInfo.productFilename}.app/Contents` : "")
+  }
+  const getResources = (platform: Platform, arch: Arch | undefined): string => {
+    return path.join(getContent(platform, arch), platform === Platform.MAC ? "Resources" : "resources")
+  }
+  return {
+    projectDir,
+    outDir,
+    getAppPath,
+    getResources,
+    getContent,
+    packager,
+    tmpDir,
+  }
+}
+
+/**
+ * Reads the `INTEGRITY` resource electron-builder embeds into the Windows executable (the asar integrity map,
+ * see `AsarIntegrity`) and normalizes the hashes for snapshotting.
+ */
+export async function readAsarIntegrityFromExe(exePath: string): Promise<Array<{ file: string; alg: string; value: string }>> {
+  const resource = NtExecutableResource.from(NtExecutable.from(await fs.readFile(exePath), { ignoreCert: true }))
+  const integrityEntry = resource.entries.find(entry => entry.type === "INTEGRITY")
+  if (integrityEntry == null) {
+    throw new Error(`No INTEGRITY resource in ${exePath}`)
+  }
+  const checksumData = new TextDecoder("utf-8").decode(new Uint8Array(integrityEntry.bin))
+  return JSON.parse(checksumData).map((data: { file: string; alg: string; value: string }) => ({ ...data, alg: "SHA256", value: "hash" }))
+}
+
+/** `true` when the PE file at `exePath` carries no Authenticode signature (empty Certificate data directory). */
+export async function isExeUnsigned(exePath: string): Promise<boolean> {
+  const executable = NtExecutable.from(await fs.readFile(exePath), { ignoreCert: true })
+  return executable.newHeader.optionalHeaderDataDirectory.get(Format.ImageDirectoryEntry.Certificate).size === 0
 }
 
 const fileCopier = new FileCopier()
@@ -168,18 +563,152 @@ export function getFixtureDir() {
   return path.join(__dirname, "..", "..", "fixtures")
 }
 
-async function packAndCheck(packagerOptions: PackagerOptions, checkOptions: AssertPackOptions) {
+/**
+ * Determines the priority of a file based on its extension for sorting.
+ * Lower numbers have higher priority in the sort order.
+ */
+function getFileTypePriority(file: string): number {
+  const ordering = [
+    // Primary executables and installers
+    ".dmg",
+    ".exe",
+    ".msi",
+    ".pkg",
+    ".deb",
+    ".rpm",
+    ".AppImage",
+    ".appx",
+    ".snap",
+    ".flatpak",
+
+    // Archive formats
+    ".zip",
+    ".7z",
+    ".tar.gz",
+    ".tar.xz",
+    ".tar.bz2",
+
+    // Package formats
+    ".nupkg",
+    ".asar",
+
+    // Metadata and auxiliary files
+    ".blockmap",
+    ".yml",
+    ".yaml",
+  ]
+
+  const index = ordering.findIndex(ext => file.endsWith(ext))
+  // If found, return the index (0-based), otherwise return highest value for "other files"
+  return index === -1 ? ordering.length : index
+}
+
+/**
+ * Sorts artifacts in a deterministic order for consistent test snapshots.
+ * Sort order:
+ * 1. Primary: File type (by extension priority)
+ * 2. Secondary: Architecture (ia32 < x64 < armv7l < arm64 < universal)
+ * 3. Tertiary: Filename (alphabetical)
+ * 4. Quaternary: Presence of updateInfo (with updateInfo < without updateInfo)
+ * 5. Quinary: Safe artifact name (alphabetical)
+ * 6. Senary: Publish provider (alphabetical)
+ * 7. Final: File content bytes — same provider may be configured multiple times
+ */
+function sortArtifacts(a: ArtifactCreated, b: ArtifactCreated): number {
+  // Primary sort: by file extension type
+  const fileA = a.file ?? ""
+  const fileB = b.file ?? ""
+
+  const typePriorityA = getFileTypePriority(fileA)
+  const typePriorityB = getFileTypePriority(fileB)
+
+  if (typePriorityA !== typePriorityB) {
+    return typePriorityA - typePriorityB
+  }
+
+  // Secondary sort: by architecture
+  const archSortKey = (a.arch?.valueOf() ?? 0) - (b.arch?.valueOf() ?? 0)
+  if (archSortKey !== 0) {
+    return archSortKey
+  }
+
+  // Tertiary sort: by filename
+  const baseNameA = path.basename(fileA)
+  const baseNameB = path.basename(fileB)
+  const fileNameCompare = baseNameA.localeCompare(baseNameB, "en")
+  if (fileNameCompare !== 0) {
+    return fileNameCompare
+  }
+
+  // Quaternary sort: by presence of updateInfo (with updateInfo comes first)
+  const hasUpdateInfoA = a.updateInfo ? 0 : 1
+  const hasUpdateInfoB = b.updateInfo ? 0 : 1
+
+  if (hasUpdateInfoA !== hasUpdateInfoB) {
+    return hasUpdateInfoA - hasUpdateInfoB
+  }
+
+  // Quinary sort: by safeArtifactName
+  const safeNameCompare = (a.safeArtifactName ?? "").localeCompare(b.safeArtifactName ?? "", "en")
+  if (safeNameCompare !== 0) {
+    return safeNameCompare
+  }
+
+  // Senary sort: by publish provider. Update-info yml files emitted per publisher share
+  // basename/arch/updateInfo/safeArtifactName, so without this their relative order depends on
+  // async write completion in writeUpdateInfoFiles (asyncPool) and is nondeterministic.
+  const providerCompare = (a.publishConfig?.provider ?? "").localeCompare(b.publishConfig?.provider ?? "", "en")
+  if (providerCompare !== 0) {
+    return providerCompare
+  }
+
+  // Final tiebreaker: file content bytes (same provider can be configured multiple times)
+  return Buffer.compare(a.fileContent ?? Buffer.alloc(0), b.fileContent ?? Buffer.alloc(0))
+}
+
+async function packAndCheck(
+  expect: ExpectStatic,
+  packagerOptions: PackagerOptions,
+  checkOptions: AssertPackOptions,
+  runtimeEnv: NodeJS.ProcessEnv,
+  packedContextOptions: { projectDir: string; tmpDir: TmpDir }
+): Promise<{ packager: Packager; outDir: string }> {
+  // `${platform.buildConfigurationKey}:${arch}` entries for which `afterPackTestHook` requested an early exit — no targets
+  // were built for them, so the target post-checks below are skipped (the .app / *-unpacked directory still exists).
+  const earlyExited = new Set<string>()
+  const testHook = checkOptions.afterPackTestHook
+  let effectivePackagerOptions = packagerOptions
+  if (testHook != null) {
+    effectivePackagerOptions = {
+      ...packagerOptions,
+      // closes over `packager` (declared below); safe because the hook only runs inside `packager.build()`
+      afterPackTestHook: async packContext => {
+        const platform = packContext.packager.platform
+        const skip = await testHook({
+          ...createPackedContext(packContext.outDir, packager, packedContextOptions.projectDir, packedContextOptions.tmpDir),
+          arch: packContext.arch,
+          packContext,
+        })
+        if (skip) {
+          earlyExited.add(`${platform.buildConfigurationKey}:${packContext.arch}`)
+        }
+        return skip
+      },
+    }
+  }
+
   const cancellationToken = new CancellationToken()
-  const packager = new Packager(packagerOptions, cancellationToken)
+  const packager = new Packager(effectivePackagerOptions, cancellationToken)
+  ;(packager as any).runtimeEnvironmentVariables = runtimeEnv
   const publishManager = new PublishManager(packager, { publish: "publish" in checkOptions ? checkOptions.publish : "never" })
 
   const artifacts: Map<Platform, Array<ArtifactCreated>> = new Map()
-  packager.artifactCreated(event => {
+  packager.onArtifactCreated(event => {
     if (event.file == null) {
       return
     }
 
-    assertThat(event.file).isAbsolute()
+    assertThat(expect, event.file).isAbsolute()
     addValue(artifacts, event.packager.platform, event)
   })
 
@@ -190,77 +719,76 @@ async function packAndCheck(packagerOptions: PackagerOptions, checkOptions: Asse
     return { packager, outDir }
   }
 
-  function sortKey(a: ArtifactCreated) {
-    return `${a.target == null ? "no-target" : a.target.name}:${a.file == null ? a.fileContent!!.toString("hex") : path.basename(a.file)}`
-  }
-
   const objectToCompare: any = {}
-  for (const platform of packagerOptions.targets!!.keys()) {
+  for (const platform of packagerOptions.targets!.keys()) {
     objectToCompare[platform.buildConfigurationKey] = await Promise.all(
-      (artifacts.get(platform) || [])
-        .sort((a, b) => sortKey(a).localeCompare(sortKey(b), "en"))
-        .map(async it => {
-          const result: any = { ...it }
-          const file = result.file
-          if (file != null) {
-            if (file.endsWith(".yml")) {
-              result.fileContent = removeUnstableProperties(load(await fs.readFile(file, "utf-8")))
-            }
-            result.file = path.basename(file)
+      (artifacts.get(platform) || []).sort(sortArtifacts).map(async it => {
+        const result: any = { ...it }
+        const file = result.file
+        if (file != null) {
+          if (file.endsWith(".yml")) {
+            result.fileContent = removeUnstableProperties(load(await fs.readFile(file, "utf-8")))
           }
-          const updateInfo = result.updateInfo
-          if (updateInfo != null) {
-            result.updateInfo = removeUnstableProperties(updateInfo)
-          } else if (updateInfo === null) {
-            delete result.updateInfo
-          }
+          result.file = path.basename(file)
+        }
+        const updateInfo = result.updateInfo
+        if (updateInfo != null) {
+          result.updateInfo = removeUnstableProperties(updateInfo)
+        }
+        if (updateInfo == null) {
+          delete result.updateInfo
+        }
 
-          // reduce snapshot - avoid noise
-          if (result.safeArtifactName == null) {
-            delete result.safeArtifactName
-          }
-          if (result.updateInfo == null) {
-            delete result.updateInfo
-          }
-          if (result.arch == null) {
-            delete result.arch
-          } else {
-            result.arch = Arch[result.arch]
-          }
+        // reduce snapshot - avoid noise
+        if (result.safeArtifactName == null) {
+          delete result.safeArtifactName
+        }
+        if (result.arch == null) {
+          delete result.arch
+        } else {
+          result.arch = Arch[result.arch]
+        }
 
+        if (result.fileContent) {
           if (Buffer.isBuffer(result.fileContent)) {
             delete result.fileContent
+          } else if (Array.isArray(result.fileContent.files)) {
+            result.fileContent.files = result.fileContent.files.sort((a: UpdateFileInfo, b: UpdateFileInfo) => a.url.localeCompare(b.url, "en"))
           }
+        }
 
-          delete result.isWriteUpdateInfo
-          delete result.packager
-          delete result.target
-          delete result.publishConfig
-          return result
-        })
+        delete result.isWriteUpdateInfo
+        delete result.packager
+        delete result.target
+        delete result.publishConfig
+        return result
+      })
     )
   }
 
   expect(objectToCompare).toMatchSnapshot()
 
-  c: for (const [platform, archToType] of packagerOptions.targets!!) {
-    for (const [arch, targets] of computeArchToTargetNamesMap(
-      archToType,
-      { platformSpecificBuildOptions: (packagerOptions as any)[platform.buildConfigurationKey] || {}, defaultTarget: [] } as any,
-      platform
-    )) {
+  c: for (const [platform, archToType] of packagerOptions.targets!) {
+    // the archs the build resolved: the requested ones, or the ones the platform's `target` option names (the build leaves `targets` as requested)
+    const key = platform.buildConfigurationKey
+    const platformOptions = (key === "mac" || key === "win" || key === "linux" ? packager.config[key] : null) ?? {}
+    for (const [arch, targets] of computeArchToTargetNamesMap(archToType, { platformOptions, defaultTarget: [] }, platform)) {
       if (targets.length === 1 && targets[0] === DIR_TARGET) {
         continue c
       }
 
-      const nameToTarget = platformToTargets.get(platform)!!
+      const nameToTarget = platformToTargets.get(platform)!
       if (platform === Platform.MAC) {
-        const packedAppDir = path.join(outDir, nameToTarget.has("mas-dev") ? "mas-dev" : nameToTarget.has("mas") ? "mas" : "mac", `${packager.appInfo.productFilename}.app`)
-        await checkMacResult(packager, packagerOptions, checkOptions, packedAppDir)
+        const subDir = nameToTarget.has("mas-dev") ? "mas-dev" : nameToTarget.has("mas") ? "mas" : "mac"
+        const packedAppDir = path.join(outDir, `${subDir}${getArchSuffix(arch)}`, `${packager.appInfo.productFilename}.app`)
+        await checkMacResult(expect, packager, packagerOptions, checkOptions, packedAppDir)
+      } else if (earlyExited.has(`${platform.buildConfigurationKey}:${arch}`)) {
+        // afterPackTestHook skipped the target builds for this arch — nothing to check beyond the artifact snapshot
+        continue
       } else if (platform === Platform.LINUX) {
-        await checkLinuxResult(outDir, packager, arch, nameToTarget)
+        await checkLinuxResult(expect, outDir, packager, arch, nameToTarget)
       } else if (platform === Platform.WINDOWS) {
-        await checkWindowsResult(packager, checkOptions, artifacts.get(platform)!!, nameToTarget)
+        await checkWindowsResult(expect, packager, checkOptions, artifacts.get(platform)!, nameToTarget)
       }
     }
   }
@@ -268,25 +796,22 @@ async function packAndCheck(packagerOptions: PackagerOptions, checkOptions: Asse
   return { packager, outDir }
 }
 
-async function checkLinuxResult(outDir: string, packager: Packager, arch: Arch, nameToTarget: Map<string, Target>) {
+async function checkLinuxResult(expect: ExpectStatic, outDir: string, packager: Packager, arch: Arch, nameToTarget: Map<string, Target>) {
   if (!nameToTarget.has("deb")) {
     return
   }
 
   const appInfo = packager.appInfo
-  const packageFile = `${outDir}/TestApp_${appInfo.version}_${arch === Arch.ia32 ? "i386" : arch === Arch.x64 ? "amd64" : "armv7l"}.deb`
-  expect(await getContents(packageFile)).toMatchSnapshot()
+  const autoFindPackagePath = await fs.readdir(outDir).then(files => files.find(file => file.endsWith(".deb")))
+  const defaultPackageFile = `${outDir}/${appInfo.name}_${appInfo.version}_${arch === Arch.ia32 ? "i386" : arch === Arch.x64 ? "amd64" : "armv7l"}.deb`
+  const packagePath = autoFindPackagePath != null ? path.join(outDir, autoFindPackagePath) : defaultPackageFile
+  expect(await getContents(packagePath)).toMatchSnapshot()
   if (arch === Arch.ia32) {
-    expect(await getContents(`${outDir}/TestApp_${appInfo.version}_i386.deb`)).toMatchSnapshot()
+    expect(await getContents(`${outDir}/${appInfo.name}_${appInfo.version}_i386.deb`)).toMatchSnapshot()
   }
 
-  const control = parseDebControl(
-    (
-      await execShell(`ar p '${packageFile}' control.tar.gz | ${await getTarExecutable()} zx --to-stdout ./control`, {
-        maxBuffer: 10 * 1024 * 1024,
-      })
-    ).stdout
-  )
+  const { member: controlMember, tarArgs: controlArgs } = await resolveDebMember(packagePath, "control.tar.")
+  const control = parseDebControl(await extractDebMember(packagePath, controlMember, ["-x", ...controlArgs, "--to-stdout", "./control"]))
 
   delete control.Version
   delete control.Size
@@ -316,16 +841,17 @@ function parseDebControl(info: string): any {
   return metadata
 }
 
-async function checkMacResult(packager: Packager, packagerOptions: PackagerOptions, checkOptions: AssertPackOptions, packedAppDir: string) {
+async function checkMacResult(expect: ExpectStatic, packager: Packager, packagerOptions: PackagerOptions, checkOptions: AssertPackOptions, packedAppDir: string) {
   const appInfo = packager.appInfo
-  const info = (await executeAppBuilderAsJson<Array<any>>(["decode-plist", "-f", path.join(packedAppDir, "Contents", "Info.plist")]))[0]
+  const plistPath = path.join(packedAppDir, "Contents", "Info.plist")
+  const info = await parsePlistFile<PlistObject>(plistPath)
 
+  const buildNumber = process.env.TRAVIS_BUILD_NUMBER || process.env.CIRCLE_BUILD_NUM
   expect(info).toMatchObject({
-    CFBundleVersion: info.CFBundleVersion === "50" ? "50" : `${appInfo.version}.${process.env.TRAVIS_BUILD_NUMBER || process.env.CIRCLE_BUILD_NUM}`,
+    CFBundleVersion: info.CFBundleVersion === "50" ? "50" : `${appInfo.version}${buildNumber ? "." + buildNumber : ""}`,
   })
 
   // checked manually, remove to avoid mismatch on CI server (where TRAVIS_BUILD_NUMBER is defined and different on each test run)
-  delete info.AsarIntegrity
   delete info.CFBundleVersion
   delete info.BuildMachineOSBuild
   delete info.NSHumanReadableCopyright
@@ -341,27 +867,25 @@ async function checkMacResult(packager: Packager, packagerOptions: PackagerOptio
   delete info.NSRequiresAquaSystemAppearance
   delete info.NSQuitAlwaysKeepsWindows
   if (info.NSAppTransportSecurity != null) {
-    delete info.NSAppTransportSecurity.NSAllowsArbitraryLoads
+    delete (info.NSAppTransportSecurity as PlistObject).NSAllowsArbitraryLoads
   }
   // test value
   if (info.LSMinimumSystemVersion !== "10.12.0") {
     delete info.LSMinimumSystemVersion
   }
 
-  expect(info).toMatchSnapshot()
+  const { ElectronAsarIntegrity: checksumData, ...snapshot } = info
 
-  const checksumData = info.AsarIntegrity
   if (checksumData != null) {
-    const data = JSON.parse(checksumData)
-    const checksums = data.checksums
-    for (const name of Object.keys(checksums)) {
-      checksums[name] = "hash"
+    for (const name of Object.keys(checksumData)) {
+      ;(checksumData as Record<string, any>)[name] = { algorithm: "SHA256", hash: "hash" }
     }
-    info.AsarIntegrity = JSON.stringify(data)
+    snapshot.ElectronAsarIntegrity = checksumData
   }
+  expect(snapshot).toMatchSnapshot()
 
   if (checkOptions.checkMacApp != null) {
-    await checkOptions.checkMacApp(packedAppDir, info)
+    await checkOptions.checkMacApp(packedAppDir, snapshot)
   }
 
   if (packagerOptions.config != null && (packagerOptions.config as Configuration).cscLink != null) {
@@ -370,27 +894,98 @@ async function checkMacResult(packager: Packager, packagerOptions: PackagerOptio
   }
 }
 
-async function checkWindowsResult(packager: Packager, checkOptions: AssertPackOptions, artifacts: Array<ArtifactCreated>, nameToTarget: Map<string, Target>) {
-  const appInfo = packager.appInfo
-  let squirrel = false
-  for (const target of nameToTarget.keys()) {
-    if (target === "squirrel") {
-      squirrel = true
-      break
+async function checkWindowsResult(expect: ExpectStatic, packager: Packager, checkOptions: AssertPackOptions, artifacts: Array<ArtifactCreated>, nameToTarget: Map<string, Target>) {
+  async function checkSquirrelResult() {
+    const appInfo = packager.appInfo
+    const { zip, allFiles } = checkResult(expect, artifacts, "-full.nupkg")
+
+    // nuget.exe re-serializes the manifest when it packs (own schema namespace, element order, no <files>
+    // block), so the packed .nuspec is not byte-comparable with the rendered template. Assert the metadata
+    // fields that SquirrelWindowsTarget derives from the config instead.
+    const nuspecEntry = allFiles.find(it => it.endsWith(".nuspec"))
+    expect(nuspecEntry).toBeDefined()
+    const nuspec = zip.readAsText(nuspecEntry!).replace(/\r\n/g, "\n")
+
+    // XmlWriter escapes only these in text nodes (quotes are written verbatim)
+    const xmlText = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    const squirrelOptions: SquirrelWindowsOptions = packager.config.squirrelWindows ?? {}
+    const expectedId = squirrelOptions.useAppIdAsId ? appInfo.id : squirrelOptions.name || appInfo.name
+    const expectedAuthors = appInfo.companyName || ""
+    const expectedDescription = isEmptyOrSpaces(appInfo.description) ? squirrelOptions.name || appInfo.productName : appInfo.description
+    const expectedProjectUrl = await appInfo.computePackageUrl()
+
+    expect(nuspecEntry).toBe(`${expectedId}.nuspec`)
+    expect(nuspec).toContain(`<id>${xmlText(expectedId)}</id>`)
+    expect(nuspec).toContain(`<version>${convertVersion(appInfo.version)}</version>`)
+    expect(nuspec).toContain(`<title>${xmlText(appInfo.productName)}</title>`)
+    expect(nuspec).toContain(`<authors>${xmlText(expectedAuthors)}</authors>`)
+    expect(nuspec).toContain(`<owners>${xmlText(expectedAuthors)}</owners>`)
+    if (squirrelOptions.iconUrl != null) {
+      expect(nuspec).toContain(`<iconUrl>${xmlText(squirrelOptions.iconUrl)}</iconUrl>`)
+    }
+    expect(nuspec).toContain(`<description>${xmlText(expectedDescription)}</description>`)
+    expect(nuspec).toContain(`<copyright>${xmlText(appInfo.copyright)}</copyright>`)
+    if (expectedProjectUrl != null) {
+      // nuget.exe round-trips the URL through System.Uri, which appends "/" to a bare authority
+      // (http://foo.example.com -> http://foo.example.com/), so compare without a trailing slash
+      const projectUrl = /<projectUrl>([^<]*)<\/projectUrl>/.exec(nuspec)?.[1]
+      expect(projectUrl).toBeDefined()
+      expect(projectUrl!.replace(/\/$/, "")).toBe(xmlText(expectedProjectUrl).replace(/\/$/, ""))
+    } else {
+      expect(nuspec).not.toContain("<projectUrl>")
     }
   }
-  if (!squirrel) {
-    return
+
+  async function checkZipResult() {
+    const { packageFile, zip, allFiles } = checkResult(expect, artifacts, ".zip")
+
+    const executable = allFiles.filter(it => it.endsWith(".exe"))[0]
+    zip.extractEntryTo(executable, path.dirname(packageFile), true, true)
+    expect(await readAsarIntegrityFromExe(path.join(path.dirname(packageFile), executable))).toMatchSnapshot()
   }
 
-  const packageFile = artifacts.find(it => it.file!!.endsWith("-full.nupkg"))!.file!!
-  const unZipper = new DecompressZip(packageFile!!)
-  const fileDescriptors = await unZipper.getFiles()
+  const hasTarget = (target: string) => {
+    const targets = nameToTarget.get(target)
+    return targets != null
+  }
+  if (hasTarget("squirrel")) {
+    return checkSquirrelResult()
+  } else if (hasTarget("zip") && !(checkOptions.signedMac || checkOptions.signedWin)) {
+    return checkZipResult()
+  }
+}
+
+const checkResult = (expect: ExpectStatic, artifacts: Array<ArtifactCreated>, extension: string) => {
+  const packageFile = artifacts.find(it => it.file.endsWith(extension))!.file
+
+  const zip = new AdmZip(packageFile)
+  const zipEntries = zip.getEntries()
+  const allFiles: string[] = []
+  // https://github.com/thejoshwolfe/yauzl/blob/master/index.js#L900
+  const cp437 =
+    "\u0000☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕‼¶§▬↨↑↓→←∟↔▲▼ !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~⌂ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ "
+  const decodeBuffer = (buffer: Buffer, isUtf8: boolean) => {
+    if (isUtf8) {
+      return buffer.toString("utf8")
+    } else {
+      let result = ""
+      for (let i = 0; i < buffer.length; i++) {
+        result += cp437[buffer[i]]
+      }
+      return result
+    }
+  }
+
+  zipEntries.forEach(function (zipEntry) {
+    const isUtf8 = (zipEntry.header.flags & 0x800) !== 0
+    const name = decodeBuffer(zipEntry.rawEntryName, isUtf8)
+    allFiles.push(name)
+  })
 
   // we test app-update.yml separately, don't want to complicate general assert (yes, it is not good that we write app-update.yml for squirrel.windows if we build nsis and squirrel.windows in parallel, but as squirrel.windows is deprecated, it is ok)
   const files = pathSorter(
-    fileDescriptors
-      .map(it => toSystemIndependentPath(it.path))
+    allFiles
+      .map(it => toSystemIndependentPath(it))
       .filter(
         it =>
           (!it.startsWith("lib/net45/locales/") || it === "lib/net45/locales/en-US.pak") && !it.endsWith(".psmdcp") && !it.endsWith("app-update.yml") && !it.includes("/inspector/")
@@ -399,46 +994,64 @@ async function checkWindowsResult(packager: Packager, checkOptions: AssertPackOp
 
   expect(files).toMatchSnapshot()
 
-  if (checkOptions == null) {
-    await unZipper.extractFile(fileDescriptors.filter(it => it.path === "TestApp.nuspec")[0], {
-      path: path.dirname(packageFile),
-    })
-    const expectedSpec = (await fs.readFile(path.join(path.dirname(packageFile), "TestApp.nuspec"), "utf8")).replace(/\r\n/g, "\n")
-    // console.log(expectedSpec)
-    expect(expectedSpec).toEqual(`<?xml version="1.0"?>
-<package xmlns="http://schemas.microsoft.com/packaging/2011/08/nuspec.xsd">
-  <metadata>
-    <id>TestApp</id>
-    <version>${convertVersion(appInfo.version)}</version>
-    <title>${appInfo.productName}</title>
-    <authors>Foo Bar</authors>
-    <owners>Foo Bar</owners>
-    <iconUrl>https://raw.githubusercontent.com/szwacz/electron-boilerplate/master/resources/windows/icon.ico</iconUrl>
-    <requireLicenseAcceptance>false</requireLicenseAcceptance>
-    <description>Test Application (test quite “ #378)</description>
-    <copyright>Copyright © ${new Date().getFullYear()} Foo Bar</copyright>
-    <projectUrl>http://foo.example.com</projectUrl>
-  </metadata>
-</package>`)
-  }
+  return { packageFile, zip, allFiles }
 }
 
-export const execShell: any = promisify(require("child_process").exec)
+// runs a program without a shell; throws when it fails to start or exits non-zero
+function run(file: string, args: Array<string>, input?: Buffer): { stdout: Buffer; stderr: string } {
+  const result = spawnSync(file, args, { input, maxBuffer: 1024 * 1024 * 1024 })
+  if (result.error != null) {
+    throw result.error
+  }
+  if (result.status !== 0) {
+    throw new Error(`${file} ${args.join(" ")} exited with ${result.status}: ${result.stderr}`)
+  }
+  return { stdout: result.stdout, stderr: result.stderr.toString() }
+}
+
+/** `ar p <debFile> <member> | tar <tarArgs>`, returning tar's stdout */
+export async function extractDebMember(debFile: string, member: string, tarArgs: Array<string>): Promise<string> {
+  const { stdout: data } = run(await getArExecutable(), ["p", debFile, member])
+  return run(await getTarExecutable(), tarArgs, data).stdout.toString()
+}
 
 export async function getTarExecutable() {
-  return process.platform === "darwin" ? path.join(await getLinuxToolsPath(), "bin", "gtar") : "tar"
+  return process.platform === "darwin" ? path.join((await getArchiveToolsetBinDir(undefined, "")) ?? "", "gtar") : "tar"
+}
+
+export async function getArExecutable() {
+  if (process.platform === "darwin") {
+    return path.join((await getArchiveToolsetBinDir(undefined, "")) ?? "", "ar")
+  }
+  return "ar"
+}
+
+export async function resolveDebMember(debFile: string, memberPrefix: "data.tar." | "control.tar."): Promise<{ member: string; tarArgs: Array<string> }> {
+  const arExecutable = await getArExecutable()
+  const { stdout, stderr } = run(arExecutable, ["t", debFile])
+  const memberList = stdout.toString()
+  if (stderr.length > 0) {
+    throw new Error(`Failed to list members of ${debFile}: ${stderr}`)
+  }
+  const member = memberList
+    .trim()
+    .split("\n")
+    .find((m: string) => m.startsWith(memberPrefix))
+  if (member == null) throw new Error(`No ${memberPrefix}* member found in ${debFile}`)
+  const ext = member.slice(memberPrefix.length)
+  // Short flags (-J, -z, -j) are safe to concatenate; zstd requires a standalone long option
+  const tarArgs = [ext === "xz" ? "-J" : ext === "gz" ? "-z" : ext === "bz2" ? "-j" : ext === "zst" || ext === "zstd" ? "--zstd" : "-J"]
+  return { member, tarArgs }
+}
+
+export async function readDebCompression(debFile: string): Promise<string> {
+  const { member } = await resolveDebMember(debFile, "data.tar.")
+  return member.slice("data.tar.".length)
 }
 
 async function getContents(packageFile: string) {
-  const result = await execShell(`ar p '${packageFile}' data.tar.xz | ${await getTarExecutable()} -t -I'${path7x}'`, {
-    maxBuffer: 10 * 1024 * 1024,
-    env: {
-      ...process.env,
-      SZA_PATH: path7za,
-    },
-  })
-
-  const contents = parseFileList(result.stdout, true)
+  const { member, tarArgs } = await resolveDebMember(packageFile, "data.tar.")
+  const contents = parseFileList(await extractDebMember(packageFile, member, ["-t", ...tarArgs]), true)
   return pathSorter(contents.filter(it => !(it.includes(`/locales/`) || it.includes(`/libgcrypt`) || it.includes("/inspector/"))))
 }
 
@@ -461,7 +1074,7 @@ export async function modifyPackageJson(projectDir: string, task: (data: any) =>
   await fs.unlink(file)
 
   await fs.writeFile(path.join(projectDir, ".yarnrc.yml"), "nodeLinker: node-modules")
-  return await writeJson(file, data)
+  return await writeJson(file, data, { spaces: 2 })
 }
 
 export function platform(platform: Platform): PackagerOptions {
@@ -470,22 +1083,58 @@ export function platform(platform: Platform): PackagerOptions {
   }
 }
 
-export function signed(packagerOptions: PackagerOptions): PackagerOptions {
-  if (process.env.CSC_KEY_PASSWORD == null) {
-    log.warn({ reason: "CSC_KEY_PASSWORD is not defined" }, "macOS code signing is not tested")
-  } else {
-    if (packagerOptions.config == null) {
-      ;(packagerOptions as any).config = {}
-    }
-    ;(packagerOptions.config as any).cscLink = CSC_LINK
+/** Resolves the macOS signing identity used by the tests (real env cert if provided, else ephemeral self-signed). */
+export async function getMacSigningIdentity(): Promise<SelfSignedIdentity> {
+  const cscLink = process.env.CSC_LINK
+  const cscKeyPassword = process.env.CSC_KEY_PASSWORD
+  if (cscLink != null && cscKeyPassword != null) {
+    log.info({ reason: "CSC_LINK is defined" }, "using provided macOS code-signing identity")
+    return { commonName: "provided", p12Base64: cscLink, password: cscKeyPassword }
   }
-  return packagerOptions
+  return await macSigningCredentialsInfo.value
 }
 
-export function createMacTargetTest(target: Array<MacOsTargetName>, config?: Configuration, isSigned = true) {
+export async function getWindowsSigningIdentity(): Promise<SelfSignedIdentity> {
+  const cscLink = process.env.CSC_LINK || process.env.WIN_CSC_LINK
+  const cscKeyPassword = process.env.CSC_KEY_PASSWORD || process.env.WIN_CSC_KEY_PASSWORD
+  if (cscLink != null && cscKeyPassword != null) {
+    log.info({ reason: cscLink != null ? "CSC_LINK is defined" : "WIN_CSC_LINK is defined" }, "using provided Windows code-signing identity")
+    return { commonName: "provided", p12Base64: cscLink, password: cscKeyPassword }
+  }
+  return await winSigningCredentialsInfo.value
+}
+
+/**
+ * The `publisherName` a Windows build signed with getWindowsSigningIdentity (`signedWin`) writes to app-update.yml when none is
+ * configured: `CN=<common name>` of its certificate. A certificate provided via CSC_LINK / WIN_CSC_LINK has one the tests don't know.
+ */
+export async function expectedWindowsPublisherName(expect: ExpectStatic): Promise<Array<unknown>> {
+  const { commonName } = await getWindowsSigningIdentity()
+  return commonName === "provided" ? [expect.any(String)] : [WIN_SIGNING_PUBLISHER_NAME]
+}
+
+async function signed(packagerOptions: PackagerOptions, platform: "win" | "mac"): Promise<PackagerOptions> {
+  if (platform === "mac" && process.platform !== "darwin") {
+    // codesign only runs on macOS; off-darwin the build is left unsigned (mac signing tests are .ifMac-gated).
+    // Also avoids generating a self-signed identity (and spawning openssl) where it isn't available — e.g. the
+    // minimal Linux package-manager updater containers that have no openssl on PATH.
+    return packagerOptions
+  }
+  // electron-builder skips macOS code signing on pull-request CI builds (isSignAllowed → isPullRequest, a
+  // security guard for forked PRs). GitHub sets GITHUB_BASE_REF on pull_request events, so without this the
+  // app comes out unsigned and the signing assertions fail with "code object is not signed at all". These are
+  // our own builds with an ephemeral identity, so opt back into signing for the test.
+  process.env.CSC_FOR_PULL_REQUEST = "true"
+  const { p12Base64, password } = platform === "mac" ? await getMacSigningIdentity() : await getWindowsSigningIdentity()
+  const options = deepAssign<PackagerOptions>({}, packagerOptions, { config: { cscLink: p12Base64, cscKeyPassword: password } })
+  return options
+}
+
+export function createMacTargetTest(expect: ExpectStatic, target: Array<MacOsTargetName>, config?: Configuration, isSigned = true) {
   return app(
+    expect,
     {
-      targets: Platform.MAC.createTarget(),
+      targets: Platform.MAC.createTarget(target, Arch.x64),
       config: {
         extraMetadata: {
           repository: "foo/bar",
@@ -498,7 +1147,7 @@ export function createMacTargetTest(target: Array<MacOsTargetName>, config?: Con
       },
     },
     {
-      signed: isSigned,
+      signedMac: isSigned,
       packed: async context => {
         if (!target.includes("tar.gz")) {
           return
@@ -506,32 +1155,35 @@ export function createMacTargetTest(target: Array<MacOsTargetName>, config?: Con
 
         const tempDir = await context.tmpDir.createTempDir({ prefix: "mac-target-test" })
         await exec("tar", ["xf", path.join(context.outDir, "Test App ßW-1.1.0-mac.tar.gz")], { cwd: tempDir })
-        await assertThat(path.join(tempDir, "Test App ßW.app")).isDirectory()
+        await assertThat(expect, path.join(tempDir, "Test App ßW.app")).isDirectory()
       },
     }
   )
 }
 
-export async function checkDirContents(dir: string) {
+export async function checkDirContents(expect: ExpectStatic, dir: string) {
   expect((await walk(dir, file => !path.basename(file).startsWith("."))).map(it => toSystemIndependentPath(it.substring(dir.length + 1)))).toMatchSnapshot()
 }
 
 export function removeUnstableProperties(data: any) {
   return JSON.parse(
     JSON.stringify(data, (name, value) => {
-      if (name.includes("size") || name.includes("Size") || name.startsWith("sha") || name === "releaseDate") {
+      // `signature`/`keyId`: Ed25519 update-manifest signatures over hashes/sizes and the (runtime-generated) key's id
+      if (name.includes("size") || name.includes("Size") || name.startsWith("sha") || name === "releaseDate" || name === "signature" || name === "keyId") {
         // to ensure that some property exists
         return `@${name}`
+      }
+      // Keep existing test coverage
+      if (value.integrity) {
+        delete value.integrity
       }
       return value
     })
   )
 }
 
-export async function verifyAsarFileTree(resourceDir: string) {
-  const fs = await readAsar(path.join(resourceDir, "app.asar"))
-  // console.log(resourceDir + " " + JSON.stringify(fs.header, null, 2))
-  expect(fs.header).toMatchSnapshot()
+export async function verifyAsarFileTree(expect: ExpectStatic, resourceDir: string) {
+  return _verifyAsarFileTree(expect, resourceDir)
 }
 
 export function toSystemIndependentPath(s: string): string {

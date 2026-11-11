@@ -38,6 +38,13 @@ export interface PackageFileInfo extends BlockMapDataHolder {
 
 export interface UpdateFileInfo extends BlockMapDataHolder {
   url: string
+
+  /**
+   * URL of the file's blockmap, for a blockmap that is not at `${url}.blockmap` with the file's query string (e.g. a separately
+   * pre-signed URL). A relative value is resolved like `url` (against the feed URL); an absolute URL is used as-is, with its own host and query. Not written by
+   * electron-builder; covered by the manifest signature when present.
+   */
+  blockMapUrl?: string
 }
 
 export interface UpdateInfo {
@@ -48,11 +55,19 @@ export interface UpdateInfo {
 
   readonly files: Array<UpdateFileInfo>
 
-  /** @deprecated */
-  readonly path: string
+  /**
+   * Legacy top-level download descriptor for electron-updater 1.x – 2.15.0. Modern clients read `files`.
+   * Only emitted when `electronUpdaterCompatibility` includes legacy clients, so it may be absent.
+   * @deprecated
+   */
+  readonly path?: string
 
-  /** @deprecated */
-  readonly sha512: string
+  /**
+   * Legacy top-level checksum for electron-updater 1.x – 2.15.0. Modern clients read `files[].sha512`.
+   * Only emitted when `electronUpdaterCompatibility` includes legacy clients, so it may be absent.
+   * @deprecated
+   */
+  readonly sha512?: string
 
   /**
    * The release name.
@@ -70,13 +85,56 @@ export interface UpdateInfo {
   releaseDate: string
 
   /**
-   * The [staged rollout](/auto-update#staged-rollouts) percentage, 0-100.
+   * The [staged rollout](https://www.electron.build/docs/features/auto-update#staged-rollouts) percentage, 0-100.
    */
   readonly stagingPercentage?: number
+
+  /**
+   * The minimum version of system required for the app to run. Sample value: macOS `23.1.0`, Windows `10.0.22631`.
+   * Same with os.release() value, this is a kernel version.
+   */
+  readonly minimumSystemVersion?: string
+
+  /**
+   * Base64-encoded Ed25519 signature over the manifest's integrity-critical fields, populated at
+   * publish time when update manifest signing is enabled. Verified by electron-updater against the
+   * configured `updateManifestPublicKey` before any download starts. See `canonicalizeForSigning`.
+   *
+   * Always the signature of the *first* configured signing key; `signatures` carries the same value
+   * (tagged with its key id) plus one entry per additional signing key. Kept so updaters that only know
+   * this single-signature form keep verifying.
+   */
+  readonly signature?: string
+
+  /**
+   * One Ed25519 signature per signing key the manifest was signed with, each tagged with the id of the
+   * key that produced it (see `computeUpdateManifestKeyId`). All entries sign the same canonical payload.
+   * A manifest carrying several entries is "dual-signed": an install verifies it as long as *any* of its
+   * trusted keys matches *any* entry, which is what makes key rotation possible without a flag day.
+   */
+  readonly signatures?: Array<UpdateManifestSignature>
+}
+
+export interface UpdateManifestSignature {
+  /** Lowercase hex SHA-256 of the SPKI DER encoding of the signing key's public half. */
+  readonly keyId: string
+  /** Base64-encoded Ed25519 signature over the canonical manifest payload. */
+  readonly signature: string
 }
 
 export interface WindowsUpdateInfo extends UpdateInfo {
   packages?: { [arch: string]: PackageFileInfo } | null
+
+  /**
+   * Whether electron-updater's default Authenticode verification accepts a valid signature that Windows reports from a security catalog
+   * for this update's installer, when the catalog signer matches `publisherName` (like `NsisUpdater.allowCatalogSignature`, for this
+   * update only). Written by electron-builder for `win.allowCatalogSignature: true`.
+   *
+   * electron-updater honors it only when the signature of this manifest was verified against a trusted key (`updateManifestPublicKey`);
+   * otherwise it is ignored with a warning. When `true` it is covered by the manifest signature, so changing it means signing the manifest
+   * again. A value that is not a boolean makes a signed manifest invalid.
+   */
+  readonly allowCatalogSignature?: boolean
 
   /**
    * @deprecated

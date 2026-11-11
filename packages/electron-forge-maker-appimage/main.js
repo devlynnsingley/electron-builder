@@ -1,13 +1,18 @@
-"use strict"
+import { ElectronBuilderForgeMaker, withLegacyForgeCall } from "app-builder-lib"
 
-Object.defineProperty(exports, "__esModule", {
-  value: true
-})
+class MakerAppImage extends ElectronBuilderForgeMaker {
+  name = "appimage"
+  defaultPlatforms = ["linux"]
 
-const buildForge = require("app-builder-lib").buildForge
-
-exports.isSupportedOnCurrentPlatform = () => Promise.resolve(true)
-
-exports.default = function (options) {
-  return buildForge(options, {linux: [`appimage:${options.targetArch}`]})
+  getTarget(targetArch, config) {
+    return { linux: [`appimage:${targetArch}`], config: { appImage: config } }
+  }
 }
+
+const Maker = withLegacyForgeCall(MakerAppImage)
+
+export { Maker as MakerAppImage }
+export default Maker
+
+// Electron Forge 5 checked this on the module
+export const isSupportedOnCurrentPlatform = () => Promise.resolve(true)

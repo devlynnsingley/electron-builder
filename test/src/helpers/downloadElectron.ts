@@ -1,9 +1,14 @@
+import { createRequire } from "node:module"
+import { fileURLToPath } from "node:url"
 import { isCI as isCi } from "ci-info"
-import * as path from "path"
 import * as fs from "fs/promises"
-import { ELECTRON_VERSION, getElectronCacheDir } from "./testConfig"
+import * as path from "path"
+import { coerce, gte, major } from "semver"
+import { ELECTRON_VERSION, getElectronCacheDir } from "./testConfig.js"
 
-const executeAppBuilder: (options: any) => Promise<any> = require(path.join(__dirname, "../../..", "packages/builder-util")).executeAppBuilder
+const require = createRequire(import.meta.url)
+
+const executeAppBuilder: (options: any) => Promise<any> = require(path.join(import.meta.dirname, "../../..", "packages/builder-util")).executeAppBuilder
 
 export async function deleteOldElectronVersion(): Promise<any> {
   // on CircleCi no need to clean manually
@@ -15,7 +20,7 @@ export async function deleteOldElectronVersion(): Promise<any> {
   let files: Array<string>
   try {
     files = await fs.readdir(cacheDir)
-  } catch (e) {
+  } catch (e: any) {
     if (e.code === "ENOENT") {
       return
     } else {
@@ -41,13 +46,24 @@ export function downloadAllRequiredElectronVersions(): Promise<any> {
 
   const versions: Array<any> = []
   for (const platform of platforms) {
-    const archs =
+    const archs: string[] =
       platform === "mas" || platform === "darwin"
         ? ["x64"]
         : platform === "win32"
-        ? ["ia32", "x64"]
-        : require(`${path.join(__dirname, "../../..")}/packages/builder-util/out/util`).getArchCliNames()
+          ? ["ia32", "x64"]
+          : require(`${path.join(import.meta.dirname, "../../..")}/packages/builder-util/dist/util.js`).getArchCliNames()
     for (const arch of archs) {
+      if (gte(ELECTRON_VERSION, "19.0.0") && platform === "linux" && arch === "ia32") {
+        // Chromium dropped support for ia32 linux binaries in 102.0.4999.0
+        // https://www.electronjs.org/docs/latest/breaking-changes#removed-ia32-linux-binaries
+        continue
+      }
+      // semver major on the coerced version: the removal covers the whole 44 line including 44.0.0-alpha.x prereleases
+      if (major(coerce(ELECTRON_VERSION)!) >= 44 && ((platform === "win32" && arch === "ia32") || (platform === "linux" && arch === "armv7l"))) {
+        // Electron 44 removed Windows ia32 and Linux armv7l builds
+        // https://github.com/electron/electron/pull/51816
+        continue
+      }
       versions.push({
         version: ELECTRON_VERSION,
         arch,
@@ -58,7 +74,7 @@ export function downloadAllRequiredElectronVersions(): Promise<any> {
   return executeAppBuilder(["download-electron", "--configuration", JSON.stringify(versions)])
 }
 
-if (require.main === module) {
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
   downloadAllRequiredElectronVersions().catch(error => {
     console.error((error.stack || error).toString())
     process.exitCode = -1

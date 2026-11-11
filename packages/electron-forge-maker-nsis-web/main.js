@@ -1,13 +1,18 @@
-"use strict"
+import { ElectronBuilderForgeMaker, withLegacyForgeCall } from "app-builder-lib"
 
-Object.defineProperty(exports, "__esModule", {
-  value: true
-})
+class MakerNsisWeb extends ElectronBuilderForgeMaker {
+  name = "nsis-web"
+  defaultPlatforms = ["win32"]
 
-const buildForge = require("app-builder-lib").buildForge
-
-exports.isSupportedOnCurrentPlatform = () => Promise.resolve(true)
-
-exports.default = function (options) {
-  return buildForge(options, {win: [`nsis-web:${options.targetArch}`]})
+  getTarget(targetArch, config) {
+    return { win: [`nsis-web:${targetArch}`], config: { nsisWeb: config } }
+  }
 }
+
+const Maker = withLegacyForgeCall(MakerNsisWeb)
+
+export { Maker as MakerNsisWeb }
+export default Maker
+
+// Electron Forge 5 checked this on the module
+export const isSupportedOnCurrentPlatform = () => Promise.resolve(true)

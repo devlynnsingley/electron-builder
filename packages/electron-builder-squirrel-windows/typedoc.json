@@ -1,0 +1,11 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "includeVersion": true,
+  "entryPoints": [
+    "src/SquirrelWindowsTarget.ts"
+  ],
+  "validation": {
+    "notExported": false,
+    "invalidLink": false
+  }
+}

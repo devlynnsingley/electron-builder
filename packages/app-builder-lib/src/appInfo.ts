@@ -1,9 +1,10 @@
 import { isEmptyOrSpaces, log } from "builder-util"
-import { prerelease, SemVer } from "semver"
-import { PlatformSpecificBuildOptions } from "./options/PlatformSpecificBuildOptions"
-import { Packager } from "./packager"
-import { expandMacro } from "./util/macroExpander"
-import { sanitizeFileName } from "./util/sanitizeFileName"
+import { sanitizeFileName } from "builder-util/internal"
+import { Nullish } from "builder-util-runtime"
+import { prerelease } from "semver"
+import { PlatformSpecificBuildOptions } from "./options/PlatformSpecificBuildOptions.js"
+import { Packager } from "./packager.js"
+import { expandMacro } from "./util/macroExpander.js"
 
 // fpm bug - rpm build --description is not escaped, well... decided to replace quite to smart quote
 // http://leancrew.com/all-this/2010/11/smart-quotes-in-javascript/
@@ -20,8 +21,9 @@ export function smarten(s: string): string {
 }
 
 export class AppInfo {
-  readonly description = smarten(this.info.metadata.description || "")
+  readonly description: string
   readonly version: string
+  readonly type: string | undefined
   readonly shortVersion: string | undefined
   readonly shortVersionWindows: string | undefined
 
@@ -32,20 +34,27 @@ export class AppInfo {
   readonly sanitizedProductName: string
   readonly productFilename: string
 
-  constructor(private readonly info: Packager, buildVersion: string | null | undefined, private readonly platformSpecificOptions: PlatformSpecificBuildOptions | null = null) {
+  constructor(
+    private readonly info: Packager,
+    buildVersion: string | Nullish,
+    private readonly platformSpecificOptions: PlatformSpecificBuildOptions | null = null
+  ) {
+    this.description = smarten(this.info.metadata.description || "")
     this.version = info.metadata.version!
+    this.type = info.metadata.type
 
     if (buildVersion == null) {
       buildVersion = info.config.buildVersion
     }
 
-    this.buildNumber =
+    const buildNumberEnvs =
       process.env.BUILD_NUMBER ||
       process.env.TRAVIS_BUILD_NUMBER ||
       process.env.APPVEYOR_BUILD_NUMBER ||
       process.env.CIRCLE_BUILD_NUM ||
       process.env.BUILD_BUILDNUMBER ||
       process.env.CI_PIPELINE_IID
+    this.buildNumber = info.config.buildNumber || buildNumberEnvs
     if (buildVersion == null) {
       buildVersion = this.version
       if (!isEmptyOrSpaces(this.buildNumber)) {
@@ -63,7 +72,9 @@ export class AppInfo {
 
     this.productName = info.config.productName || info.metadata.productName || info.metadata.name!
     this.sanitizedProductName = sanitizeFileName(this.productName)
-    this.productFilename = platformSpecificOptions?.executableName != null ? sanitizeFileName(platformSpecificOptions.executableName) : this.sanitizedProductName
+
+    const executableName = platformSpecificOptions?.executableName ?? info.config.executableName
+    this.productFilename = executableName != null ? sanitizeFileName(executableName) : this.sanitizedProductName
   }
 
   get channel(): string | null {
@@ -75,13 +86,25 @@ export class AppInfo {
   }
 
   getVersionInWeirdWindowsForm(isSetBuildNumber = true): string {
-    const parsedVersion = new SemVer(this.version)
+    const [major, maybe_minor, maybe_patch] = this.version.split(".").map(versionPart => parseInt(versionPart))
+    // The major component must be present. Here it can be either NaN or undefined, which
+    // both returns true from isNaN.
+    if (isNaN(major)) {
+      throw new Error(`Invalid major number in: ${this.version}`)
+    }
+    // Allow missing version parts. Minor and patch can be left out and default to zero
+    const minor = maybe_minor ?? 0
+    const patch = maybe_patch ?? 0
+    // ... but reject non-integer version parts. '1.a' is not going to fly
+    if (isNaN(minor) || isNaN(patch)) {
+      throw new Error(`Invalid minor or patch number in: ${this.version}`)
+    }
     // https://github.com/electron-userland/electron-builder/issues/2635#issuecomment-371792272
     let buildNumber = isSetBuildNumber ? this.buildNumber : null
     if (buildNumber == null || !/^\d+$/.test(buildNumber)) {
       buildNumber = "0"
     }
-    return `${parsedVersion.major}.${parsedVersion.minor}.${parsedVersion.patch}.${buildNumber}`
+    return `${major}.${minor}.${patch}.${buildNumber}`
   }
 
   private get notNullDevMetadata() {
@@ -94,7 +117,7 @@ export class AppInfo {
   }
 
   get id(): string {
-    let appId: string | null | undefined = null
+    let appId: string | Nullish = null
     for (const options of [this.platformSpecificOptions, this.info.config]) {
       if (options != null && appId == null) {
         appId = options.appId

@@ -1,9 +1,8 @@
-import { Configuration } from "../configuration"
+import { Configuration } from "../configuration.js"
 
 export interface Metadata {
   /**
-   * The application name.
-   * @required
+   * The application name. Required.
    */
   readonly name?: string
 
@@ -37,9 +36,11 @@ export interface Metadata {
   readonly build?: Configuration
 
   /** @private */
-  readonly dependencies?: { [key: string]: string }
+  readonly dependencies?: Record<string, string>
   /** @private */
   readonly version?: string
+  /** @private */
+  readonly type?: string
   /** @private */
   readonly shortVersion?: string | null
   /** @private */
@@ -48,6 +49,8 @@ export interface Metadata {
   readonly productName?: string | null
   /** @private */
   readonly main?: string | null
+  /** @private */
+  readonly desktopName?: string | null
 }
 
 export interface AuthorMetadata {

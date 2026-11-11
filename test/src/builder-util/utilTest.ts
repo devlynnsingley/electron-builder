@@ -1,0 +1,736 @@
+import { expandDefaultKeyword, parseValidEnvVarUrl, resolveDefaultKeywordList } from "builder-util/internal"
+import { resolveEnvShellValue, validateShellEmbeddable } from "builder-util/src/envUtil"
+import { exec, removePassword, removePasswordFromArgs, filterSensitiveEnv, spawnAndWrite, spawnAndWriteWithOutput, ExecError, getPlatformIconFileName } from "builder-util"
+import { execFile, ExecFileException } from "child_process"
+import * as path from "path"
+import { inspect } from "util"
+import { afterEach, beforeEach, expect, vi } from "vitest"
+
+// Every process below really runs; a test replaces a single launch to fail it the way the OS does
+vi.mock("child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("child_process")>()
+  return { ...actual, execFile: vi.fn(actual.execFile) }
+})
+
+const testValue = "secretValue"
+const testQuoted = "secret with spaces"
+
+// Fingerprints are keyed per process, so snapshots show where one stands, not its value
+const FINGERPRINT_PATTERN = /[a-f0-9]{32} \(redacted fingerprint\)/g
+const withoutFingerprints = (text: string) => text.replace(FINGERPRINT_PATTERN, "<fingerprint>")
+
+const keys = ["--accessKey", "--secretKey", "-p", "-pass", "-String", "/p", "pass:"]
+
+describe("getPlatformIconFileName", () => {
+  test.each([
+    ["icon", true, "icon.icns"],
+    ["icon.ico", true, "icon.icns"],
+    ["icon.ICO", true, "icon.icns"],
+    ["icon.icns", false, "icon.ico"],
+    ["assets/.ico-cache/icon.png", true, "assets/.ico-cache/icon.png"],
+  ])("maps %s for isMac=%s", (value, isMac, expected) => {
+    expect(getPlatformIconFileName(value, isMac)).toBe(expected)
+  })
+})
+
+keys.forEach(key => {
+  describe(`removePassword: ${key}`, () => {
+    test("handles unquoted value (snapshot)", ({ expect }) => {
+      const input = `${key} ${testValue}`
+      const output = removePassword(input)
+
+      expect(withoutFingerprints(output)).toMatchSnapshot()
+    })
+
+    test("handles double-quoted value (snapshot)", ({ expect }) => {
+      const input = `${key} "${testQuoted}"`
+      const output = removePassword(input)
+
+      expect(withoutFingerprints(output)).toMatchSnapshot()
+    })
+
+    test("handles single-quoted value (snapshot)", ({ expect }) => {
+      const input = `${key} '${testQuoted}'`
+      const output = removePassword(input)
+
+      expect(withoutFingerprints(output)).toMatchSnapshot()
+    })
+
+    if (key === "/p") {
+      test("handles Mac host path without hashing (snapshot)", ({ expect }) => {
+        const macPath = "\\\\Mac\\Host\\Users\\user"
+        const input = `${key} ${macPath}`
+        const output = removePassword(input)
+
+        expect(withoutFingerprints(output)).toMatchSnapshot()
+      })
+    }
+  })
+})
+
+describe("removePassword: /b … /c block", () => {
+  test("handles /b … /c block (snapshot)", ({ expect }) => {
+    const secret = "blockSecret"
+    const input = `/b ${secret} /c`
+    const output = removePassword(input)
+
+    expect(withoutFingerprints(output)).toMatchSnapshot()
+  })
+})
+
+describe("validateEnvVarUrl", () => {
+  const VAR = "TEST_VALIDATE_URL_VAR"
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  test("returns null when env var is not set", ({ expect }) => {
+    delete process.env[VAR]
+    expect(parseValidEnvVarUrl(VAR)).toBeNull()
+  })
+
+  test("throws when value is not a valid URL", ({ expect }) => {
+    vi.stubEnv(VAR, "not-a-url")
+    expect(() => parseValidEnvVarUrl(VAR)).toThrow(`${VAR} is not a valid URL`)
+  })
+
+  test("throws when protocol is http for external host (default allowHttp=false)", ({ expect }) => {
+    vi.stubEnv(VAR, "http://example.com/")
+    expect(() => parseValidEnvVarUrl(VAR)).toThrow(`${VAR} must use https://`)
+  })
+
+  test("throws when protocol is file", ({ expect }) => {
+    vi.stubEnv(VAR, "file:///etc/passwd")
+    expect(() => parseValidEnvVarUrl(VAR)).toThrow(`${VAR} must use https://`)
+  })
+
+  test("returns the URL string for a valid https URL", ({ expect }) => {
+    vi.stubEnv(VAR, "https://mirror.example.com/")
+    expect(parseValidEnvVarUrl(VAR)).toBe("https://mirror.example.com/")
+  })
+
+  test("returns the URL string unchanged when it has a path and query", ({ expect }) => {
+    vi.stubEnv(VAR, "https://mirror.example.com/path?q=1")
+    expect(parseValidEnvVarUrl(VAR)).toBe("https://mirror.example.com/path?q=1")
+  })
+
+  test("allows http for localhost by default (local dev exemption)", ({ expect }) => {
+    vi.stubEnv(VAR, "http://localhost:8080/mirror/")
+    expect(parseValidEnvVarUrl(VAR)).toBe("http://localhost:8080/mirror/")
+  })
+
+  test("allows http for 127.0.0.1 by default (loopback exemption)", ({ expect }) => {
+    vi.stubEnv(VAR, "http://127.0.0.1:3000/")
+    expect(parseValidEnvVarUrl(VAR)).toBe("http://127.0.0.1:3000/")
+  })
+
+  test("allows http for [::1] by default (IPv6 loopback exemption)", ({ expect }) => {
+    vi.stubEnv(VAR, "http://[::1]:9000/")
+    expect(parseValidEnvVarUrl(VAR)).toBe("http://[::1]:9000/")
+  })
+
+  test("allows http for external host when allowHttp=true (air-gapped opt-in)", ({ expect }) => {
+    vi.stubEnv(VAR, "http://internal-mirror.corp.example/")
+    expect(parseValidEnvVarUrl(VAR, true)).toBe("http://internal-mirror.corp.example/")
+  })
+})
+
+describe("removePassword: word boundary protection", () => {
+  test("does not redact -path argument", ({ expect }) => {
+    const input = "tool -path /some/dir"
+    expect(removePassword(input)).toBe(input)
+  })
+
+  test("does not redact -pid argument", ({ expect }) => {
+    const input = "tool -pid 1234"
+    expect(removePassword(input)).toBe(input)
+  })
+
+  test("does not redact -StringLength argument", ({ expect }) => {
+    const input = "tool -StringLength 10"
+    expect(removePassword(input)).toBe(input)
+  })
+
+  test("does not redact a bare file path containing /p", ({ expect }) => {
+    const input = "/path/to/file"
+    expect(removePassword(input)).toBe(input)
+  })
+
+  test("redacts -passphrase argument", ({ expect }) => {
+    const input = "tool -passphrase secret"
+    expect(removePassword(input)).not.toContain("secret")
+  })
+
+  test("still redacts -p when it is a standalone flag", ({ expect }) => {
+    const input = "tool -p secret"
+    expect(removePassword(input)).not.toContain("secret")
+  })
+
+  test("still redacts /p when preceded by whitespace", ({ expect }) => {
+    const input = "tool /p secret"
+    expect(removePassword(input)).not.toContain("secret")
+  })
+})
+
+describe("removePassword: case-insensitive flag matching", () => {
+  const secret = "caseSecret"
+
+  test("redacts -P (uppercase variant of -p)", ({ expect }) => {
+    expect(removePassword(`-P ${secret}`)).not.toContain(secret)
+  })
+
+  test("redacts -PASS (uppercase variant of -pass)", ({ expect }) => {
+    expect(removePassword(`-PASS ${secret}`)).not.toContain(secret)
+  })
+
+  test("redacts -STRING (uppercase variant of -String)", ({ expect }) => {
+    expect(removePassword(`-STRING ${secret}`)).not.toContain(secret)
+  })
+
+  test("redacts --ACCESSKEY (uppercase variant of --accessKey)", ({ expect }) => {
+    expect(removePassword(`--ACCESSKEY ${secret}`)).not.toContain(secret)
+  })
+})
+
+describe("removePassword: pass: colon-separator style", () => {
+  test("redacts pass:value with no space (OpenSSL style)", ({ expect }) => {
+    // -pass is NOT in the input, so the pass: pattern handles it directly
+    const output = removePassword("enc pass:topsecret --other")
+    expect(output).not.toContain("topsecret")
+    expect(output).toContain("pass:")
+    expect(output).toContain("(redacted fingerprint)")
+  })
+
+  test("redacts pass: value with space", ({ expect }) => {
+    const output = removePassword("pass: spaced")
+    expect(output).not.toContain("spaced")
+    expect(output).toContain("(redacted fingerprint)")
+  })
+})
+
+const FINGERPRINT_RE = /^[a-f0-9]{32} \(redacted fingerprint\)$/
+
+describe("filterSensitiveEnv", () => {
+  test("redacts values for keys containing KEY", ({ expect }) => {
+    const result = filterSensitiveEnv({ MY_API_KEY: "abc123" })
+    expect(result.MY_API_KEY).toMatch(FINGERPRINT_RE)
+  })
+
+  test("redacts values for keys containing TOKEN", ({ expect }) => {
+    const result = filterSensitiveEnv({ GITHUB_TOKEN: "ghp_secret" })
+    expect(result.GITHUB_TOKEN).toMatch(FINGERPRINT_RE)
+  })
+
+  test("redacts values for keys containing SECRET", ({ expect }) => {
+    const result = filterSensitiveEnv({ AWS_SECRET_ACCESS_KEY: "secret" })
+    expect(result.AWS_SECRET_ACCESS_KEY).toMatch(FINGERPRINT_RE)
+  })
+
+  test("redacts values for keys containing PASSWORD", ({ expect }) => {
+    const result = filterSensitiveEnv({ DB_PASSWORD: "hunter2" })
+    expect(result.DB_PASSWORD).toMatch(FINGERPRINT_RE)
+  })
+
+  test("is case-insensitive on the key name", ({ expect }) => {
+    const result = filterSensitiveEnv({ api_key: "secret", Auth_Token: "tok" })
+    expect(result.api_key).toMatch(FINGERPRINT_RE)
+    expect(result.Auth_Token).toMatch(FINGERPRINT_RE)
+  })
+
+  test("does not redact values for non-sensitive keys", ({ expect }) => {
+    const result = filterSensitiveEnv({ NODE_ENV: "production", PATH: "/usr/bin" })
+    expect(result.NODE_ENV).toBe("production")
+    expect(result.PATH).toBe("/usr/bin")
+  })
+
+  test("replaces the entire value, not just the sensitive substring within it", ({ expect }) => {
+    // The value itself contains 'password' — only the key triggers redaction.
+    // The entire value must be replaced with a fingerprint, not "thisismy<hash>".
+    const result = filterSensitiveEnv({ DB_PASSWORD: "thisismypassword" })
+    expect(result.DB_PASSWORD).toMatch(FINGERPRINT_RE)
+  })
+
+  test("handles a mixed env object, redacting only sensitive keys", ({ expect }) => {
+    const result = filterSensitiveEnv({
+      HOME: "/home/user",
+      GITHUB_TOKEN: "tok",
+      NODE_ENV: "test",
+      MY_API_KEY: "key123",
+    })
+    expect(result.HOME).toBe("/home/user")
+    expect(result.NODE_ENV).toBe("test")
+    expect(result.GITHUB_TOKEN).toMatch(FINGERPRINT_RE)
+    expect(result.MY_API_KEY).toMatch(FINGERPRINT_RE)
+  })
+
+  test("redacts values for keys containing CSC (code-signing certificate vars)", ({ expect }) => {
+    const result = filterSensitiveEnv({ CSC_LINK: "https://example.com/cert.p12" })
+    expect(result.CSC_LINK).toMatch(FINGERPRINT_RE)
+  })
+
+  test("redacts values for WIN_CSC_LINK", ({ expect }) => {
+    const result = filterSensitiveEnv({ WIN_CSC_LINK: "/path/to/cert.pfx" })
+    expect(result.WIN_CSC_LINK).toMatch(FINGERPRINT_RE)
+  })
+
+  test("redacts values for keys containing CREDENTIAL", ({ expect }) => {
+    const result = filterSensitiveEnv({ DB_CREDENTIAL: "s3cr3t" })
+    expect(result.DB_CREDENTIAL).toMatch(FINGERPRINT_RE)
+  })
+
+  test("does not redact unrelated LINK or CSC-free vars", ({ expect }) => {
+    const result = filterSensitiveEnv({ GITHUB_LINK: "https://github.com", ELECTRON_CACHE: "/tmp" })
+    expect(result.GITHUB_LINK).toBe("https://github.com")
+    expect(result.ELECTRON_CACHE).toBe("/tmp")
+  })
+})
+
+describe("removePassword: multiple keys in one string", () => {
+  test("handles two keys unquoted (snapshot)", ({ expect }) => {
+    const input = `--accessKey key1 --secretKey key2`
+    const output = removePassword(input)
+
+    expect(withoutFingerprints(output)).toMatchSnapshot()
+  })
+
+  test("handles mixed quoted and unquoted keys (snapshot)", ({ expect }) => {
+    const input = `-p 'quoted secret' -pass unquoted`
+    const output = removePassword(input)
+
+    expect(withoutFingerprints(output)).toMatchSnapshot()
+  })
+
+  test("handles several keys and /b … /c block (snapshot)", ({ expect }) => {
+    const input = `pass: val1 --accessKey "val two" /b blockpass /c`
+    const output = removePassword(input)
+
+    expect(withoutFingerprints(output)).toMatchSnapshot()
+  })
+})
+
+describe("removePassword: -k / -key single-letter and pkcs11 stems (string form, e.g. echoed in stderr)", () => {
+  test("redacts `security … -k <password>`", ({ expect }) => {
+    const out = removePassword("security set-key-partition-list -S apple-tool:,apple: -s -k topSecretPw /Users/x/build.keychain")
+    expect(out).not.toContain("topSecretPw")
+    expect(out).toContain("/Users/x/build.keychain")
+  })
+
+  test("redacts a `-key` pkcs11 URI (hides an embedded pin-value)", ({ expect }) => {
+    const out = removePassword("osslsigncode -key pkcs11:token=t;object=k?pin-value=9999 -in app.exe")
+    expect(out).not.toContain("9999")
+    expect(out).not.toContain("pin-value")
+  })
+
+  test("does not redact `-keychain <path>` (word boundary)", ({ expect }) => {
+    const input = "security -keychain /Users/x/login.keychain"
+    expect(removePassword(input)).toBe(input)
+  })
+})
+
+describe("removePasswordFromArgs (per-argument redaction)", () => {
+  test("hashes a whitespace-containing password in full — no tail leak", ({ expect }) => {
+    const out = removePasswordFromArgs(["signtool", "-P", "my pass phrase", "/some/keychain"])
+    expect(out).not.toContain("pass phrase")
+    expect(out).not.toContain("my pass")
+    // the trailing non-secret argument is preserved
+    expect(out).toContain("/some/keychain")
+  })
+
+  test("redacts a whitespace-containing value for -pass / --accessKey too", ({ expect }) => {
+    expect(removePasswordFromArgs(["osslsigncode", "-pass", "spaced secret value"])).not.toContain("secret value")
+    expect(removePasswordFromArgs(["tool", "--accessKey", "two word key"])).not.toContain("word key")
+  })
+
+  test("redacts `security … -k <password>` keychain value", ({ expect }) => {
+    const out = removePasswordFromArgs(["security", "set-key-partition-list", "-S", "apple-tool:,apple:", "-s", "-k", "topSecretPw", "/Users/x/build.keychain"])
+    expect(out).not.toContain("topSecretPw")
+    expect(out).toContain("/Users/x/build.keychain")
+  })
+
+  test("redacts the whole -key pkcs11 URI including an embedded pin-value", ({ expect }) => {
+    const out = removePasswordFromArgs(["osslsigncode", "-key", "pkcs11:token=t;object=k?pin-value=1234", "-certs", "cert.pem"])
+    expect(out).not.toContain("1234")
+    expect(out).not.toContain("pin-value")
+    expect(out).toContain("cert.pem")
+  })
+
+  test("does not redact a non-secret flag value", ({ expect }) => {
+    expect(removePasswordFromArgs(["tool", "-path", "/some/dir"])).toBe("tool -path /some/dir")
+  })
+
+  test("preserves a Parallels Mac host path passed to /p", ({ expect }) => {
+    expect(removePasswordFromArgs(["signtool", "/p", "\\\\Mac\\Host\\Users\\user"])).toContain("\\\\Mac\\Host\\Users\\user")
+  })
+
+  test("redacts the `/b <cert> /c` block that spans arguments", ({ expect }) => {
+    const out = removePasswordFromArgs(["signtool", "/b", "blockSecret", "/c"])
+    expect(out).not.toContain("blockSecret")
+    expect(out).toContain("/b")
+    expect(out).toContain("/c")
+  })
+})
+
+describe("resolveEnvShellValue", () => {
+  const VAR = "TEST_RESOLVE_ENV_SHELL_VAR"
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  test("returns null when env var is not set", ({ expect }) => {
+    delete process.env[VAR]
+    expect(resolveEnvShellValue(VAR)).toBeNull()
+  })
+
+  test("returns null when env var is empty string", ({ expect }) => {
+    vi.stubEnv(VAR, "")
+    expect(resolveEnvShellValue(VAR)).toBeNull()
+  })
+
+  test("returns null when env var is whitespace only", ({ expect }) => {
+    vi.stubEnv(VAR, "   ")
+    expect(resolveEnvShellValue(VAR)).toBeNull()
+  })
+
+  test("returns the value trimmed of surrounding whitespace", ({ expect }) => {
+    vi.stubEnv(VAR, "  /some/path  ")
+    expect(resolveEnvShellValue(VAR)).toBe("/some/path")
+  })
+
+  const UNSAFE_CHARS = [";", "&", "|", "`", "$", "<", ">", '"', "'", "\n", "\r"]
+  for (const ch of UNSAFE_CHARS) {
+    test(`throws on shell-unsafe character: ${ch}`, ({ expect }) => {
+      vi.stubEnv(VAR, `/some/path${ch}foo`)
+      expect(() => resolveEnvShellValue(VAR)).toThrow(`${VAR} contains shell-unsafe characters`)
+    })
+  }
+
+  test.skipIf(process.platform === "win32")("throws on backslash on non-Windows platforms", ({ expect }) => {
+    vi.stubEnv(VAR, "/some/path\\foo")
+    expect(() => resolveEnvShellValue(VAR)).toThrow(`${VAR} contains shell-unsafe characters`)
+  })
+
+  test.skipIf(process.platform !== "win32")("allows backslash on Windows (native path separator)", ({ expect }) => {
+    vi.stubEnv(VAR, "C:\\some\\path")
+    expect(resolveEnvShellValue(VAR)).toBe("C:\\some\\path")
+  })
+})
+
+// ─── exec ───────────────────────────────────────────────────────────────────
+
+describe("exec failure", () => {
+  // a value with spaces, so a redaction that only sees the joined command line would leak its tail
+  const secret = "s3cret token value"
+  const secretParts = ["s3cret", "token value", "hunter2"]
+  // `--` ends node's own options, so the flags reach the script as its arguments
+  const failingArgs = ["-e", "process.stderr.write('boom'); process.exit(3)", "--", "--token", secret, "--password", "hunter2"]
+
+  beforeEach(() => {
+    vi.mocked(execFile).mockClear()
+  })
+
+  async function execFailure(file: string, args?: Array<string>): Promise<ExecError> {
+    const error = await exec(file, args).then(
+      () => null,
+      (e: unknown) => e
+    )
+    expect(error).toBeInstanceOf(ExecError)
+    return error as ExecError
+  }
+
+  function causeOf(error: ExecError): Error & Record<string, unknown> {
+    expect(error.cause).toBeInstanceOf(Error)
+    return error.cause as Error & Record<string, unknown>
+  }
+
+  function expectNoSecret(error: ExecError) {
+    const cause = causeOf(error)
+    for (const text of [inspect(error, { depth: null }), error.message, error.stack, cause.message, cause.stack, cause.cmd]) {
+      for (const part of secretParts) {
+        expect(String(text)).not.toContain(part)
+      }
+    }
+  }
+
+  test("keeps secret arguments out of the error and its cause when the process exits non-zero", async ({ expect }) => {
+    const error = await execFailure(process.execPath, failingArgs)
+    expectNoSecret(error)
+    expect(error.message).toContain("boom")
+    const cause = causeOf(error)
+    expect(Object.keys(cause).sort()).toEqual(["cmd", "code", "killed"])
+    expect(cause.code).toBe(3)
+    expect(cause.cmd).toMatch(/--token [a-f0-9]{32} \(redacted fingerprint\) --password [a-f0-9]{32} \(redacted fingerprint\)$/)
+    expect(cause.stack).toContain("Command failed:")
+  })
+
+  test("keeps secret arguments out of the error and its cause when the process cannot start, and does not retry", async ({ expect, tmpDir }) => {
+    const missing = path.join(await tmpDir.getTempDir({ prefix: "exec-failure" }), "missing-tool")
+    const error = await execFailure(missing, ["--token", secret, "--password", "hunter2"])
+    expectNoSecret(error)
+    const cause = causeOf(error)
+    // no `spawnargs`: Node puts the raw arguments there
+    expect(Object.keys(cause).sort()).toEqual(["cmd", "code", "errno", "path", "syscall"])
+    expect(cause).toMatchObject({ code: "ENOENT", syscall: `spawn ${missing}`, path: missing })
+    expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1)
+  })
+
+  test("keeps the cause when there are no arguments", async ({ expect, tmpDir }) => {
+    const missing = path.join(await tmpDir.getTempDir({ prefix: "exec-failure" }), "missing-tool")
+    const cause = causeOf(await execFailure(missing))
+    expect(cause).toMatchObject({ code: "ENOENT", cmd: missing })
+  })
+
+  test("retries a launch that the OS refused with a transient code", async ({ expect }) => {
+    vi.mocked(execFile).mockImplementationOnce(((
+      file: string,
+      args: Array<string>,
+      _options: unknown,
+      callback: (error: ExecFileException, stdout: string, stderr: string) => void
+    ) => {
+      // the shape Node reports for a launch that failed (e.g. the executable is still locked by AV)
+      const error = Object.assign(new Error(`spawn ${file} EBUSY`), {
+        errno: -16,
+        code: "EBUSY",
+        syscall: `spawn ${file}`,
+        path: file,
+        spawnargs: args,
+        cmd: `${file} ${args.join(" ")}`,
+      })
+      process.nextTick(() => callback(error, "", ""))
+      return {}
+    }) as unknown as typeof execFile)
+    await expect(exec(process.execPath, ["-e", "process.stdout.write('ran')", "--", "--token", secret])).resolves.toBe("ran")
+    expect(vi.mocked(execFile)).toHaveBeenCalledTimes(2)
+  })
+
+  test("rejects with an ExecError when the reported error has no stack or command line", async ({ expect }) => {
+    vi.mocked(execFile).mockImplementationOnce(((
+      _file: string,
+      _args: Array<string>,
+      _options: unknown,
+      callback: (error: ExecFileException, stdout: string, stderr: string) => void
+    ) => {
+      const error: ExecFileException = Object.assign(new Error("Command failed"), { code: 1 })
+      delete error.stack
+      process.nextTick(() => callback(error, "", ""))
+      return {}
+    }) as unknown as typeof execFile)
+    const cause = causeOf(await execFailure(process.execPath, ["--token", secret]))
+    expect(cause.message).toBe("Command failed")
+    expect(Object.keys(cause)).toEqual(["code"])
+  })
+
+  test("a raw error with own __proto__, constructor or prototype keys does not change any prototype", async ({ expect }) => {
+    vi.mocked(execFile).mockImplementationOnce(((
+      _file: string,
+      _args: Array<string>,
+      _options: unknown,
+      callback: (error: ExecFileException, stdout: string, stderr: string) => void
+    ) => {
+      const error: ExecFileException = new Error("Command failed")
+      // own enumerable data properties, as JSON.parse creates them; an assignment would hit the `__proto__` setter
+      for (const [key, value] of Object.entries(JSON.parse('{"__proto__": {"polluted": "yes"}, "constructor": "c", "prototype": "p", "code": 1}'))) {
+        Object.defineProperty(error, key, { value, enumerable: true, configurable: true, writable: true })
+      }
+      expect(Object.prototype.hasOwnProperty.call(error, "__proto__")).toBe(true)
+      process.nextTick(() => callback(error, "", ""))
+      return {}
+    }) as unknown as typeof execFile)
+    const cause = causeOf(await execFailure(process.execPath, ["--token", secret]))
+    expect(Object.getPrototypeOf(cause)).toBe(Error.prototype)
+    expect(Object.keys(cause)).toEqual(["code"])
+    expect(cause.code).toBe(1)
+    expect(cause.polluted).toBeUndefined()
+    expect(Object.prototype.hasOwnProperty.call(cause, "__proto__")).toBe(false)
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined()
+  })
+})
+
+// ─── spawnAndWriteWithOutput ────────────────────────────────────────────────
+
+// the child exits without reading stdin, so writing a large payload reliably fails with EPIPE;
+// the exit code (not the stdin write error) must decide the outcome, with no unhandled 'error' event
+const largePayload = "x".repeat(16 * 1024 * 1024)
+
+describe("spawnAndWriteWithOutput", () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  test("resolves with captured stdout and stderr", async ({ expect }) => {
+    const script = `
+      let buf = ""
+      process.stdin.on("data", d => { buf += d })
+      process.stdin.on("end", () => {
+        process.stdout.write("out:" + buf)
+        process.stderr.write("err:" + buf)
+      })
+    `
+    const { stdout, stderr } = await spawnAndWriteWithOutput(process.execPath, ["-e", script], "hello")
+    expect(stdout).toBe("out:hello")
+    expect(stderr).toBe("err:hello")
+  })
+
+  test("resolves with empty stdout and stderr when process emits nothing", async ({ expect }) => {
+    const { stdout, stderr } = await spawnAndWriteWithOutput(process.execPath, ["-e", ""], "")
+    expect(stdout).toBe("")
+    expect(stderr).toBe("")
+  })
+
+  test("rejects with ExecError on non-zero exit code", async ({ expect }) => {
+    const script = `process.stdout.write("some output"); process.exit(1)`
+    await expect(spawnAndWriteWithOutput(process.execPath, ["-e", script], "")).rejects.toBeInstanceOf(ExecError)
+  })
+
+  test("ExecError includes stdout and stderr from failed process", async ({ expect }) => {
+    const script = `process.stdout.write("stdoutval"); process.stderr.write("stderrval"); process.exit(2)`
+    let caught: unknown
+    try {
+      await spawnAndWriteWithOutput(process.execPath, ["-e", script], "")
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(ExecError)
+    const err = caught as ExecError
+    expect(err.exitCode).toBe(2)
+    expect(err.message).toContain("stdoutval")
+    expect(err.message).toContain("stderrval")
+  })
+
+  test("writes data to stdin and reads it back", async ({ expect }) => {
+    const script = `
+      let buf = ""
+      process.stdin.on("data", d => { buf += d })
+      process.stdin.on("end", () => process.stdout.write(buf.toUpperCase()))
+    `
+    const { stdout } = await spawnAndWriteWithOutput(process.execPath, ["-e", script], "hello world")
+    expect(stdout).toBe("HELLO WORLD")
+  })
+
+  test("resolves when process exits 0 before stdin is fully written (EPIPE)", async ({ expect }) => {
+    const { stdout, stderr } = await spawnAndWriteWithOutput(process.execPath, ["-e", "process.exit(0)"], largePayload)
+    expect(stdout).toBe("")
+    expect(stderr).toBe("")
+  })
+
+  test("rejects with ExecError when process exits non-zero before stdin is fully written (EPIPE)", async ({ expect }) => {
+    const promise = spawnAndWriteWithOutput(process.execPath, ["-e", "process.exit(3)"], largePayload)
+    await expect(promise).rejects.toBeInstanceOf(ExecError)
+    await expect(promise).rejects.toMatchObject({ exitCode: 3 })
+  })
+
+  test("rejects with a timeout error when process does not finish within 4 minutes", async ({ expect }) => {
+    vi.useFakeTimers()
+    const script = `setInterval(() => {}, 999999)`
+    const promise = spawnAndWriteWithOutput(process.execPath, ["-e", script], "")
+    vi.advanceTimersByTime(4 * 60 * 1000 + 100)
+    await expect(promise).rejects.toThrow(/timed out/i)
+  })
+})
+
+describe("spawnAndWrite", () => {
+  test("resolves when process exits 0 before stdin is fully written (EPIPE)", async ({ expect }) => {
+    await expect(spawnAndWrite(process.execPath, ["-e", "process.exit(0)"], largePayload)).resolves.toBeUndefined()
+  })
+
+  test("rejects when process exits non-zero before stdin is fully written (EPIPE)", async ({ expect }) => {
+    await expect(spawnAndWrite(process.execPath, ["-e", "process.exit(3)"], largePayload)).rejects.toBeInstanceOf(ExecError)
+  })
+})
+
+describe("validateShellEmbeddable", () => {
+  describe("safe values pass", () => {
+    test.each([
+      ["index.js", "package.json main"],
+      ["src/main.js", "package.json main"],
+      ["dist/app.js", "package.json main"],
+      ["my-app.js", "package.json main"],
+      ["app_main.js", "package.json main"],
+      ["", "empty string"],
+    ])("allows %j", (value, field) => {
+      expect(() => validateShellEmbeddable(value, field)).not.toThrow()
+    })
+  })
+
+  describe("shell metacharacters are rejected", () => {
+    test.each([
+      ["index.js$(evil)", "$"],
+      ["index.js`evil`", "backtick"],
+      ['index.js"evil"', "double-quote"],
+      ["index.js\\evil", "backslash"],
+      ["index.js\nevil", "newline"],
+      ["index.js\revil", "carriage return"],
+      ["$(rm -rf /)", "command substitution"],
+      ["`id`", "backtick substitution"],
+    ])("rejects %j (contains %s)", value => {
+      expect(() => validateShellEmbeddable(value, "test field")).toThrow()
+    })
+  })
+})
+
+describe("expandDefaultKeyword", () => {
+  const defaults = ["a", "b"]
+
+  test('expands every "default" entry at its position, into a new array', ({ expect }) => {
+    const list = ["x", "default", "y", "default"]
+    const result = expandDefaultKeyword(list, defaults)
+    expect(result).toEqual(["x", "a", "b", "y", "a", "b"])
+    expect(result).not.toBe(list)
+    expect(expandDefaultKeyword(["default"], defaults)).not.toBe(defaults)
+    expect(list).toEqual(["x", "default", "y", "default"])
+  })
+
+  test('does not deduplicate, and keeps a list without "default" as it is', ({ expect }) => {
+    expect(expandDefaultKeyword(["a", "default"], defaults)).toEqual(["a", "a", "b"])
+    expect(expandDefaultKeyword(["x"], defaults)).toEqual(["x"])
+    expect(expandDefaultKeyword([], defaults)).toEqual([])
+  })
+
+  test("matches the keyword exactly", ({ expect }) => {
+    expect(expandDefaultKeyword(["Default", " default", "!default"], defaults)).toEqual(["Default", " default", "!default"])
+  })
+
+  test("keeps descriptor objects by reference", ({ expect }) => {
+    const descriptor = { default: null }
+    const result = expandDefaultKeyword<string | object>([descriptor, "default"], ["a"])
+    expect(result).toEqual([descriptor, "a"])
+    expect(result[0]).toBe(descriptor)
+  })
+})
+
+describe("resolveDefaultKeywordList", () => {
+  const defaults = ["a", "b", "c"]
+
+  test('"default" expands to the defaults, deduplicated, the first occurrence keeping its position', ({ expect }) => {
+    expect(resolveDefaultKeywordList(["default"], defaults).result).toEqual(["a", "b", "c"])
+    expect(resolveDefaultKeywordList(["b", "default", "b", "default"], defaults).result).toEqual(["b", "a", "c"])
+  })
+
+  test('a list without "default" replaces the defaults', ({ expect }) => {
+    expect(resolveDefaultKeywordList(["x"], defaults).result).toEqual(["x"])
+    expect(resolveDefaultKeywordList([], defaults).result).toEqual([])
+  })
+
+  test('"!x" removes x wherever it is listed', ({ expect }) => {
+    expect(resolveDefaultKeywordList(["default", "!b"], defaults).result).toEqual(["a", "c"])
+    expect(resolveDefaultKeywordList(["!b", "default", "x"], defaults).result).toEqual(["a", "c", "x"])
+    expect(resolveDefaultKeywordList(["x", "!x"], defaults).result).toEqual([])
+  })
+
+  test("reports the removals that removed nothing, once each", ({ expect }) => {
+    expect(resolveDefaultKeywordList(["default", "!b", "!z", "!z"], defaults).unusedRemovals).toEqual(["z"])
+    expect(resolveDefaultKeywordList(["!b"], defaults)).toEqual({ result: [], unusedRemovals: ["b"] })
+  })
+
+  test('does not validate: "!default" removes a literal "default" value, for the caller to reject', ({ expect }) => {
+    expect(resolveDefaultKeywordList(["default", "!default"], defaults)).toEqual({ result: ["a", "b", "c"], unusedRemovals: ["default"] })
+  })
+
+  test("does not change its inputs", ({ expect }) => {
+    const list = ["default", "!a"]
+    resolveDefaultKeywordList(list, defaults)
+    expect(list).toEqual(["default", "!a"])
+    expect(defaults).toEqual(["a", "b", "c"])
+  })
+})

@@ -1,0 +1,653 @@
+import { EventEmitter } from "events"
+import * as path from "path"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+// ─── Hoist mocks before any module imports ────────────────────────────────────
+
+vi.mock("https")
+vi.mock("electron-publish/src/s3/awsCredentials", async importOriginal => ({
+  ...(await importOriginal<typeof import("electron-publish/src/s3/awsCredentials")>()),
+  resolveS3Credentials: vi.fn().mockResolvedValue({ accessKeyId: "test-key", secretAccessKey: "test-secret" }),
+}))
+
+// ─── Imports after mocks ──────────────────────────────────────────────────────
+
+import * as https from "https"
+import { Arch, InvalidConfigurationError } from "builder-util"
+import { CancellationToken, S3Options, SpacesOptions } from "builder-util-runtime"
+import { BLOCK_MAP_V3_MAGIC } from "builder-util-runtime/internal"
+import { PublishContext, UploadTask } from "electron-publish"
+import { resolveS3Credentials } from "electron-publish/src/s3/awsCredentials"
+import { S3Publisher } from "electron-publish/internal"
+import { SpacesPublisher } from "electron-publish/internal"
+import { getS3ContentType } from "electron-publish/src/s3/s3UploadHelper"
+import fsExtra from "fs-extra"
+import { gzipSync } from "zlib"
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function makeContext(): PublishContext {
+  return { cancellationToken: new CancellationToken(), progress: null }
+}
+
+function makeTask(file: string): UploadTask {
+  return { file, arch: Arch.x64 }
+}
+
+function makeS3Publisher(options: Partial<S3Options> = {}): S3Publisher {
+  return new S3Publisher(makeContext(), {
+    provider: "s3",
+    bucket: "test-bucket",
+    region: "us-east-1",
+    ...options,
+  })
+}
+
+function makeSpacesPublisher(options: Partial<SpacesOptions> = {}): SpacesPublisher {
+  return new SpacesPublisher(makeContext(), {
+    provider: "spaces",
+    name: "my-space",
+    region: "nyc3",
+    ...options,
+  })
+}
+
+/**
+ * Sets up https.request to return a 200 OK immediately (for upload tests).
+ * Returns the captured request options so tests can assert on URL/headers.
+ */
+function mockSuccessfulUpload(): { capturedOpts: () => any } {
+  let opts: any = null
+  vi.mocked(https.request).mockImplementationOnce((requestOpts: unknown, callback: unknown) => {
+    opts = requestOpts
+    const req = new EventEmitter() as ReturnType<typeof https.request>
+    ;(req as any).end = vi.fn()
+    ;(req as any).destroy = vi.fn()
+    // Simulate a 200 response
+    setImmediate(() => {
+      const res = new EventEmitter() as any
+      res.statusCode = 200
+      res.resume = vi.fn()
+      ;(callback as (arg: unknown) => void)(res)
+      ;(callback as (res: unknown) => void)(res)
+      setImmediate(() => res.emit("end"))
+    })
+    // Handle piped stream
+    ;(req as any).write = vi.fn()
+    return req
+  })
+  return { capturedOpts: () => opts }
+}
+
+// ─── getS3ContentType ─────────────────────────────────────────────────────────
+
+describe("getS3ContentType — mirrors Go binary getContentType()", () => {
+  it.each([
+    ["app.AppImage", "application/vnd.appimage"],
+    ["app.appimage", "application/vnd.appimage"],
+    ["app.APPIMAGE", "application/vnd.appimage"],
+    ["update.blockmap", "application/gzip"],
+    ["app.snap", "application/vnd.snap"],
+    ["setup.exe", "application/octet-stream"],
+    ["archive.zip", "application/zip"],
+    ["disk.dmg", "application/octet-stream"],
+    ["file.unknownxyz", "application/octet-stream"],
+  ])("%s → %s", (filename, expected) => {
+    expect(getS3ContentType(filename)).toBe(expected)
+  })
+
+  it("a binary block map is application/octet-stream, a gzipped JSON one application/gzip", async ({ tmpDir }) => {
+    const dir = await tmpDir.getTempDir({ prefix: "s3-content-type" })
+    const binary = path.join(dir, "binary.exe.blockmap")
+    const json = path.join(dir, "json.exe.blockmap")
+    await fsExtra.outputFile(binary, Buffer.concat([Buffer.from(BLOCK_MAP_V3_MAGIC, "latin1"), Buffer.alloc(60)]))
+    await fsExtra.outputFile(json, gzipSync(Buffer.from('{"version":"2","files":[]}')))
+    expect(getS3ContentType(binary)).toBe("application/octet-stream")
+    expect(getS3ContentType(json)).toBe("application/gzip")
+  })
+})
+
+// ─── S3Publisher — getS3UploadConfig ─────────────────────────────────────────
+
+describe("S3Publisher — getS3UploadConfig", () => {
+  it("forwards region from options", async () => {
+    await expect(makeS3Publisher({ region: "eu-west-1" }).getS3UploadConfig()).resolves.toMatchObject({ region: "eu-west-1" })
+  })
+
+  it("defaults region to us-east-1 when not set", async () => {
+    await expect(makeS3Publisher({ region: null }).getS3UploadConfig()).resolves.toMatchObject({ region: "us-east-1" })
+  })
+
+  it("forwards endpoint when set", async () => {
+    await expect(makeS3Publisher({ endpoint: "https://minio.example.com" }).getS3UploadConfig()).resolves.toMatchObject({ endpoint: "https://minio.example.com" })
+  })
+
+  it("endpoint is undefined when not set", async () => {
+    const config = await makeS3Publisher({ endpoint: null }).getS3UploadConfig()
+    expect(config.endpoint).toBeUndefined()
+  })
+
+  it("forwards forcePathStyle: true", async () => {
+    await expect(makeS3Publisher({ forcePathStyle: true }).getS3UploadConfig()).resolves.toMatchObject({ forcePathStyle: true })
+  })
+
+  it("forcePathStyle is undefined when not set", async () => {
+    const config = await makeS3Publisher({ forcePathStyle: undefined }).getS3UploadConfig()
+    expect(config.forcePathStyle).toBeUndefined()
+  })
+
+  it("resolves profile credentials before signing the upload", async ({ tmpDir }) => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    const { writeFile } = await import("fs/promises")
+    const file = path.join(await tmpDir.createTempDir({ prefix: "s3-upload" }), "artifact.zip")
+    await writeFile(file, "artifact")
+    vi.mocked(resolveS3Credentials).mockResolvedValueOnce({ accessKeyId: "CONFIG_KEY", secretAccessKey: "config-secret", sessionToken: "config-token" })
+    await makeS3Publisher({ awsCredentials: { source: "profile", profile: "release" } }).upload(makeTask(file))
+    expect(capturedOpts()?.headers.Authorization).toContain("CONFIG_KEY")
+    expect(capturedOpts()?.headers["X-Amz-Security-Token"] ?? capturedOpts()?.headers["x-amz-security-token"]).toBe("config-token")
+  })
+
+  it("uses credentials from the configured awsCredentials source", async () => {
+    const awsCredentials = { source: "profile" as const, profile: "release" }
+    vi.mocked(resolveS3Credentials).mockResolvedValueOnce({ accessKeyId: "AKIAchain", secretAccessKey: "chain-secret" })
+    const config = await makeS3Publisher({ awsCredentials }).getS3UploadConfig()
+    expect(config.credentials).toEqual({ accessKeyId: "AKIAchain", secretAccessKey: "chain-secret" })
+    expect(resolveS3Credentials).toHaveBeenLastCalledWith(awsCredentials)
+  })
+})
+
+// ─── S3Publisher — getUploadExtraParams ──────────────────────────────────────
+
+describe("S3Publisher — getUploadExtraParams", () => {
+  it("ACL defaults to public-read", () => {
+    expect(makeS3Publisher().getUploadExtraParams()).toMatchObject({ acl: "public-read" })
+  })
+
+  it("ACL: private passes through", () => {
+    expect(makeS3Publisher({ acl: "private" }).getUploadExtraParams()).toMatchObject({ acl: "private" })
+  })
+
+  it("ACL: null → acl is undefined (bucket owner enforced)", () => {
+    const params = makeS3Publisher({ acl: null }).getUploadExtraParams()
+    expect(params.acl).toBeUndefined()
+  })
+
+  it("storageClass is included when set", () => {
+    expect(makeS3Publisher({ storageClass: "STANDARD_IA" }).getUploadExtraParams()).toMatchObject({ storageClass: "STANDARD_IA" })
+  })
+
+  it("storageClass is undefined when null", () => {
+    expect(makeS3Publisher({ storageClass: null }).getUploadExtraParams().storageClass).toBeUndefined()
+  })
+
+  it("serverSideEncryption is included when encryption is AES256", () => {
+    expect(makeS3Publisher({ encryption: "AES256" }).getUploadExtraParams()).toMatchObject({ serverSideEncryption: "AES256" })
+  })
+
+  it("serverSideEncryption is included when encryption is aws:kms", () => {
+    expect(makeS3Publisher({ encryption: "aws:kms" }).getUploadExtraParams()).toMatchObject({ serverSideEncryption: "aws:kms" })
+  })
+
+  it("serverSideEncryption is undefined when encryption is null", () => {
+    expect(makeS3Publisher({ encryption: null }).getUploadExtraParams().serverSideEncryption).toBeUndefined()
+  })
+})
+
+// ─── SpacesPublisher — getS3UploadConfig ─────────────────────────────────────
+
+describe("SpacesPublisher — getS3UploadConfig", { concurrent: false }, () => {
+  const savedEnv: Record<string, string | undefined> = {}
+
+  beforeEach(() => {
+    savedEnv.DO_KEY_ID = process.env.DO_KEY_ID
+    savedEnv.DO_SECRET_KEY = process.env.DO_SECRET_KEY
+    process.env.DO_KEY_ID = "do-test-key"
+    process.env.DO_SECRET_KEY = "do-test-secret"
+  })
+
+  afterEach(() => {
+    process.env.DO_KEY_ID = savedEnv.DO_KEY_ID
+    process.env.DO_SECRET_KEY = savedEnv.DO_SECRET_KEY
+  })
+
+  it("uses DO_KEY_ID / DO_SECRET_KEY as explicit credentials", () => {
+    const config = makeSpacesPublisher().getS3UploadConfig()
+    expect(config.credentials).toEqual({ accessKeyId: "do-test-key", secretAccessKey: "do-test-secret" })
+  })
+
+  it("constructs endpoint as https://${region}.digitaloceanspaces.com", () => {
+    const config = makeSpacesPublisher({ region: "ams3" }).getS3UploadConfig()
+    expect(config.endpoint).toBe("https://ams3.digitaloceanspaces.com")
+  })
+
+  it("forwards region to config", () => {
+    const config = makeSpacesPublisher({ region: "fra1" }).getS3UploadConfig()
+    expect(config.region).toBe("fra1")
+  })
+
+  it("throws with DO_KEY_ID mention when DO_KEY_ID is missing", () => {
+    delete process.env.DO_KEY_ID
+    expect(() => makeSpacesPublisher().getS3UploadConfig()).toThrow(/DO_KEY_ID.*https:\/\/www\.electron\.build\/docs\/publish#spaces/)
+  })
+
+  it("throws with DO_SECRET_KEY mention when DO_SECRET_KEY is missing", () => {
+    delete process.env.DO_SECRET_KEY
+    expect(() => makeSpacesPublisher().getS3UploadConfig()).toThrow(/DO_SECRET_KEY/)
+  })
+
+  it("throws when DO_KEY_ID is an empty string", () => {
+    process.env.DO_KEY_ID = ""
+    expect(() => makeSpacesPublisher().getS3UploadConfig()).toThrow(/DO_KEY_ID/)
+  })
+})
+
+// ─── SpacesPublisher — name and region validation ────────────────────────────
+
+describe("SpacesPublisher — name and region validation", { concurrent: false }, () => {
+  const invalidRegions = ["evil.example.com/", "attacker.example#", "nyc3.evil.example", "user@host", "nyc3 ", "nyc", "nyc123", ""]
+  const invalidNames = ["evil.example.com/", "evil.example.com#", "evil.example.com?", "user@evil.example.com", "my.space", "my space", "-space", "ab", "a".repeat(64), ""]
+
+  beforeEach(() => {
+    vi.stubEnv("DO_KEY_ID", "do-test-key")
+    vi.stubEnv("DO_SECRET_KEY", "do-test-secret")
+  })
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it.each(["nyc3", "ams3", "sfo2", "sgp1", "fra1", "syd1", "NYC3"])("accepts DigitalOcean region %s", async region => {
+    await expect(SpacesPublisher.checkAndResolveOptions({ provider: "spaces", name: "my-space", region }, null, true)).resolves.toBeUndefined()
+    expect(makeSpacesPublisher({ region }).getS3UploadConfig().endpoint).toBe(`https://${region}.digitaloceanspaces.com`)
+  })
+
+  it.each(["my-space", "abc", "1space", "My-Space", "a".repeat(63)])("accepts Spaces name %s", async name => {
+    await expect(SpacesPublisher.checkAndResolveOptions({ provider: "spaces", name, region: "nyc3" }, null, true)).resolves.toBeUndefined()
+    expect(makeSpacesPublisher({ name }).getS3UploadConfig().endpoint).toBe("https://nyc3.digitaloceanspaces.com")
+  })
+
+  it.each(invalidRegions)("checkAndResolveOptions rejects region %j", region => {
+    expect(() => SpacesPublisher.checkAndResolveOptions({ provider: "spaces", name: "my-space", region }, null, true)).toThrow(InvalidConfigurationError)
+  })
+
+  it.each(invalidRegions)("getS3UploadConfig rejects region %j before building an endpoint", region => {
+    expect(() => makeSpacesPublisher({ region }).getS3UploadConfig()).toThrow(InvalidConfigurationError)
+    expect(() => makeSpacesPublisher({ region }).getS3UploadConfig()).toThrow(/region slug such as "nyc3".*https:\/\/www\.electron\.build\/docs\/publish#spaces/)
+  })
+
+  it.each(invalidNames)("checkAndResolveOptions rejects name %j", name => {
+    expect(() => SpacesPublisher.checkAndResolveOptions({ provider: "spaces", name, region: "nyc3" }, null, true)).toThrow(/Invalid "name"/)
+  })
+
+  it.each(invalidNames)("getS3UploadConfig rejects name %j before building an endpoint", name => {
+    expect(() => makeSpacesPublisher({ name }).getS3UploadConfig()).toThrow(InvalidConfigurationError)
+    expect(() => makeSpacesPublisher({ name }).getS3UploadConfig()).toThrow(/Invalid "name".*https:\/\/www\.electron\.build\/docs\/publish#spaces/)
+  })
+})
+
+// ─── Upload — key construction and request params ────────────────────────────
+
+describe("BaseS3Publisher.upload — key construction and S3 request", { concurrent: false }, () => {
+  let tmpDir: string
+  let testFile: string
+
+  beforeEach(async context => {
+    vi.mocked(https.request).mockClear()
+    const { writeFile } = await import("fs/promises")
+    tmpDir = await context.tmpDir.createTempDir()
+    testFile = path.join(tmpDir, "MyApp-1.0.0.exe")
+    await writeFile(testFile, "fake exe content")
+    delete process.env.__TEST_S3_PUBLISHER__
+  })
+
+  afterEach(() => {
+    delete process.env.__TEST_S3_PUBLISHER__
+    vi.clearAllMocks()
+  })
+
+  it("uses just the filename as key when path is null", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    const publisher = makeS3Publisher({ path: null })
+    await publisher.upload(makeTask(testFile))
+    // Virtual-hosted style: path is just /key
+    expect(capturedOpts()?.path).toBe("/MyApp-1.0.0.exe")
+  })
+
+  it("prepends options.path to the key when path is set", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    const publisher = makeS3Publisher({ path: "releases/stable", forcePathStyle: true })
+    await publisher.upload(makeTask(testFile))
+    // Path-style with options.path: /{bucket}/{path}/{filename}
+    expect(capturedOpts()?.path).toBe("/test-bucket/releases/stable/MyApp-1.0.0.exe")
+  })
+
+  it("uses virtual-hosted style URL by default", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    const publisher = makeS3Publisher({ region: "us-west-2" })
+    await publisher.upload(makeTask(testFile))
+    expect(capturedOpts()?.hostname).toBe("test-bucket.s3.us-west-2.amazonaws.com")
+  })
+
+  it("uses path-style URL when forcePathStyle is true", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    const publisher = makeS3Publisher({ region: "us-west-2", forcePathStyle: true })
+    await publisher.upload(makeTask(testFile))
+    expect(capturedOpts()?.hostname).toBe("s3.us-west-2.amazonaws.com")
+    expect(capturedOpts()?.path).toMatch(/^\/test-bucket\//)
+  })
+
+  it("uses custom endpoint hostname when endpoint is set", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    const publisher = makeS3Publisher({ endpoint: "https://minio.example.com" })
+    await publisher.upload(makeTask(testFile))
+    expect(capturedOpts()?.hostname).toBe("minio.example.com")
+  })
+
+  it("splits the port from a custom endpoint hostname", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher({ endpoint: "https://minio.local:9000" }).upload(makeTask(testFile))
+    expect(capturedOpts()?.hostname).toBe("minio.local")
+    expect(capturedOpts()?.port).toBe(9000)
+    expect(capturedOpts()?.headers?.Host).toBe("minio.local:9000")
+  })
+
+  it("preserves IPv6 custom endpoint hosts and ports", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    const publisher = makeS3Publisher({ endpoint: "https://[::1]:9000" })
+    await publisher.upload(makeTask(testFile))
+    expect(capturedOpts()?.hostname).toBe("::1")
+    expect(capturedOpts()?.port).toBe(9000)
+    expect(capturedOpts()?.headers?.Host).toBe("[::1]:9000")
+  })
+
+  // "localhost:9000" (no scheme) parses with protocol "localhost:" and an empty host
+  it.each(["ftp://minio.example.com", "localhost:9000"])("rejects non-HTTP(S) custom endpoint %s as a configuration error", async endpoint => {
+    const error = await makeS3Publisher({ endpoint })
+      .upload(makeTask(testFile))
+      .catch(e => e)
+    expect(error).toBeInstanceOf(InvalidConfigurationError)
+    expect(error.message).toContain(`Unsupported S3 endpoint protocol "${new URL(endpoint).protocol}" in "${endpoint}"`)
+    expect(vi.mocked(https.request)).not.toHaveBeenCalled()
+  })
+
+  // "minio.local" (no scheme, no colon) cannot be parsed as a URL at all
+  it("rejects an unparseable custom endpoint as a configuration error", async () => {
+    const error = await makeS3Publisher({ endpoint: "minio.local" })
+      .upload(makeTask(testFile))
+      .catch(e => e)
+    expect(error).toBeInstanceOf(InvalidConfigurationError)
+    expect(error.message).toContain(`Invalid S3 endpoint "minio.local"`)
+    expect(vi.mocked(https.request)).not.toHaveBeenCalled()
+  })
+
+  it("sets x-amz-acl header when ACL is public-read", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher({ acl: "public-read" }).upload(makeTask(testFile))
+    expect(capturedOpts()?.headers?.["x-amz-acl"]).toBe("public-read")
+  })
+
+  it("omits x-amz-acl header when ACL is null", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher({ acl: null }).upload(makeTask(testFile))
+    expect(capturedOpts()?.headers?.["x-amz-acl"]).toBeUndefined()
+  })
+
+  it("sets x-amz-storage-class header when storageClass is set", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher({ storageClass: "STANDARD_IA" }).upload(makeTask(testFile))
+    expect(capturedOpts()?.headers?.["x-amz-storage-class"]).toBe("STANDARD_IA")
+  })
+
+  it("sets x-amz-server-side-encryption header when encryption is set", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher({ encryption: "AES256" }).upload(makeTask(testFile))
+    expect(capturedOpts()?.headers?.["x-amz-server-side-encryption"]).toBe("AES256")
+  })
+
+  it("sets Content-Length to the file size", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    const { statSync } = await import("fs")
+    await makeS3Publisher().upload(makeTask(testFile))
+    const size = statSync(testFile).size
+    expect(capturedOpts()?.headers?.["Content-Length"]).toBe(String(size))
+  })
+
+  it("sets Content-Type based on file extension", async () => {
+    const appImageFile = path.join(tmpDir, "app.AppImage")
+    const { writeFile } = await import("fs/promises")
+    await writeFile(appImageFile, "fake appimage")
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher().upload(makeTask(appImageFile))
+    expect(capturedOpts()?.headers?.["Content-Type"]).toBe("application/vnd.appimage")
+  })
+
+  it("includes an Authorization header (SigV4 signed)", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher().upload(makeTask(testFile))
+    expect(capturedOpts()?.headers?.Authorization).toMatch(/^AWS4-HMAC-SHA256/)
+  })
+
+  it("sets x-amz-content-sha256 to UNSIGNED-PAYLOAD for streaming uploads", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher().upload(makeTask(testFile))
+    expect(capturedOpts()?.headers?.["x-amz-content-sha256"]).toBe("UNSIGNED-PAYLOAD")
+  })
+
+  it("Authorization header covers x-amz-content-sha256 (UNSIGNED-PAYLOAD in signed headers)", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher().upload(makeTask(testFile))
+    const auth: string = capturedOpts()?.headers?.Authorization ?? ""
+    // aws4 includes x-amz-content-sha256 in SignedHeaders when present
+    expect(auth).toMatch(/x-amz-content-sha256/)
+  })
+
+  it("resolves credentials once per publisher across multiple uploads (artifacts, blockmaps, latest*.yml)", async () => {
+    const { writeFile } = await import("fs/promises")
+    const files = ["MyApp-1.0.0.exe", "MyApp-1.0.0.exe.blockmap", "latest.yml"].map(name => path.join(tmpDir, name))
+    await Promise.all(files.map(file => writeFile(file, "x")))
+    vi.mocked(resolveS3Credentials).mockClear()
+    const publisher = makeS3Publisher({ awsCredentials: { source: "profile", profile: "release" } })
+    files.forEach(() => mockSuccessfulUpload())
+    // concurrent, as PublishManager schedules them
+    await Promise.all(files.map(file => publisher.upload(makeTask(file))))
+    mockSuccessfulUpload()
+    await publisher.upload(makeTask(files[0]))
+    expect(vi.mocked(https.request)).toHaveBeenCalledTimes(4)
+    expect(resolveS3Credentials).toHaveBeenCalledTimes(1)
+  })
+
+  it("fails the upload without sending a request when credentials cannot be resolved", async () => {
+    vi.mocked(resolveS3Credentials).mockRejectedValueOnce(new Error("S3 publishing requires AWS credentials"))
+    await expect(makeS3Publisher().upload(makeTask(testFile))).rejects.toThrow("S3 publishing requires AWS credentials")
+    expect(vi.mocked(https.request)).not.toHaveBeenCalled()
+  })
+
+  it("cancellation destroys a request that was already started", async () => {
+    let destroyCalled = false
+    vi.mocked(https.request).mockImplementationOnce((_opts: unknown, _cb: unknown) => {
+      const req = new EventEmitter() as ReturnType<typeof https.request>
+      ;(req as any).end = vi.fn()
+      ;(req as any).destroy = vi.fn(() => {
+        destroyCalled = true
+      })
+      ;(req as any).write = vi.fn()
+      // Never call the response callback — upload hangs until cancel
+      return req
+    })
+
+    const context = makeContext()
+    const publisher = new S3Publisher(context, { provider: "s3", bucket: "b", region: "us-east-1" })
+    const uploadPromise = publisher.upload(makeTask(testFile))
+    // credentials resolve asynchronously; cancel once the request is in flight
+    await vi.waitFor(() => expect(https.request).toHaveBeenCalledTimes(1))
+    context.cancellationToken.cancel()
+    await uploadPromise.catch(() => null)
+    expect(destroyCalled).toBe(true)
+  })
+
+  it("cancellation before the credentials resolve sends no request", async () => {
+    const context = makeContext()
+    const publisher = new S3Publisher(context, { provider: "s3", bucket: "b", region: "us-east-1" })
+    const uploadPromise = publisher.upload(makeTask(testFile))
+    context.cancellationToken.cancel()
+    await uploadPromise.catch(() => null)
+    // let the pending credential resolution settle
+    await new Promise(resolve => setImmediate(resolve))
+    expect(https.request).not.toHaveBeenCalled()
+  })
+
+  it("rejects when the S3 response is aborted", async ({ expect }) => {
+    vi.mocked(https.request).mockImplementationOnce((_opts: unknown, callback: unknown) => {
+      const req = new EventEmitter() as ReturnType<typeof https.request>
+      ;(req as any).end = vi.fn()
+      ;(req as any).destroy = vi.fn()
+      ;(req as any).write = vi.fn()
+      setImmediate(() => {
+        const res = new EventEmitter() as any
+        res.statusCode = 200
+        // Connection dropped before the message completed: "close" without "end"
+        res.complete = false
+        res.resume = vi.fn()
+        ;(callback as (response: unknown) => void)(res)
+        setImmediate(() => res.emit("close"))
+      })
+      return req
+    })
+
+    await expect(makeS3Publisher().upload(makeTask(testFile))).rejects.toThrow("S3 PutObject response aborted (HTTP 200)")
+  })
+
+  it("destroys the request when the source file cannot be read", async () => {
+    const destroy = vi.fn()
+    vi.mocked(https.request).mockImplementationOnce((_opts: unknown, _cb: unknown) => {
+      const req = new EventEmitter() as ReturnType<typeof https.request>
+      ;(req as any).end = vi.fn()
+      ;(req as any).destroy = destroy
+      ;(req as any).write = vi.fn()
+      // Never call the response callback — only the file stream error can settle the upload
+      return req
+    })
+
+    // A directory passes the statSync size check, then fails once the stream reads it
+    const error = await makeS3Publisher()
+      .upload(makeTask(tmpDir))
+      .catch(e => e)
+    expect(error).toBeInstanceOf(Error)
+    expect(destroy).toHaveBeenCalledWith(error)
+  })
+})
+
+// ─── Upload — test mode bypass ────────────────────────────────────────────────
+
+describe("BaseS3Publisher.upload — __TEST_S3_PUBLISHER__ bypass", { concurrent: false }, () => {
+  let testPublisherDir: string
+  let srcDir: string
+  let srcFile: string
+
+  beforeEach(async context => {
+    vi.mocked(https.request).mockClear()
+    const { writeFile } = await import("fs/promises")
+    // Keep source file and destination dir separate so symlink(src, dest) doesn't collide
+    testPublisherDir = await context.tmpDir.createTempDir()
+    srcDir = await context.tmpDir.createTempDir()
+    srcFile = path.join(srcDir, "source.exe")
+    await writeFile(srcFile, "fake content")
+    process.env.__TEST_S3_PUBLISHER__ = testPublisherDir
+  })
+
+  afterEach(() => {
+    delete process.env.__TEST_S3_PUBLISHER__
+    vi.clearAllMocks()
+  })
+
+  it("creates a symlink instead of making an HTTPS request", async () => {
+    const { readlink } = await import("fs/promises")
+    await makeS3Publisher().upload(makeTask(srcFile))
+
+    expect(vi.mocked(https.request)).not.toHaveBeenCalled()
+    const link = await readlink(path.join(testPublisherDir, "source.exe"))
+    expect(link).toBe(srcFile)
+  })
+})
+
+// ─── Parity contract: Go binary publish-s3 flag → TS header/URL mapping ──────
+
+describe("publish-s3 parity — Go binary flag mapping to HTTP request", { concurrent: false }, () => {
+  // The Go binary accepted:
+  //   --acl         → x-amz-acl header
+  //   --storageClass → x-amz-storage-class header
+  //   --encryption  → x-amz-server-side-encryption header
+  //   --bucket      → Bucket in URL (path or virtual-hosted)
+  //   --key         → Object key in URL path
+  //   --endpoint    → custom base URL
+  //   --region      → signing region + hostname region segment
+  //   --forcePathStyle → path-style vs virtual-hosted URL format
+  // This suite verifies each mapping.
+
+  let tmpDir: string
+  let testFile: string
+
+  beforeEach(async context => {
+    vi.mocked(https.request).mockClear()
+    const { writeFile } = await import("fs/promises")
+    tmpDir = await context.tmpDir.createTempDir()
+    testFile = path.join(tmpDir, "TestApp-1.0.0-setup.exe")
+    await writeFile(testFile, "x")
+    delete process.env.__TEST_S3_PUBLISHER__
+  })
+
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it("--acl public-read → x-amz-acl: public-read", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher({ acl: "public-read" }).upload(makeTask(testFile))
+    expect(capturedOpts()?.headers?.["x-amz-acl"]).toBe("public-read")
+  })
+
+  it("--acl private → x-amz-acl: private", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher({ acl: "private" }).upload(makeTask(testFile))
+    expect(capturedOpts()?.headers?.["x-amz-acl"]).toBe("private")
+  })
+
+  it("--storageClass REDUCED_REDUNDANCY → x-amz-storage-class: REDUCED_REDUNDANCY", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher({ storageClass: "REDUCED_REDUNDANCY" }).upload(makeTask(testFile))
+    expect(capturedOpts()?.headers?.["x-amz-storage-class"]).toBe("REDUCED_REDUNDANCY")
+  })
+
+  it("--encryption aws:kms → x-amz-server-side-encryption: aws:kms", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher({ encryption: "aws:kms" }).upload(makeTask(testFile))
+    expect(capturedOpts()?.headers?.["x-amz-server-side-encryption"]).toBe("aws:kms")
+  })
+
+  it("--region eu-west-1 → hostname contains eu-west-1", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher({ region: "eu-west-1" }).upload(makeTask(testFile))
+    expect(capturedOpts()?.hostname).toContain("eu-west-1")
+  })
+
+  it("--forcePathStyle true → bucket in URL path, not hostname", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher({ region: "us-west-2", forcePathStyle: true }).upload(makeTask(testFile))
+    expect(capturedOpts()?.hostname).not.toContain("test-bucket")
+    expect(capturedOpts()?.path).toMatch(/^\/test-bucket\//)
+  })
+
+  it("--endpoint https://s3.custom.io → uses custom hostname", async () => {
+    const { capturedOpts } = mockSuccessfulUpload()
+    await makeS3Publisher({ endpoint: "https://s3.custom.io" }).upload(makeTask(testFile))
+    expect(capturedOpts()?.hostname).toBe("s3.custom.io")
+  })
+
+  it("x-amz-content-sha256 is UNSIGNED-PAYLOAD regardless of endpoint or path style", async () => {
+    for (const opts of [{ endpoint: "https://minio.local:9000" }, { forcePathStyle: true as const }, { region: "ap-southeast-1" }]) {
+      const { capturedOpts } = mockSuccessfulUpload()
+      await makeS3Publisher(opts).upload(makeTask(testFile))
+      expect(capturedOpts()?.headers?.["x-amz-content-sha256"]).toBe("UNSIGNED-PAYLOAD")
+    }
+  })
+})

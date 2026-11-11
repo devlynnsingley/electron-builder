@@ -1,0 +1,15 @@
+{
+  "private": true,
+  "build": {
+    "electronVersion": "42.4.0",
+    "appId": "org.electron-builder.testApp",
+    "compression": "store",
+    "nativeModules": { "npmRebuild": false },
+    "mac": {
+      "category": "your.app.category.type"
+    },
+    "squirrelWindows": {
+      "iconUrl": "https://raw.githubusercontent.com/szwacz/electron-boilerplate/master/resources/windows/icon.ico"
+    }
+  }
+}

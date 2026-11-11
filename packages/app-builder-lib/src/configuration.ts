@@ -1,268 +1,690 @@
 import { Arch } from "builder-util"
-import { BeforeBuildContext, Target } from "./core"
-import { ElectronBrandingOptions, ElectronDownloadOptions } from "./electron/ElectronFramework"
-import { PrepareApplicationStageDirectoryOptions } from "./Framework"
-import { AppXOptions } from "./options/AppXOptions"
-import { AppImageOptions, DebOptions, FlatpakOptions, LinuxConfiguration, LinuxTargetSpecificOptions } from "./options/linuxOptions"
-import { DmgOptions, MacConfiguration, MasConfiguration } from "./options/macOptions"
-import { MsiOptions } from "./options/MsiOptions"
-import { PkgOptions } from "./options/pkgOptions"
-import { PlatformSpecificBuildOptions } from "./options/PlatformSpecificBuildOptions"
-import { SnapOptions } from "./options/SnapOptions"
-import { SquirrelWindowsOptions } from "./options/SquirrelWindowsOptions"
-import { WindowsConfiguration } from "./options/winOptions"
-import { BuildResult } from "./packager"
-import { ArtifactBuildStarted, ArtifactCreated } from "./packagerApi"
-import { PlatformPackager } from "./platformPackager"
-import { NsisOptions, NsisWebOptions, PortableOptions } from "./targets/nsis/nsisOptions"
+import { BeforeBuildContext, Target } from "./core.js"
+import { ElectronBrandingOptions } from "./electron/ElectronFramework.js"
+import { PrepareApplicationStageDirectoryOptions } from "./Framework.js"
+import { AppXOptions } from "./options/AppXOptions.js"
+import { AppImageOptions, DebOptions, FlatpakOptions, LinuxConfiguration, LinuxTargetSpecificOptions, PacmanOptions, RpmOptions } from "./options/linuxOptions.js"
+import { DmgOptions, MacConfiguration, MasConfiguration } from "./options/macOptions.js"
+import { MsiOptions } from "./options/MsiOptions.js"
+import { MsiWrappedOptions } from "./options/MsiWrappedOptions.js"
+import { MsixOptions } from "./options/MsixOptions.js"
+import { PkgOptions } from "./options/pkgOptions.js"
+import { PlatformSpecificBuildOptions } from "./options/PlatformSpecificBuildOptions.js"
+import { SnapcraftOptions } from "./options/SnapOptions.js"
+import { SquirrelWindowsOptions } from "./options/SquirrelWindowsOptions.js"
+import { WindowsConfiguration } from "./options/winOptions.js"
+import { BuildResult } from "./packager.js"
+import { ArtifactBuildStarted, ArtifactCreated } from "./packagerApi.js"
+import { PlatformPackager } from "./platformPackager.js"
+import { NsisOptions, NsisWebOptions, PortableOptions } from "./targets/win/nsis/nsisOptions.js"
+import { ElectronGetOptions } from "./util/electronGet.js"
+import type { ExecutablesConfig } from "builder-util"
+// the types of toolsets.executables live with its resolver, in builder-util
+export type { ExecutableLocation, ExecutableName, ExecutablesConfig } from "builder-util"
+import { FuseOptionsV1 } from "./options/FuseOptionsV1.js"
+
+/**
+ * Production dependencies that are excluded from the copied `node_modules` by default. These are
+ * still legitimate production dependencies (for SBOM, license, and vulnerability tracking), but
+ * electron-builder already provides them another way — notably the Electron runtime, which is
+ * embedded separately — so copying them into the app would just duplicate what is already there.
+ * Users can override the set via {@link CommonConfiguration.ignoredProductionDependencies}.
+ *
+ * Declared next to the option so the code constant, the jsdoc `@default`, and the generated
+ * `scheme.json` stay in one place; a test asserts the generated schema matches this constant.
+ */
+export const DEFAULT_IGNORED_PRODUCTION_DEPENDENCIES: ReadonlyArray<string> = ["electron", "electron-builder"]
 
 // duplicate appId here because it is important
 /**
- * Configuration Options
+ * Configuration options shared across all platforms.
+ *
+ * These properties apply regardless of the target platform and control general build behaviour such
+ * as the application identity, output paths, native dependency rebuilding, toolset versions, and
+ * platform-specific target sub-configurations.
  */
-export interface Configuration extends PlatformSpecificBuildOptions {
+export interface CommonConfiguration {
   /**
-   * The application id. Used as [CFBundleIdentifier](https://developer.apple.com/library/ios/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html#//apple_ref/doc/uid/20001431-102070) for MacOS and as
-   * [Application User Model ID](https://msdn.microsoft.com/en-us/library/windows/desktop/dd378459(v=vs.85).aspx) for Windows (NSIS target only, Squirrel.Windows not supported). It is strongly recommended that an explicit ID is set.
+   * The application identifier.
+   *
+   * Used as [`CFBundleIdentifier`](https://developer.apple.com/documentation/bundleresources/information_property_list/cfbundleidentifier)
+   * on macOS and as the
+   * [Application User Model ID](https://learn.microsoft.com/en-us/windows/win32/shell/appids)
+   * on Windows (NSIS target only; Squirrel.Windows does not support custom Application User Model IDs).
+   *
+   * It is strongly recommended to set an explicit, reverse-DNS-style identifier (e.g. `"com.example.myapp"`)
+   * rather than relying on the generated default.
+   *
    * @default com.electron.${name}
    */
   readonly appId?: string | null
 
   /**
-   * As [name](#Metadata-name), but allows you to specify a product name for your executable which contains spaces and other special characters not allowed in the [name property](https://docs.npmjs.com/files/package.json#name).
+   * The human-readable product name displayed in installers, the macOS dock, and the Windows
+   * Apps & Features list.
+   *
+   * Unlike the `name` field in `package.json`, this value may contain spaces and other characters
+   * that are not allowed in npm package names.
+   *
+   * Resolution order:
+   * 1. `productName` inside the `build` configuration block.
+   * 2. `productName` at the top level of `package.json`.
+   * 3. `name` at the top level of `package.json`.
    */
   readonly productName?: string | null
 
   /**
-   * The human-readable copyright line for the app.
-   * @default Copyright © year ${author}
+   * The copyright string embedded in the built artifacts.
+   *
+   * Appears in the Windows `LegalCopyright` version-info field and the macOS `NSHumanReadableCopyright`
+   * Info.plist key.
+   *
+   * @default Copyright © ${year} ${author}
    */
   readonly copyright?: string | null
 
+  /**
+   * Overrides for input/output directory paths used during the build.
+   *
+   * @see {@link MetadataDirectories}
+   */
   readonly directories?: MetadataDirectories | null
 
   /**
-   * Options related to how build macOS targets.
+   * Pinned versions of the binary toolsets electron-builder downloads and uses internally.
+   *
+   * Each property selects a specific release of the corresponding tool bundle. Set a property to
+   * `"0.0.0"` to force the legacy bundle (pre-v27 behaviour). Leave a property unset (or set it to
+   * `"latest"`) to use the modern default (newest bundle) for that toolset.
+   *
+   * Note: Toolset versioning can drop intermediate releases (such as if a problem is discovered in a bundle). If you need to pin to a specific release, check the release notes for the toolset to ensure the version you specify is valid.
+   * Toolsets, the versions offered for each, and what `latest` resolves to can be added, changed or removed in any electron-builder release (minor or patch), not only in a major release. (To address toolset stability, reported issues, adopt latest tooling versions, etc.)
+   *
+   * @see {@link ToolsetConfig}
+   */
+  readonly toolsets?: ToolsetConfig | null
+
+  /**
+   * Format of the `<artifact>.blockmap` file published next to installers and update archives, which electron-updater reads for
+   * differential downloads. The map is read by the updater already installed in your users' apps, so the format follows
+   * `electronUpdaterCompatibility` (default `">=7"`):
+   *
+   * - unset: `"v3"` when `electronUpdaterCompatibility` includes only electron-updater 7 and later, else `"v2"`, with a build
+   *   warning.
+   * - `"v3"`: a binary block map that electron-updater fetches in parts with HTTP `Range` requests (only the parts that changed
+   *   since the installed version), with finer blocks for stored members such as an uncompressed `app.asar`. Needs electron-updater
+   *   7 or later: with an `electronUpdaterCompatibility` that includes earlier versions, the build fails.
+   * - `"v2"`: the gzipped JSON block map every electron-updater version reads, downloaded in full on every update; the package and
+   *   block map are the same as electron-builder 26 wrote.
+   * - `"latest"`: the newest format the `electronUpdaterCompatibility` range supports (currently the same as unset). A future
+   *   format may then cost one full download per user, as below.
+   *
+   * Apps whose electron-updater cannot read a release's format download that update in full once; the next one is differential
+   * again, or with an artifact name without `${version}` the one after it. Switching between `"v2"` and `"v3"` does not cost a
+   * full download with electron-updater 7.0.0-alpha.14 and later: both formats cut the same blocks and hash them alike, so the
+   * cached map of one format is compared with the new map of the other. Only the bytes of a stored member (`nsis.differentialPackage: "store-asar"`),
+   * which `"v3"` cuts into finer blocks, are downloaded whole by that first update.
+   *
+   * Compressed bytes (a compressed app package, a zip) are cut into the same 8/16/32 KiB blocks in both formats, so `"v3"`
+   * downloads the same data for them as `"v2"` (compressed data changes from a change up to the end of its compressed stream,
+   * whatever the format); it only makes the map smaller (about 10 instead of 22 bytes per block) and fetched in parts.
+   *
+   * Block maps embedded in an artifact (AppImage, the NSIS web installer's app package) are always `"v2"`.
+   * See [the v27 notes](https://www.electron.build/docs/migration/v27-build-changes#block-map-format-follows-electronupdatercompatibility).
+   */
+  readonly blockmap?: "v2" | "v3" | "latest" | null
+
+  /**
+   * macOS-specific build options (signing, entitlements, notarization, target categories, etc.).
+   * @see {@link MacConfiguration}
    */
   readonly mac?: MacConfiguration | null
   /**
-   * MAS (Mac Application Store) options.
+   * macOS App Store (MAS) submission options.
+   * @see {@link MasConfiguration}
    */
   readonly mas?: MasConfiguration | null
   /**
-   * MAS (Mac Application Store) development options (`mas-dev` target).
+   * macOS App Store development-signing options (`mas-dev` target).
+   * Used for local testing of MAS builds without submitting to the store.
+   * @see {@link MasConfiguration}
    */
   readonly masDev?: MasConfiguration | null
   /**
-   * macOS DMG options.
+   * macOS DMG disk image options (background image, window position, icon layout, licence, etc.).
+   * @see {@link DmgOptions}
    */
   readonly dmg?: DmgOptions | null
   /**
-   * macOS PKG options.
+   * macOS PKG flat-package installer options.
+   * @see {@link PkgOptions}
    */
   readonly pkg?: PkgOptions | null
 
   /**
-   * Options related to how build Windows targets.
+   * Windows-specific build options (signing, NSIS, icon, file associations, etc.).
+   * @see {@link WindowsConfiguration}
    */
   readonly win?: WindowsConfiguration | null
-  readonly nsis?: NsisOptions | null
-  readonly nsisWeb?: NsisWebOptions | null
-  readonly portable?: PortableOptions | null
-  readonly appx?: AppXOptions | null
-  /** @private */
-  readonly msi?: MsiOptions | null
-  readonly squirrelWindows?: SquirrelWindowsOptions | null
-
   /**
-   * Options related to how build Linux targets.
+   * NSIS one-click installer options.
+   *
+   * NSIS (Nullsoft Scriptable Install System) is the default Windows installer format produced by
+   * electron-builder. It generates a lightweight, self-extracting `.exe` installer.
+   *
+   * @see {@link NsisOptions}
+   */
+  readonly nsis?: NsisOptions | null
+  /**
+   * NSIS web installer options.
+   *
+   * Like the standard NSIS installer but the app payload is downloaded from a remote URL at install
+   * time rather than bundled into the `.exe`. Useful for very large apps or staged rollouts.
+   *
+   * @see {@link NsisWebOptions}
+   */
+  readonly nsisWeb?: NsisWebOptions | null
+  /**
+   * Portable executable options.
+   *
+   * Produces a single `.exe` that requires no installation — it extracts and runs directly.
+   *
+   * @see {@link PortableOptions}
+   */
+  readonly portable?: PortableOptions | null
+  /**
+   * Windows Store (MSIX/AppX) package options.
+   *
+   * Produces a `.appx` or `.msix` package suitable for distribution through the Microsoft Store or
+   * side-loading.
+   *
+   * @see {@link AppXOptions}
+   */
+  readonly appx?: AppXOptions | null
+  /** MSIX package options. MSIX is the modern successor to AppX with additional deployment features. */
+  readonly msix?: MsixOptions | null
+  /**
+   * WiX-based MSI installer options.
+   *
+   * Produces a traditional `.msi` package built with the WiX Toolset. Best for enterprise
+   * deployments that require MSI-based installation policies.
+   *
+   * @see {@link MsiOptions}
+   */
+  readonly msi?: MsiOptions | null
+  /**
+   * MSI-wrapped NSIS installer options.
+   *
+   * Wraps the standard NSIS installer inside an MSI package so that it can be deployed via
+   * Group Policy or other MSI-only channels while preserving the NSIS installer UX.
+   *
+   * @see {@link MsiWrappedOptions}
+   */
+  readonly msiWrapped?: MsiWrappedOptions | null
+  /**
+   * Squirrel.Windows auto-update installer options.
+   *
+   * Requires the `electron-builder-squirrel-windows` optional dependency.
+   *
+   * @see {@link SquirrelWindowsOptions}
+   */
+  readonly squirrelWindows?: SquirrelWindowsOptions | null
+  /**
+   * General Linux build options shared across all Linux targets (icon, category, desktop entry,
+   * executable name, etc.). Target-specific compression and packaging options live in the
+   * per-format interfaces (`DebOptions`, `RpmOptions`, `PacmanOptions`, etc.).
+   *
+   * @see {@link LinuxConfiguration}
    */
   readonly linux?: LinuxConfiguration | null
   /**
    * Debian package options.
+   *
+   * Targets Debian, Ubuntu, and Debian-based distributions. Produces a `.deb` archive
+   * installable via `dpkg -i` or `apt install ./package.deb`.
+   *
+   * @see {@link DebOptions}
    */
   readonly deb?: DebOptions | null
   /**
-   * Snap options.
+   * Snapcraft configuration.
+   *
+   * Selects the snapcraft base and provides per-core options:
+   * - `base: "core18" | "core20" | "core22"` — legacy bases; still functional but not recommended
+   *   for new apps.
+   * - `base: "core24"` — modern base with the GNOME extension (recommended, requires Electron 25+).
+   * - `base: "custom"` — pass an existing `snapcraft.yaml` through unchanged; no plugs, extensions,
+   *   or desktop files are injected.
+   *
+   * @example
+   * ```json
+   * { "snapcraft": { "base": "core24", "core24": { "useLXD": true } } }
+   * ```
+   *
+   * @see {@link SnapcraftOptions}
    */
-  readonly snap?: SnapOptions | null
+  readonly snapcraft?: SnapcraftOptions | null
   /**
    * AppImage options.
+   *
+   * AppImage is a portable application format that bundles the app and its runtime dependencies
+   * into a single self-contained executable that runs on most Linux distributions without
+   * installation. The produced `.AppImage` file is executable after `chmod +x`.
+   *
+   * @see {@link AppImageOptions}
    */
   readonly appImage?: AppImageOptions | null
   /**
    * Flatpak options.
+   *
+   * Flatpak is a sandboxed application distribution format for Linux distributed via
+   * [Flathub](https://flathub.org/) or self-hosted OSTree repositories.
+   *
+   * @see {@link FlatpakOptions}
    */
   readonly flatpak?: FlatpakOptions | null
-  readonly pacman?: LinuxTargetSpecificOptions | null
-  readonly rpm?: LinuxTargetSpecificOptions | null
+  /**
+   * Pacman package options.
+   *
+   * Targets Arch Linux and Arch-based distributions (Manjaro, EndeavourOS, etc.).
+   * Produces a `.pacman` archive installable via `pacman -U ./package.pacman`.
+   *
+   * @see {@link PacmanOptions}
+   */
+  readonly pacman?: PacmanOptions | null
+  /**
+   * RPM package options.
+   *
+   * Targets Fedora, Red Hat Enterprise Linux, SUSE, and RPM-based distributions.
+   * Produces a `.rpm` archive installable via `rpm -i` or `dnf install ./package.rpm`.
+   *
+   * @see {@link RpmOptions}
+   */
+  readonly rpm?: RpmOptions | null
+  /**
+   * FreeBSD `pkg` package options.
+   *
+   * Produces a `.pkg` archive for the FreeBSD package manager.
+   */
   readonly freebsd?: LinuxTargetSpecificOptions | null
+  /**
+   * Solaris IPS package options.
+   *
+   * Produces a `.p5p` archive for the Solaris Image Packaging System (`pkg`).
+   */
   readonly p5p?: LinuxTargetSpecificOptions | null
+  /**
+   * Alpine Linux APK package options.
+   *
+   * Produces an `.apk` archive installable via `apk add --allow-untrusted ./package.apk`.
+   */
   readonly apk?: LinuxTargetSpecificOptions | null
 
   /**
-   * Whether to include *all* of the submodules node_modules directories
-   * @default false
-   */
-  includeSubNodeModules?: boolean
-
-  /**
-   * Whether to build the application native dependencies from source.
-   * @default false
-   */
-  buildDependenciesFromSource?: boolean
-  /**
-   * Whether to execute `node-gyp rebuild` before starting to package the app.
+   * Additional command-line arguments appended to the package manager's `install` command when
+   * electron-builder installs app dependencies (i.e., when `node_modules` is missing and a fresh
+   * install is required).
    *
-   * Don't [use](https://github.com/electron-userland/electron-builder/issues/683#issuecomment-241214075) [npm](http://electron.atom.io/docs/tutorial/using-native-node-modules/#using-npm) (neither `.npmrc`) for configuring electron headers. Use `electron-builder node-gyp-rebuild` instead.
-   * @default false
-   */
-  readonly nodeGypRebuild?: boolean
-  /**
-   * Additional command line arguments to use when installing app native deps.
+   * These arguments are appended **only** during the install phase, not during the rebuild phase.
+   * To influence `@electron/rebuild` directly, see {@link NativeModulesConfig.rebuildMode}.
+   *
+   * @example
+   * ```json
+   * { "npmArgs": ["--prefer-offline", "--ignore-scripts"] }
+   * ```
    */
   readonly npmArgs?: Array<string> | string | null
-  /**
-   * Whether to [rebuild](https://docs.npmjs.com/cli/rebuild) native dependencies before starting to package the app.
-   * @default true
-   */
-  readonly npmRebuild?: boolean
 
   /**
-   * The build version. Maps to the `CFBundleVersion` on macOS, and `FileVersion` metadata property on Windows. Defaults to the `version`.
-   * If `TRAVIS_BUILD_NUMBER` or `APPVEYOR_BUILD_NUMBER` or `CIRCLE_BUILD_NUM` or `BUILD_NUMBER` or `bamboo.buildNumber` or `CI_PIPELINE_IID` env defined, it will be used as a build version (`version.build_number`).
+   * Names of production dependencies that are excluded from the copied `node_modules`, even if they
+   * are declared in the `dependencies` section of `package.json`.
+   *
+   * electron-builder copies the resolved production dependency tree into the app. Some packages —
+   * notably `electron` — are already provided another way (the Electron runtime is embedded
+   * separately), so copying them would just duplicate what is already there. Such packages are
+   * excluded from the copy rather than rejected: they remain valid production dependencies for
+   * tooling purposes (e.g. SBOM, license, and vulnerability tracking) without being shipped twice.
+   *
+   * Only dependencies **declared by the app itself** are eligible: a listed name and the transitive
+   * dependencies required *only* by it are dropped, while anything also required by another (kept)
+   * production dependency stays bundled. A matching name that appears solely as a transitive
+   * dependency of a kept package is never excluded. Note that a kept package which `require()`s an
+   * excluded name at runtime *without declaring it* (relying on hoisting) will fail with
+   * `MODULE_NOT_FOUND` — declare such a dependency properly or remove the name from this list.
+   *
+   * Matching is by the dependency name as declared in `package.json`: an npm alias
+   * (`"custom-electron": "npm:electron@^30.0.0"`) is matched by its alias key (`custom-electron`),
+   * never by the underlying package name.
+   *
+   * Overriding this option **replaces** the default list, so include `electron` and `electron-builder`
+   * unless you intend to ship them. The most common reason to override is to *add* a dependency that a
+   * bundler (Vite, webpack, esbuild, …) already inlines into your app code: keep it in `dependencies`
+   * so SBOM/license tooling still sees it, and list it here so a duplicate copy is not packaged — e.g.
+   * `["electron", "electron-builder", "react", "react-dom"]`. Removing a default name keeps that
+   * package in the copied `node_modules`. Setting the option to `null` (or omitting it) applies the
+   * default list; to disable exclusion entirely, set it to an empty array `[]`. Each excluded package
+   * is logged once during packaging.
+   *
+   * @default ["electron", "electron-builder"]
+   */
+  readonly ignoredProductionDependencies?: Array<string> | null
+
+  /**
+   * Whether production dependencies that cannot be resolved during node-module collection are
+   * allowed — i.e. whether the build should continue with a warning instead of failing.
+   *
+   * During collection every production dependency must resolve to an installed package on disk. A
+   * dependency that does not resolve (`cannot find path for dependency` / `dependency not found on
+   * disk`) is not bundled, which typically breaks the packaged app at runtime with
+   * `MODULE_NOT_FOUND`.
+   *
+   * - `false` or `null` (default): the build fails after dependency collection completes,
+   *   reporting the **complete** list of missing production dependencies at once.
+   * - `string[]`: the listed dependency names are allowed to be missing; any other missing
+   *   production dependency still fails the build. Entries match the package name of the reported
+   *   `name@version` entry (e.g. `some-native-module`, `@scope/pkg`), or an exact `name@version`
+   *   string to allow only that resolved version to be missing.
+   * - `true`: missing production dependencies are only logged as warnings (the electron-builder
+   *   ≤ 26 behavior).
+   *
+   * Missing *optional* dependencies (declared in `optionalDependencies`, e.g. `fsevents` on
+   * Linux/Windows, or platform-specific packages) are always allowed and never fail the build.
+   *
+   * Independent of {@link ignoredProductionDependencies}, which controls which dependencies are
+   * excluded from the copied `node_modules`; this option only controls validation of the
+   * collection result.
+   *
+   * @default false
+   */
+  readonly allowMissingDependencies?: boolean | Array<string> | null
+
+  /**
+   * Configuration for native Node.js module installation and rebuilding.
+   *
+   * Groups all options that control how electron-builder handles native modules — from forcing
+   * source builds during install through to the `@electron/rebuild` compilation mode.
+   *
+   * @see {@link NativeModulesConfig}
+   */
+  readonly nativeModules?: NativeModulesConfig | null
+
+  /**
+   * The build number.
+   *
+   * Maps to the `--iteration` flag for FPM-based Linux targets and is appended to the version
+   * string in `CFBundleVersion` (macOS) and `FileVersion` (Windows) when {@link buildVersion} is
+   * not set explicitly.
+   *
+   * If not set, falls back to the first defined environment variable among:
+   * `BUILD_NUMBER`, `TRAVIS_BUILD_NUMBER`, `APPVEYOR_BUILD_NUMBER`, `CIRCLE_BUILD_NUM`,
+   * `BUILD_BUILDNUMBER`, `CI_PIPELINE_IID`.
+   */
+  readonly buildNumber?: string | null
+
+  /**
+   * The full build version string.
+   *
+   * Maps to `CFBundleVersion` on macOS and the `FileVersion` metadata field on Windows.
+   * Defaults to the `version` field from `package.json`.
+   *
+   * If `buildVersion` is not set but {@link buildNumber} is defined (or resolved from an
+   * environment variable), the effective build version becomes `${version}.${buildNumber}`.
    */
   readonly buildVersion?: string | null
 
   /**
-   * Whether to use [electron-compile](http://github.com/electron/electron-compile) to compile app. Defaults to `true` if `electron-compile` in the dependencies. And `false` if in the `devDependencies` or doesn't specified.
-   */
-  readonly electronCompile?: boolean
-
-  /**
-   * Returns the path to custom Electron build (e.g. `~/electron/out/R`). Zip files must follow the pattern `electron-v${version}-${platformName}-${arch}.zip`, otherwise it will be assumed to be an unpacked Electron app directory
-   */
-  readonly electronDist?: string | ((options: PrepareApplicationStageDirectoryOptions) => string)
-
-  /**
-   * The [electron-download](https://github.com/electron-userland/electron-download#usage) options.
-   */
-  readonly electronDownload?: ElectronDownloadOptions
-
-  /**
-   * The branding used by Electron's distributables. This is needed if a fork has modified Electron's BRANDING.json file.
-   */
-  readonly electronBranding?: ElectronBrandingOptions
-
-  /**
-   * The version of electron you are packaging for. Defaults to version of `electron`, `electron-prebuilt` or `electron-prebuilt-compile` dependency.
-   */
-  electronVersion?: string | null
-
-  /**
-   * The name of a built-in configuration preset (currently, only `react-cra` is supported) or any number of paths to config files (relative to project dir).
+   * Whether to download the FFmpeg library variant from Electron's release assets and replace the
+   * default (proprietary codec) FFmpeg library before signing.
    *
-   * The latter allows to mixin a config from multiple other configs, as if you `Object.assign` them, but properly combine `files` glob patterns.
-   *
-   * If `react-scripts` in the app dependencies, `react-cra` will be set automatically. Set to `null` to disable automatic detection.
+   * The alternate FFmpeg is compiled without proprietary codec support (H.264, AAC, etc.) and is
+   * required for distributing on certain platforms (e.g., Linux distributions that prohibit
+   * proprietary codecs). Enabling this swaps the bundled `ffmpeg` dynamic library before the app
+   * is signed.
    */
-  extends?: Array<string> | string | null
+  readonly downloadAlternateFFmpeg?: boolean
 
   /**
-   * Inject properties to `package.json`.
+   * Additional properties to deep-merge into the app's `package.json` at build time.
+   *
+   * Useful for injecting build-time metadata (e.g., a git commit hash or CI build URL) that
+   * should be readable at runtime via `require('./package.json')` or `import.meta.url`.
+   *
+   * @example
+   * ```json
+   * { "extraMetadata": { "commitHash": "abc1234", "buildDate": "2025-01-01" } }
+   * ```
    */
   readonly extraMetadata?: any
 
   /**
-   * Whether to fail if the application is not signed (to prevent unsigned app if code signing configuration is not correct).
+   * Whether to throw an error and abort the build if the app could not be code-signed, notarized, or have its
+   * auto-update manifests signed - and to verify the signatures the build produces.
+   *
+   * Set to `true` in release pipelines to catch missing or misconfigured signing credentials
+   * before producing unsigned artifacts. When `false` (the default), missing signing credentials
+   * produce a warning and the build continues unsigned.
+   *
+   * With `true`:
+   * - macOS: the app must be signed, which needs a macOS host, also in pull-request builds (set `CSC_FOR_PULL_REQUEST=true` to sign
+   *   them, or pass `-c.forceCodeSigning=false` there), and notarized: notarization credentials must be set when the build starts.
+   *   The output of a custom `mac.sign` signer is checked with `codesign --verify --deep --strict`, the stapled ticket with
+   *   `stapler validate`, a signed pkg with `pkgutil --check-signature`, and a DMG with `dmg.sign: true` must be signed.
+   * - Windows: every signed file is read back and must carry a valid Authenticode signature.
+   * - Every platform (the only effect on Linux): auto-update manifests must be signed, also by a build that does not publish.
+   * - A prepackaged app, which electron-builder does not sign, must already be signed (and, on macOS, notarized).
+   *
+   * Explicit opt-outs are honored with a warning: `mac.notarize: false`, `updateManifest: false`, `win.signExts` exclusions and a
+   * custom `nsis.script` (whose uninstaller electron-builder does not sign). `win.sign: false` and `mac.sign: null` contradict it
+   * and fail the build. `electron-builder verify` checks the build output afterwards.
+   *
    * @default false
    */
   readonly forceCodeSigning?: boolean
 
   /**
-   * *libui-based frameworks only* The version of NodeJS you are packaging for.
-   * You can set it to `current` to set the Node.js version that you use to run.
-   */
-  readonly nodeVersion?: string | null
-
-  /**
-   * *libui-based frameworks only* The version of LaunchUI you are packaging for. Applicable for Windows only. Defaults to version suitable for used framework version.
-   */
-  readonly launchUiVersion?: boolean | string | null
-
-  /**
-   * The framework name. One of `electron`, `proton`, `libui`. Defaults to `electron`.
-   */
-  readonly framework?: string | null
-
-  /**
-   * The function (or path to file or module id) to be [run after pack](#afterpack) (but before pack into distributable format and sign).
-   */
-  readonly afterPack?: ((context: AfterPackContext) => Promise<any> | any) | string | null
-  /**
-   * The function (or path to file or module id) to be [run after pack and sign](#aftersign) (but before pack into distributable format).
-   */
-  readonly afterSign?: ((context: AfterPackContext) => Promise<any> | any) | string | null
-
-  /**
-   * The function (or path to file or module id) to be run on artifact build start.
-   */
-  readonly artifactBuildStarted?: ((context: ArtifactBuildStarted) => Promise<any> | any) | string | null
-  /**
-   * The function (or path to file or module id) to be run on artifact build completed.
-   */
-  readonly artifactBuildCompleted?: ((context: ArtifactCreated) => Promise<any> | any) | string | null
-  /**
-   * The function (or path to file or module id) to be [run after all artifacts are build](#afterAllArtifactBuild).
-   */
-  readonly afterAllArtifactBuild?: ((context: BuildResult) => Promise<Array<string>> | Array<string>) | string | null
-  /**
-   * MSI project created on disk - not packed into .msi package yet.
-   */
-  readonly msiProjectCreated?: ((path: string) => Promise<any> | any) | string | null
-  /**
-   * Appx manifest created on disk - not packed into .appx package yet.
-   */
-  readonly appxManifestCreated?: ((path: string) => Promise<any> | any) | string | null
-  /**
-   * The function (or path to file or module id) to be [run on each node module](#onnodemodulefile) file.
-   */
-  readonly onNodeModuleFile?: ((file: string) => void) | string | null
-  /**
-   * The function (or path to file or module id) to be run before dependencies are installed or rebuilt. Works when `npmRebuild` is set to `true`. Resolving to `false` will skip dependencies install or rebuild.
+   * Whether to remove the `scripts` field from bundled `package.json` files.
    *
-   * If provided and `node_modules` are missing, it will not invoke production dependencies check.
-   */
-  readonly beforeBuild?: ((context: BeforeBuildContext) => Promise<any>) | string | null
-
-  /**
-   * Whether to build using Electron Build Service if target not supported on current OS.
-   * @default true
-   */
-  readonly remoteBuild?: boolean
-
-  /**
-   * Whether to include PDB files.
-   * @default false
-   */
-  readonly includePdb?: boolean
-
-  /**
-   * Whether to remove `scripts` field from `package.json` files.
+   * Lifecycle scripts (`preinstall`, `postinstall`, etc.) have no meaning inside a packaged
+   * Electron app and can trigger unintended behaviour if any tooling inspects the bundled
+   * `package.json`. Removing them reduces artifact size and prevents accidental execution.
    *
    * @default true
    */
   readonly removePackageScripts?: boolean
 
   /**
-   * Whether to remove `keywords` field from `package.json` files.
+   * Whether to remove the `keywords` field from bundled `package.json` files.
+   *
+   * The `keywords` array is only meaningful for package registry discoverability and has no
+   * runtime value inside a packaged Electron app. Removing it marginally reduces artifact size.
    *
    * @default true
    */
   readonly removePackageKeywords?: boolean
+
+  /**
+   * Options forwarded to [`@electron/fuses`](https://github.com/electron/fuses) to flip Electron
+   * feature flags in the binary.
+   *
+   * Fuses are compile-time-like flags baked into the Electron binary that cannot be changed at
+   * runtime. Flipping them is the approved mechanism for hardening Electron apps (e.g., disabling
+   * `ELECTRON_RUN_AS_NODE`, enabling ASAR integrity, etc.).
+   *
+   * electron-builder flips fuses after packaging but before signing so that the final signature
+   * covers the modified binary.
+   *
+   * @see {@link FuseOptionsV1}
+   */
+  readonly electronFuses?: FuseOptionsV1 | null
+
+  /**
+   * Configuration for experimental concurrent (multi-platform / multi-arch) builds.
+   *
+   * When `jobs > 1`, electron-builder runs up to `jobs` platform builds in parallel. This is an
+   * experimental feature — use with caution and verify that your hook functions and build resources
+   * are safe to execute concurrently.
+   *
+   * @see {@link Concurrency}
+   */
+  readonly concurrency?: Concurrency | null
 }
 
-export interface AfterPackContext {
+/**
+ * The root build configuration object passed to electron-builder.
+ *
+ * Extends {@link CommonConfiguration} with top-level Electron-specific options, configuration
+ * inheritance/presets, and all per-platform build hooks.
+ */
+export interface Configuration extends CommonConfiguration, PlatformSpecificBuildOptions, Hooks {
+  /**
+   * Options forwarded to [`@electron/get`](https://github.com/electron/get) when downloading the
+   * Electron distribution to package.
+   *
+   * `checksums` (a map of artifact file name → SHA-256 hex) makes checksum validation fully offline —
+   * without it, `@electron/get` fetches `SHASUMS256.txt` from the network on every build, even when the
+   * artifact itself is already cached. When `checksums` is not configured, electron-builder automatically
+   * picks up a locally seeded `SHASUMS256.txt-<version>` (or `SHASUMS256.txt`) file at the root of the
+   * Electron cache directory. See the
+   * [air-gapped / offline builds guide](https://www.electron.build/tutorials/offline-air-gapped-builds).
+   */
+  readonly electronGet?: ElectronGetOptions | null
+
+  /**
+   * Electron branding overrides.
+   *
+   * Required only when packaging a custom Electron fork that ships a modified `BRANDING.json`
+   * (e.g., a fork that renames the `Electron Helper` process or the `Electron Framework`).
+   * Standard Electron builds do not need this.
+   */
+  readonly electronBranding?: ElectronBrandingOptions
+
+  /**
+   * The Electron version to package against.
+   *
+   * Defaults to the version of the `electron` (or `electron-prebuilt`) dependency declared in
+   * `package.json`. Set this explicitly only when the installed Electron version is not the one
+   * you want to package against (e.g., in monorepos where the Electron dependency lives in a
+   * different workspace).
+   */
+  electronVersion?: string | null
+
+  /**
+   * Whether to write `builder-effective-config.yaml` (the resolved configuration, including the detected
+   * `electronVersion`) to the output directory.
+   *
+   * Defaults to writing it only for local interactive builds: not on CI and not when stdout is piped.
+   * Set `true` to always write it, e.g. to read the resolved configuration in a CI step, or `false` to never write it.
+   */
+  readonly writeEffectiveConfig?: boolean | null
+
+  /**
+   * One or more configuration presets or file paths to merge into this configuration.
+   *
+   * Accepts a string or array of strings, each of which is either:
+   * - A built-in preset name (`"react-cra"` is the only currently supported value).
+   * - A path to a JS/JSON config file relative to the project directory.
+   *
+   * Configs are merged left-to-right using a deep-assign strategy that properly combines `files`
+   * glob patterns rather than replacing them.
+   *
+   * The `react-cra` preset is applied automatically when `react-scripts` is found in
+   * `dependencies`. Set `extends: null` to opt out of automatic preset detection.
+   */
+  extends?: Array<string> | string | null
+}
+
+/**
+ * Configuration for native Node.js module installation and rebuilding.
+ *
+ * All options that control how electron-builder handles native modules — from forcing source
+ * builds at install time through to the `@electron/rebuild` compilation mode.
+ */
+export interface NativeModulesConfig {
+  /**
+   * Whether to pass `--build-from-source` to the package manager when installing native
+   * dependencies, forcing them to compile from source rather than using pre-built binaries.
+   *
+   * Useful when pre-built binaries are not available for the target platform/arch combination,
+   * or when you need to ensure native modules are compiled against the exact Electron ABI.
+   *
+   * Only honored when the target platform matches the host platform: native modules cannot be
+   * cross-compiled from source for another OS, so for a cross-platform target native dependencies are
+   * rebuilt with prebuilt binaries for that target instead (and a warning is logged).
+   *
+   * @default false
+   */
+  buildDependenciesFromSource?: boolean
+
+  /**
+   * Whether to run `node-gyp rebuild` with Electron headers before packaging.
+   *
+   * This is a low-level escape hatch for cases where the standard `@electron/rebuild` path
+   * (controlled by {@link npmRebuild}) is insufficient. Most projects should leave this `false`
+   * and rely on `@electron/rebuild` instead.
+   *
+   * When `true`, electron-builder runs `node-gyp rebuild` with the correct `npm_config_*`
+   * environment variables set for the target Electron version and architecture before the
+   * normal rebuild step.
+   *
+   * @default false
+   */
+  readonly nodeGypRebuild?: boolean
+
+  /**
+   * Whether to rebuild native Node.js modules for the target Electron version and architecture
+   * before packaging.
+   *
+   * When `true` (the default), electron-builder runs `@electron/rebuild` against the app's
+   * `node_modules` directory to ensure all native modules are compiled against the correct Electron
+   * ABI. Set to `false` to skip this step entirely — useful when native modules are pre-built
+   * elsewhere in your pipeline or when the app has no native dependencies.
+   *
+   * The compilation mode (`sequential` vs `parallel`) is controlled by {@link rebuildMode}.
+   *
+   * @default true
+   */
+  readonly npmRebuild?: boolean
+
+  /**
+   * Compilation mode for `@electron/rebuild`.
+   *
+   * - `"sequential"` — rebuilds native modules one at a time. Safer in memory-constrained
+   *   environments and produces cleaner log output.
+   * - `"parallel"` — rebuilds all native modules concurrently. Faster on machines with many cores
+   *   and plentiful memory, but may exhaust resources on CI agents with limited RAM.
+   *
+   * @default "sequential"
+   */
+  readonly rebuildMode?: "sequential" | "parallel" | null
+
+  /**
+   * Whether to verify, after the app is packed, that every native binary shipped in the app was built for
+   * the target platform and architecture.
+   *
+   * electron-builder reads the header of each `.node` addon (and of other native libraries and executables
+   * such as `.so`, `.dylib`, `.dll`, `.exe`) in `app.asar`, `app.asar.unpacked` or the unpacked `app`
+   * directory, and compares its format (ELF / Mach-O / PE) and machine type against the target (for
+   * a macOS universal build, each per-arch slice is checked before the slices are merged). This catches a
+   * stale or host-platform binary left in `node_modules` by a skipped or cached rebuild, which otherwise
+   * only surfaces at runtime as `invalid ELF header` / `not a valid Win32 application` /
+   * `incompatible architecture`.
+   *
+   * Files whose package declares another platform via `package.json` `os`/`cpu`, or whose path names
+   * another platform/arch (e.g. prebuildify's `prebuilds/linux-arm64/`), are not loaded for this target
+   * and are ignored.
+   *
+   * - `true` (default) — a mismatched `.node` addon fails the build; other mismatched native files log a warning.
+   * - `"warn"` — log every mismatch as a warning and continue.
+   * - `false` — skip the check.
+   *
+   * @default true
+   */
+  readonly verifyNativeBinaries?: boolean | "warn" | null
+}
+
+export type Hook<T, V> = (contextOrPath: T) => Promise<V> | V
+
+export interface PackContext {
   readonly outDir: string
   readonly appOutDir: string
   readonly packager: PlatformPackager<any>
@@ -270,24 +692,554 @@ export interface AfterPackContext {
   readonly arch: Arch
   readonly targets: Array<Target>
 }
+export type AfterPackContext = PackContext
+export type BeforePackContext = PackContext
+export type AfterExtractContext = PackContext
 
+/**
+ * Version pins and custom bundle overrides for the binary toolsets that electron-builder downloads and caches locally.
+ *
+ * Each toolset is a versioned archive hosted at [electron-userland/electron-builder-binaries](https://github.com/electron-userland/electron-builder-binaries/releases).
+ * Omitting a property (or setting it to `latest`) selects the modern default for that toolset.
+ *
+ * To supply your own bundle, set the property to a {@link ToolsetCustom} object with a `url` (https:// or file://) and a `checksum` for verification. The bundle must mirror the expected directory layout of the corresponding built-in bundle; see the build scripts at
+ * https://github.com/electron-userland/electron-builder-binaries/tree/master/packages.
+ *
+ * Toolsets, the versions offered for each, and what `latest` resolves to can be added, changed or removed in any electron-builder release (minor or patch), not only in a major release. (To address toolset stability, reported issues, adopt latest tooling versions, etc.)
+ */
+export interface ToolsetConfig {
+  /**
+   * Version of the `win-codesign` bundle used for Windows code signing and resource editing.
+   *
+   * The bundle ships:
+   * - **`signtool.exe`** (Windows) / **`osslsigncode`** (macOS & Linux) — used to sign `.exe`,
+   *   `.dll`, and `.msix` artifacts.
+   * - **`rcedit`** — embeds version metadata and icons into `.exe` files (legacy usage, migrated to npm `resedit` package).
+   * - **Windows Kits** — used by AppX/MSIX packaging (`makeappx`, `signtool`).
+   *
+   * Available versions:
+   * | Version | Notes |
+   * |---------|-------|
+   * | `"0.0.0"` | Legacy bundle — `winCodeSign-2.6.0` (pre-v27) |
+   * | `"1.0.0"` | Windows Kits 10.0.26100.0, `osslsigncode` v2.9 |
+   * | `"1.1.1"` | Updates `osslsigncode` to v2.11 |
+   * | `"1.2.1"` | Adds native `osslsigncode` arm64 |
+   * | `"1.3.0"` | Includes support for Azure Trusted Signing `signtool` via dlib and .NET 8 runtime |
+   * | `"1.3.1"` | macOS `osslsigncode` bundles its own OpenSSL (no Homebrew `openssl@3` needed) and libp11's PKCS#11 provider |
+   * | `"1.3.3"` | Linux `osslsigncode` bundles its own OpenSSL (no system OpenSSL 1.1 needed); `osslsigncode` 2.14 and .NET runtime 8.0.33 |
+   *
+   * Releases: https://github.com/electron-userland/electron-builder-binaries/blob/master/packages/win-codesign/CHANGELOG.md
+   *
+   * @default "latest"
+   */
+  readonly winCodeSign?: "0.0.0" | "1.0.0" | "1.1.0" | "1.1.1" | "1.2.1" | "1.3.0" | "1.3.1" | "1.3.3" | ToolsetCustom | "latest"
+
+  /**
+   * Version of the AppImage toolset bundle used for building `.AppImage` files.
+   *
+   * The bundle ships:
+   * - **`mksquashfs`** — creates the SquashFS filesystem embedded in the AppImage. It also packs legacy-base (core18/core20/core22) snaps built from the snap template app.
+   * - **`desktop-file-validate`** — validates the generated `.desktop` entry.
+   * - **AppImage runtime** — the self-executing stub that mounts the SquashFS at launch.
+   *
+   * Available versions:
+   * | Version | Runtime date | Notes |
+   * |---------|-------------|-------|
+   * | `"0.0.0"` | Legacy | FUSE2-based AppImage runtime (pre-v27) |
+   * | `"1.0.3"` | 20251108 | Introduces static AppImage runtime |
+   * | `"1.1.0"` | 20251108 | Adds `unsquashfs` support |
+   * | `"1.2.1"` | 20251108 | squashfs-tools 4.7.5 with a statically linked zstd 1.5.7, so Linux and macOS hosts produce identical images; ships the bundled components' license files |
+   *
+   * An explicit version pin always selects exactly that release.
+   *
+   * Releases: https://github.com/electron-userland/electron-builder-binaries/blob/master/packages/appimage/CHANGELOG.md
+   *
+   * @default "latest"
+   */
+  readonly appimage?: "0.0.0" | "1.0.3" | "1.1.0" | "1.2.1" | ToolsetCustom | "latest"
+
+  /**
+   * Version of the NSIS toolset bundle used to compile Windows installers.
+   *
+   * The bundle ships:
+   * - **`makensis`** — the NSIS compiler invoked to build `.nsi` scripts into `.exe` installers.
+   * - **NSIS plugins** — the plugin DLLs (`NsisMultiUser`, `UAC`, `StdUtils`, etc.) referenced by
+   *   electron-builder's default installer scripts.
+   * - **`elevate.exe`** — UAC elevation helper included in NSIS installers.
+   *
+   * Available versions:
+   * | Version | `makensis` version | Notes |
+   * |---------|------------------|-------|
+   * | `"0.0.0"` | 3.0.4.1 | Legacy split bundle — `nsis` + `nsis-resources` archives (pre-v27) |
+   * | `"1.2.1"` | 3.12 | Unified bundle — single archive, entrypoint scripts auto-set `NSISDIR` |
+   * | `"2.0.4"` | 3.13 | Compiled from source, `NSIS_MAX_STRLEN=8192` — two bundles: the default, and a `-log` bundle whose `makensis` and stubs are log-enabled (`NSIS_CONFIG_LOG=yes`), used when `installerDebugLogging` is on |
+   *
+   * Releases: https://github.com/electron-userland/electron-builder-binaries/blob/master/packages/nsis/CHANGELOG.md
+   *
+   * A custom bundle (a {@link ToolsetCustom} object) must follow the layout at
+   * https://www.electron.build/docs/toolsets#custom-nsis-bundle-layout
+   *
+   * @default "latest"
+   */
+  readonly nsis?: "0.0.0" | "1.2.1" | "2.0.4" | ToolsetCustom | "latest"
+
+  /**
+   * Version of the WiX Toolset bundle used to build `msi` and `msiWrapped` installers.
+   *
+   * The bundle ships **`candle.exe`** and **`light.exe`** (compile and link the generated `.wxs` project) and the WiX
+   * extensions (`WixUIExtension` for assisted installers). On macOS and Linux they run under Wine with wine-mono.
+   *
+   * Available versions:
+   * | Version | WiX version | Notes |
+   * |---------|-------------|-------|
+   * | `"0.0.0"` | 4.0.0.5512 (preview) | Legacy bundle (pre-v27). An `arm64` app is packaged in an `x64` MSI, because this toolset has no `arm64` |
+   * | `"2.0.0"` | 3.14.1 | Builds a native `arm64` MSI for `arm64` |
+   *
+   * The `.wxs` project uses the WiX 3 schema with `"2.0.0"`: an `msiProjectCreated` hook that inserts elements of a WiX 4
+   * extension namespace must use the WiX 3 one (for example `http://schemas.microsoft.com/wix/UtilExtension`), or pin `"0.0.0"`.
+   *
+   * A custom bundle (a {@link ToolsetCustom} object) must have the WiX v3 layout: `candle.exe`, `light.exe` and the
+   * extensions at its root.
+   *
+   * Releases: https://github.com/electron-userland/electron-builder-binaries/blob/master/packages/wix/CHANGELOG.md
+   *
+   * @default "latest"
+   */
+  readonly wix?: "0.0.0" | "2.0.0" | ToolsetCustom | "latest"
+
+  /**
+   * Version of the Wine bundle used to run Windows tools (NSIS, rcedit, signtool) on
+   * non-Windows hosts (macOS and Linux).
+   *
+   * Wine is only required when building Windows targets on a non-Windows machine. On Windows,
+   * this setting has no effect.
+   *
+   * Available versions:
+   * | Version | Wine version | Platform support | Notes |
+   * |---------|-------------|-----------------|-------|
+   * | `"0.0.0"` | 4.0.1 | macOS | Legacy portable bundle (pre-v27) |
+   * | `"1.0.1"` | 11.0 | macOS | Supports arm64 macOS via Rosetta |
+   * | `"system"` | host install | macOS, Linux | Uses the host Wine at a fixed install location instead of a bundle |
+   *
+   * `"system"` is the replacement for the `USE_SYSTEM_WINE` environment variable removed in v27, and
+   * is what `"latest"` (the default) currently resolves to on every platform: the published `"1.0.1"`
+   * bundles ship no PE builtins, so a host Wine installation is required to build Windows targets on
+   * macOS or Linux.
+   *
+   * The host Wine (`"system"`) is started by absolute path, never looked up on `PATH`: it is the `wine` entry of
+   * {@link executables}, which lists its default install locations and is where a Wine installed elsewhere is set.
+   * Setting both a bundle that would be used (a `ToolsetCustom` object, or a version on macOS; on Linux a version selects no
+   * bundle) and `executables.wine` is a configuration error.
+   *
+   * To use a custom Wine bundle, use a `ToolsetCustom` object.
+   *
+   * Releases: https://github.com/electron-userland/electron-builder-binaries/blob/master/packages/wine/CHANGELOG.md
+   *
+   * @default "latest"
+   */
+  readonly wine?: "0.0.0" | "1.0.1" | "system" | ToolsetCustom | "latest"
+
+  /**
+   * Version of the FPM bundle used to build Linux packages (`.deb`, `.rpm`, `.pacman`, etc.)
+   * on macOS and Linux hosts.
+   *
+   * Available versions:
+   * | Version | FPM version | Notes |
+   * |---------|------------|-------|
+   * | `"2.2.1"` | 1.17.0 (Ruby 3.4.3) | Previous default |
+   * | `"2.3.1"` | 1.18.0 (Ruby 3.4.12) | Linux bundles link a static OpenSSL 3.5.9 instead of OpenSSL 1.1.1 |
+   *
+   * An explicit version pin always selects exactly that release.
+   *
+   * Releases: https://github.com/electron-userland/electron-builder-binaries/blob/master/packages/fpm/CHANGELOG.md
+   *
+   * @default "latest"
+   */
+  readonly fpm?: "2.2.1" | "2.3.1" | ToolsetCustom | "latest"
+
+  /**
+   * The archive and packaging tools that fpm and the `tar.lz` target run, on macOS and Linux hosts: `xz`, `lzip`, GNU `tar`
+   * (`tar`, `gtar`), GNU `ar` (`ar`, `gar`) and `bsdtar`, plus `rpm` and `rpmbuild` (rpm 6.1.0) on Linux x64 and arm64 and macOS arm64.
+   * Its `bin` directory goes first on fpm's `PATH`. On Intel macOS and 32-bit Linux, which get no bundled `rpmbuild`,
+   * building `rpm` uses the host `rpmbuild` on `PATH`. A {@link ToolsetCustom} bundle must have the same `bin/` layout.
+   * `"system"` uses the host's tools (no download); `tar.lz` then uses `lzip` from {@link executables}.
+   *
+   * Releases: https://github.com/electron-userland/electron-builder-binaries/blob/master/packages/archive/CHANGELOG.md
+   *
+   * @default "latest"
+   */
+  readonly archive?: "1.0.0" | "system" | ToolsetCustom | "latest"
+
+  /**
+   * Version of the 7-Zip binary bundle used internally to extract `.7z` and `.tar.xz` archives.
+   *
+   * Set to a {@link ToolsetCustom} object to supply your own 7za binary.
+   * The `url` must point to a directory (or a `.tar.gz`/`.zip` archive of one) that contains
+   * `bin/7za` (macOS/Linux) or `bin/7za.exe` (Windows).
+   *
+   * **Bootstrap constraint:** the custom bundle itself must be a `.tar.gz` or `.zip` archive
+   * (or a bare `file://` directory). `.7z` and `.tar.xz` archives cannot be used here because
+   * extracting them requires 7za — a circular dependency.
+   *
+   * Available versions:
+   * | Version | Notes |
+   * |---------|-------|
+   * | `"1.0.0"` | Shipped the 32-bit `7za.exe` for every Windows arch (1.75 GiB memory cap, no LZMA2 multithreading on x64/arm64) |
+   * | `"1.0.1"` | 24.09 - Correct per-arch Windows binaries (x64, ia32, arm64) |
+   * | `"1.1.0"` | 26.05 |
+   *
+   * Releases: https://github.com/electron-userland/electron-builder-binaries/blob/master/packages/7zip/CHANGELOG.md
+   *
+   * @default "latest"
+   */
+  readonly sevenZip?: "1.0.0" | "1.0.1" | "1.1.0" | ToolsetCustom | "latest"
+
+  /**
+   * Version of the icons-conversion bundle used to convert source images to `.icns`, `.ico`,
+   * and PNG icon sets.
+   *
+   * Set to a {@link ToolsetCustom} object to supply your own icons bundle directory.
+   *
+   * Available versions:
+   * | Version | Notes |
+   * |---------|-------|
+   * | `"1.2.3"` | Writes 16px/32px ICNS entries as `ic04`/`ic05` ARGB (fixes corrupt small icons in Finder) |
+   *
+   * Releases: https://github.com/electron-userland/electron-builder-binaries/blob/master/packages/icons/CHANGELOG.md
+   *
+   * @default "latest"
+   */
+  readonly icons?: "1.2.3" | ToolsetCustom | "latest"
+
+  /**
+   * Version of the `squirrel.windows` bundle used to build Squirrel.Windows installers.
+   *
+   * The bundle ships the Squirrel vendor toolset under `electron-winstaller/vendor/`:
+   * - **`Squirrel.exe`** / **`Squirrel-Mono.exe`** — releasify the app into `Setup.exe` (and an optional MSI).
+   * - **`SyncReleases.exe`** — downloads prior releases to produce delta packages.
+   * - **`nuget.exe`**, **`7z`** — pack the app into a `.nupkg` and compress release assets.
+   *
+   * `rcedit.exe` is provisioned from the {@link winCodeSign} toolset at runtime (on every platform;
+   * under Wine on non-Windows hosts). Building an MSI additionally uses the shared WiX toolset.
+   *
+   * Available versions:
+   * | Version | Notes |
+   * |---------|-------|
+   * | `"1.1.1"` | Squirrel.Windows 2.0.1 (patched) with a standalone, checksum-verified `nuget.exe` 6.14.0 |
+   * | `"1.2.1"` | Pinned, checksum-verified 7-Zip 26.05 (adds native `7z-arm64`, selected on arm64 Windows hosts) and `nuget.exe` 7.9.0 |
+   *
+   * Set to a {@link ToolsetCustom} object to supply your own bundle — it must contain the
+   * `electron-winstaller/vendor/` subtree. Only used when building the `squirrelWindows` target.
+   *
+   * Releases: https://github.com/electron-userland/electron-builder-binaries/blob/master/packages/squirrel.windows/CHANGELOG.md
+   *
+   * @default "latest"
+   */
+  readonly squirrel?: "1.1.1" | "1.2.1" | ToolsetCustom | "latest"
+
+  /**
+   * Where the host programs that electron-builder starts are installed on the build machine, by program name.
+   *
+   * electron-builder starts these programs only from an absolute path, never by looking up a name on `PATH`. For each one it
+   * uses the first location that is an executable file: from this entry when it is set, otherwise from a built-in list of
+   * default install locations for the host operating system (see https://www.electron.build/docs/toolsets#executables).
+   * An entry replaces the default list for that program; it is not merged with it.
+   *
+   * @example
+   * ```json
+   * {
+   *   "toolsets": {
+   *     "executables": {
+   *       "mono": "file:///opt/homebrew/bin/mono",
+   *       "pwsh": ["file:///usr/local/microsoft/powershell/7/pwsh", "file:///opt/microsoft/powershell/7/pwsh"],
+   *       "powershell": "file:///C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+   *     }
+   *   }
+   * }
+   * ```
+   */
+  readonly executables?: ExecutablesConfig | null
+}
+
+/**
+ * A custom toolset bundle supplied by the user in place of a built-in versioned bundle.
+ *
+ * The bundle must mirror the expected directory layout of the corresponding built-in bundle.
+ * See the build scripts at
+ * https://github.com/electron-userland/electron-builder-binaries/tree/master/packages.
+ *
+ * File formats supported for `url` archives: `.zip`, `.7z`, `.tar.gz`, `.tar.xz`.
+ *
+ * `checksum` is the SHA-256 of the archive as 64 hex characters or its SHA-512 as 88 base64 characters (the format v26
+ * used for all toolset checksums), the same for every toolset. See https://www.electron.build/docs/toolsets#custom-toolset-checksum
+ *
+ * @example
+ * ```json
+ * {
+ *   "toolsets": {
+ *     "nsis": {
+ *       "url": "file:///path/to/my-nsis-bundle.tar.gz",
+ *       "checksum": "56997fdefe25e7928a1a68b4583d08b240b66cf660234053b20131a74cc082f4",
+ *       "version": "my-custom-1.0"
+ *     }
+ *   }
+ * }
+ * ```
+ */
+export interface ToolsetCustom {
+  /**
+   * The `https://` URL or `file://` path to load the custom toolset bundle from.
+   *
+   * - `https://` — downloaded and cached locally; the archive is extracted before use.
+   * - `file:///absolute/path` — used directly; relative paths must be within the project resources dir.
+   *
+   * Archives (`.zip`, `.7z`, `.tar.gz`, `.tar.xz`) are extracted automatically.
+   * A bare directory path (no archive) is used as-is.
+   */
+  readonly url: string
+
+  /**
+   * Checksum of the bundle archive, in one of two formats:
+   * - the SHA-256 as 64 hex characters (uppercase is lowercased), e.g. `shasum -a 256 <archive>` (macOS / Linux),
+   *   `(Get-FileHash -Algorithm SHA256 <archive>).Hash` (PowerShell) or `certutil -hashfile <archive> SHA256`;
+   * - the SHA-512 as 88 base64 characters, the format v26 used for all toolset checksums, e.g.
+   *   `openssl dgst -sha512 -binary <archive> | openssl base64 -A`.
+   *
+   * Prefixed forms such as `sha256:…` or `sha512-…`, and a hex-encoded SHA-512, are rejected before anything is downloaded.
+   * A downloaded archive is verified before it is cached or extracted, and a local `file://` archive before it is extracted.
+   *
+   * Required for remote (`https://`) URLs and local archive files (`file://`).
+   * Not needed for bare directory paths — the directory is used as-is with no caching and no verification.
+   * @see https://www.electron.build/docs/toolsets#custom-toolset-checksum
+   */
+  readonly checksum?: string
+
+  /**
+   * Optional version label used in the local cache directory name.
+   * Falls back to the first 8 hex characters of the `checksum` digest when omitted.
+   */
+  readonly version?: string
+}
+
+/**
+ * Lifecycle hooks that run at specific points during the electron-builder pipeline.
+ *
+ * Each hook can be specified as:
+ * - An **inline function** (JavaScript/TypeScript config files only):
+ *   ```js
+ *   // electron-builder.config.js
+ *   module.exports = { beforePack: async (context) => { /* ... *\/ } }
+ *   ```
+ * - A **path** to a CommonJS/ESM module (relative to the project directory) that exports the
+ *   hook as its **default export**:
+ *   ```json
+ *   { "build": { "beforePack": "./scripts/myHook.js" } }
+ *   ```
+ *   ```js
+ *   // scripts/myHook.js
+ *   export default async function (context) { /* ... *\/ }
+ *   ```
+ */
+export interface Hooks {
+  /**
+   * Called immediately before electron-builder begins packing the app for each platform/arch
+   * combination.
+   *
+   * Use this hook to perform last-minute modifications to source files or build resources before
+   * they are read by the packager.
+   *
+   * Receives a {@link BeforePackContext}.
+   */
+  readonly beforePack?: Hook<BeforePackContext, void> | string | null
+
+  /**
+   * Called after the prebuilt Electron binary has been extracted to the staging directory but
+   * before the app files have been copied into it.
+   *
+   * Use this hook to patch or augment the Electron binary itself (e.g. rename helper processes,
+   * inject native libraries) before the app payload is laid down on top.
+   *
+   * Receives an {@link AfterExtractContext}.
+   */
+  readonly afterExtract?: Hook<AfterExtractContext, void> | string | null
+
+  /**
+   * Called after the app files have been copied into the staging directory (and ASAR created if
+   * applicable) but **before** signing and before the output archive/installer is built.
+   *
+   * Use this hook to post-process the staged app bundle (e.g. strip debug symbols, inject
+   * platform-specific resources).
+   *
+   * Receives an {@link AfterPackContext}.
+   */
+  readonly afterPack?: Hook<AfterPackContext, void> | string | null
+
+  /**
+   * Called after code signing but **before** the signed app is packed into the final
+   * distributable format (e.g. before `dmg` is created from the signed `.app`).
+   *
+   * Use this hook to perform post-sign validation or to add signed resources that are not part of
+   * the main app bundle.
+   *
+   * Receives an {@link AfterPackContext}.
+   */
+  readonly afterSign?: Hook<AfterPackContext, void> | string | null
+
+  /**
+   * Called when an individual artifact build starts (e.g. just before a `.dmg` or `.exe` is
+   * written to disk).
+   *
+   * Receives an {@link ArtifactBuildStarted}.
+   */
+  readonly artifactBuildStarted?: Hook<ArtifactBuildStarted, void> | string | null
+
+  /**
+   * Called when an individual artifact has been successfully built and written to disk.
+   *
+   * Use this hook to collect artifact paths, upload to custom destinations, or trigger
+   * post-processing steps.
+   *
+   * Receives an {@link ArtifactCreated}.
+   */
+  readonly artifactBuildCompleted?: Hook<ArtifactCreated, void> | string | null
+
+  /**
+   * Called after **all** artifacts across all platforms/architectures have been built.
+   *
+   * May return an array of additional file paths that should be treated as publish targets
+   * (i.e. uploaded to the configured publisher).
+   *
+   * Receives a {@link BuildResult}.
+   *
+   * @example
+   * ```js
+   * export default async function afterAllArtifactBuild(result) {
+   *   return ["/path/to/extra-file.txt"]
+   * }
+   * ```
+   */
+  readonly afterAllArtifactBuild?: Hook<BuildResult, Array<string>> | string | null
+
+  /**
+   * Called after the WiX MSI project XML has been written to a temporary directory but before
+   * `candle.exe` / `light.exe` compile it into a `.msi` package.
+   *
+   * The hook receives the path to the project directory as a string. Use it to patch the generated
+   * `.wxs` files for customizations not exposed through electron-builder's options.
+   */
+  readonly msiProjectCreated?: Hook<string, void> | string | null
+
+  /**
+   * Called after the AppX/MSIX manifest XML has been written to the staging directory but before
+   * `makeappx` packages it.
+   *
+   * The hook receives the path to the manifest file as a string. Use it to inject custom manifest
+   * extensions (capabilities, protocol handlers, etc.) not exposed through {@link AppXOptions}.
+   */
+  readonly appxManifestCreated?: Hook<string, void> | string | null
+
+  /**
+   * Called after the `distribution.xml` of a macOS `pkg` installer has been written (synthesized by
+   * `productbuild --synthesize`, then customized from {@link PkgOptions}) but before `productbuild` builds the
+   * installer from it.
+   *
+   * The hook receives the path to the distribution file as a string. Edit it in place or overwrite it to
+   * customize the installer beyond {@link PkgOptions} (for example, its `<title>`).
+   */
+  readonly pkgDistributionCreated?: Hook<string, void> | string | null
+
+  /**
+   * Called for every file inside each `node_modules` package directory as electron-builder
+   * decides whether to include it in the packaged app.
+   *
+   * Return `true` to force-include the file regardless of the default exclusion rules.
+   * Return `false` or `undefined` to let electron-builder apply its normal filtering logic.
+   *
+   * Receives the absolute path of the file as a string.
+   */
+  readonly onNodeModuleFile?: Hook<string, void | boolean> | string | null
+
+  /**
+   * Called before dependencies are installed or native modules are rebuilt.
+   *
+   * Return `false` (or a `Promise` that resolves to `false`) to skip the install/rebuild step
+   * entirely — useful when you manage `node_modules` externally (e.g. in a CI pipeline that
+   * restores them from cache). When not set, electron-builder proceeds with the normal
+   * install/rebuild flow.
+   *
+   * If this hook is provided and `node_modules` is missing, electron-builder will not perform
+   * the production-dependencies check.
+   *
+   * Receives a {@link BeforeBuildContext}.
+   */
+  readonly beforeBuild?: Hook<BeforeBuildContext, boolean | void> | string | null
+
+  /**
+   * Override the source of the Electron distribution to stage.
+   *
+   * Should return the path to either:
+   * - A **directory** containing a pre-built, unpacked Electron app (e.g. `~/electron/out/R`).
+   * - A **directory** containing Electron zip archives following the naming convention
+   *   `electron-v${version}-${platformName}-${arch}.zip`.
+   *
+   * When not set, electron-builder downloads the official Electron release from GitHub (or the
+   * mirror configured via `electronGet`).
+   *
+   * Receives a {@link PrepareApplicationStageDirectoryOptions}.
+   */
+  readonly electronDist?: Hook<PrepareApplicationStageDirectoryOptions, string> | string | null
+}
+
+/**
+ * Overrides for the input and output directories used during the build.
+ */
 export interface MetadataDirectories {
   /**
-   * The path to build resources.
+   * The directory that contains static build resources (icons, background images, license files,
+   * custom NSIS scripts, etc.) that electron-builder reads during packaging.
    *
-   * Please note — build resources are not packed into the app. If you need to use some files, e.g. as tray icon, please include required files explicitly: `"files": ["**\/*", "build/icon.*"]`
-   * @default build
+   * **Build resources are not copied into the packaged app.** If you need runtime access to a
+   * file (e.g. a tray icon), include it explicitly via the `fileOptions.files` option:
+   * ```json
+   * { "fileOptions": { "files": ["**\/*", "build/icon.*"] } }
+   * ```
+   *
+   * @default "build"
    */
   readonly buildResources?: string | null
 
   /**
-   * The output directory. [File macros](/file-patterns#file-macros) are supported.
-   * @default dist
+   * The directory where electron-builder writes its output (installers, zip archives, etc.).
+   *
+   * [File macros](https://www.electron.build/file-patterns#file-macros) are supported, e.g.
+   * `"dist/${os}-${arch}"` to separate outputs by platform and architecture.
+   *
+   * @default "dist"
    */
   readonly output?: string | null
 
   /**
-   * The application directory (containing the application package.json), defaults to `app`, `www` or working directory.
+   * The directory that contains the application's `package.json` and source code.
+   *
+   * Defaults to `app`, then `www`, then the project root. Set this when your packagable app
+   * lives in a subdirectory (common in monorepos or when using a separate frontend build step).
    */
   readonly app?: string | null
+}
+
+/**
+ * Configuration for experimental concurrent builds.
+ */
+export interface Concurrency {
+  /**
+   * Maximum number of platform/architecture builds to run in parallel.
+   *
+   * Set to `1` to disable concurrency (sequential builds, the safe default). Higher values
+   * reduce wall-clock time on multi-platform builds at the cost of increased memory and CPU
+   * usage. Ensure that your {@link Hooks} and build resources are safe to execute concurrently
+   * before raising this limit.
+   *
+   * @default 1
+   */
+  jobs: number
 }

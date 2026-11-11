@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "crypto"
-import { newError } from "./index"
+import { newError } from "./error.js"
 
 const invalidName = "options.name must be either a string or a Buffer"
 
@@ -26,7 +26,7 @@ export class UUID {
   private readonly version: number
 
   // from rfc4122#appendix-C
-  static readonly OID = UUID.parse("6ba7b812-9dad-11d1-80b4-00c04fd430c8")
+  static readonly OID: Buffer = UUID.parse("6ba7b812-9dad-11d1-80b4-00c04fd430c8")
 
   constructor(uuid: Buffer | string) {
     const check = UUID.check(uuid)
@@ -103,7 +103,7 @@ export class UUID {
   }
 
   // read stringified uuid into a Buffer
-  static parse(input: string) {
+  static parse(input: string): Buffer {
     const buffer = Buffer.allocUnsafe(16)
     let j = 0
     for (let i = 0; i < 16; i++) {

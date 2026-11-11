@@ -1,5 +1,6 @@
 !include FileFunc.nsh
 !include UAC.nsh
+!include WordFunc.nsh
 
 !define FOLDERID_UserProgramFiles {5CD7AEE2-2219-4A67-B85D-6C9CE15660CB}
 !define KF_FLAG_CREATE 0x00008000
@@ -24,24 +25,33 @@ Var installMode
 
     # сhecks registry for previous installation path
     ReadRegStr $perUserInstallationFolder HKCU "${INSTALL_REGISTRY_KEY}" InstallLocation
+    # a double quote is invalid in a path: drop the closing quote that an earlier installer kept from a quoted /D= argument
+    ${WordReplace} $perUserInstallationFolder '"' "" "+" $perUserInstallationFolder
     ${if} $perUserInstallationFolder != ""
       StrCpy $INSTDIR $perUserInstallationFolder
     ${else}
       StrCpy $0 "$LocalAppData\Programs"
-      System::Store S
-      # Win7 has a per-user programfiles known folder and this can be a non-default location
+
+      Push $1
+      Push $2
+      # UserProgramFiles is the per-user install root and can be a non-default location
+      StrCpy $2 0
       System::Call 'SHELL32::SHGetKnownFolderPath(g "${FOLDERID_UserProgramFiles}", i ${KF_FLAG_CREATE}, p 0, *p .r2)i.r1'
       ${If} $1 == 0
-        System::Call '*$2(&w${NSIS_MAX_STRLEN} .s)'
-        StrCpy $0 $1
+        System::Call 'KERNEL32::lstrcpynW(w .r0, p r2, i ${NSIS_MAX_STRLEN})p'
+      ${endif}
+      # SHGetKnownFolderPath may return allocated memory even on failure
+      ${If} $2 != 0
         System::Call 'OLE32::CoTaskMemFree(p r2)'
       ${endif}
-      System::Store L
+      Pop $2
+      Pop $1
+
       StrCpy $INSTDIR "$0\${APP_FILENAME}"
     ${endif}
 
     # allow /D switch to override installation path https://github.com/electron-userland/electron-builder/issues/1551
-    ${StdUtils.GetParameter} $R0 "D" ""
+    !insertmacro GetDParameter $R0
     ${If} $R0 != ""
       StrCpy $INSTDIR $R0
     ${endif}
@@ -66,6 +76,8 @@ Var installMode
 
     # сheck registry for previous installation path
     ReadRegStr $perMachineInstallationFolder HKLM "${INSTALL_REGISTRY_KEY}" InstallLocation
+    # a double quote is invalid in a path: drop the closing quote that an earlier installer kept from a quoted /D= argument
+    ${WordReplace} $perMachineInstallationFolder '"' "" "+" $perMachineInstallationFolder
     ${if} $perMachineInstallationFolder != ""
       StrCpy $INSTDIR $perMachineInstallationFolder
     ${else}
@@ -84,10 +96,64 @@ Var installMode
     ${endif}
 
     # allow /D switch to override installation path https://github.com/electron-userland/electron-builder/issues/1551
-    ${StdUtils.GetParameter} $R0 "D" ""
+    !insertmacro GetDParameter $R0
     ${If} $R0 != ""
       StrCpy $INSTDIR $R0
     ${endif}
 
   !macroend
 !endif
+
+# Custom function to handle /D parameter with spaces
+# The /D parameter is special in NSIS - it must be the last parameter and is not quoted: /S /D=C:\Program Files\App
+# Use StdUtils.GetAllParameters to get the full command line, then parse /D= manually
+# A caller that quotes the whole argument ("/D=C:\Program Files\App", as child_process.spawn does for a path with a space)
+# leaves the closing quote in the rest of the command line, so the parsed argument is used for that form
+!macro GetDParameter outVar
+  Push $R8
+  Push $R9
+  Push $R7
+  Push $R6
+  Push $R5
+
+  # Get the complete command line using StdUtils (including /D parameter)
+  ${StdUtils.GetAllParameters} $R8 "0"
+
+  # Initialize result
+  StrCpy $R9 ""
+
+  # Search for /D= or /d= using a simple loop
+  StrLen $R7 $R8
+  IntOp $R7 $R7 - 2  # Don't check last 2 characters
+  StrCpy $R6 0
+
+  ${Do}
+    StrCpy $R5 $R8 3 $R6  # Get 3 characters starting at position $R6
+    ${If} $R5 == "/D="
+    ${OrIf} $R5 == "/d="
+      # the character before /D= tells whether the caller quoted the argument
+      StrCpy $R7 ""
+      ${If} $R6 > 0
+        IntOp $R7 $R6 - 1
+        StrCpy $R7 $R8 1 $R7
+      ${EndIf}
+      ${If} $R7 == '"'
+        # quoted: the rest of the command line ends with the closing quote, take the parsed argument instead
+        ${StdUtils.GetParameter} $R9 "D" ""
+      ${Else}
+        # Found /D= or /d=, extract everything after it
+        IntOp $R6 $R6 + 3
+        StrCpy $R9 $R8 "" $R6
+      ${EndIf}
+      ${Break}
+    ${EndIf}
+    IntOp $R6 $R6 + 1
+  ${LoopUntil} $R6 > $R7
+
+  StrCpy ${outVar} $R9
+  Pop $R5
+  Pop $R6
+  Pop $R7
+  Pop $R9
+  Pop $R8
+!macroend

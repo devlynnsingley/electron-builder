@@ -1,16 +1,18 @@
 #! /usr/bin/env node
 
-import { PACKAGE_VERSION } from "app-builder-lib/out/version"
-import { log, use, getArchCliNames } from "builder-util"
-import { printErrorAndExit } from "builder-util/out/promise"
-import { computeDefaultAppDirectory, getConfig } from "app-builder-lib/out/util/config"
-import { getElectronVersion } from "app-builder-lib/out/electron/electronVersion"
-import { createLazyProductionDeps } from "app-builder-lib/out/util/packageDependencies"
-import { installOrRebuild } from "app-builder-lib/out/util/yarn"
-import { readJson } from "fs-extra"
-import { Lazy } from "lazy-val"
-import * as path from "path"
-import { orNullIfFileNotExist } from "read-config-file"
+import {
+  computeDefaultAppDirectory,
+  createProjectMetadataLazy,
+  determinePackageManagerEnv,
+  getConfig,
+  getElectronVersion,
+  installOrRebuild,
+  PACKAGE_VERSION,
+} from "app-builder-lib/internal"
+import { Executables, getArchCliNames, log, printErrorAndExit } from "builder-util"
+
+import { fileURLToPath } from "node:url"
+import { hideBin } from "yargs/helpers"
 import * as yargs from "yargs"
 
 /** @internal */
@@ -37,7 +39,7 @@ export function configureInstallAppDepsCommand(yargs: yargs.Argv): yargs.Argv {
 export async function installAppDeps(args: any) {
   try {
     log.info({ version: PACKAGE_VERSION }, "electron-builder")
-  } catch (e) {
+  } catch (e: any) {
     // error in dev mode without babel
     if (!(e instanceof ReferenceError)) {
       throw e
@@ -45,35 +47,41 @@ export async function installAppDeps(args: any) {
   }
 
   const projectDir = process.cwd()
-  const packageMetadata = new Lazy(() => orNullIfFileNotExist(readJson(path.join(projectDir, "package.json"))))
+  const packageMetadata = createProjectMetadataLazy(projectDir)
   const config = await getConfig(projectDir, null, null, packageMetadata)
-  const [appDir, version] = await Promise.all<string>([
-    computeDefaultAppDirectory(
-      projectDir,
-      use(config.directories, it => it!.app)
-    ),
-    getElectronVersion(projectDir, config, packageMetadata),
-  ])
+  const [appDir, version] = await Promise.all<string>([computeDefaultAppDirectory(projectDir, config.directories?.app), getElectronVersion(projectDir, config)])
 
-  // if two package.json — force full install (user wants to install/update app deps in addition to dev)
-  await installOrRebuild(
-    config,
-    appDir,
-    {
-      frameworkInfo: { version, useCustomDist: true },
-      platform: args.platform,
-      arch: args.arch,
-      productionDeps: createLazyProductionDeps(appDir, null),
-    },
-    appDir !== projectDir
+  const packageManagerEnv = determinePackageManagerEnv({ projectDir, appDir, workspaceRoot: undefined })
+  const workspaceRoot = await (await packageManagerEnv.value).workspaceRoot
+
+  // if two package.json — force full install (user wants to install/update app deps in addition to dev). On Windows the package
+  // manager runs in Windows PowerShell, from the configuration's toolsets.executables.powershell or its default location
+  await Executables.run(config.toolsets?.executables, () =>
+    installOrRebuild(
+      config,
+      {
+        appDir,
+        projectDir,
+        workspaceRoot,
+      },
+      {
+        frameworkInfo: { version, useCustomDist: true },
+        platform: args.platform,
+        arch: args.arch,
+      },
+      appDir !== projectDir,
+      {}
+    )
   )
 }
 
 function main() {
-  return installAppDeps(configureInstallAppDepsCommand(yargs).argv)
+  const factory = (yargs as any).default ?? yargs
+  const instance = typeof factory?.parserConfiguration === "function" ? factory : factory(hideBin(process.argv))
+  return installAppDeps(configureInstallAppDepsCommand(instance).argv)
 }
 
-if (require.main === module) {
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
   log.warn("please use as subcommand: electron-builder install-app-deps")
   main().catch(printErrorAndExit)
 }

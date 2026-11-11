@@ -1,0 +1,283 @@
+{!./partials/_upgrading-from-v26.md!}
+
+The [publish](./configuration.md#publish) key contains a set of options instructing electron-builder on how it should publish artifacts and build update info files for [auto update](./features/auto-update.md).
+
+`String | Object | Array<Object | String>` where `Object` it is [Keygen](#keygen), [Generic Server](#byo-generic-create-your-own), [GitHub](#github), [S3](#s3), [Spaces](#spaces), [R2](#r2) or [Snap Store](#snap-store) options. Order is important — first item will be used as a default auto-update server. Can be specified in the [top-level configuration](./configuration.md) or any platform- ([mac](mac.md), [linux](linux.md), [win](win.md)) or target- (e.g. [nsis](nsis.md)) specific configuration.
+
+Note that when using a generic server, you have to upload the built application and metadata files yourself.
+
+Travis and AppVeyor support publishing artifacts. But it requires additional configuration for each CI and you need to configure what to publish.
+`electron-builder` makes publishing dead simple.
+
+!!! important "Publishing Must Be Explicitly Requested"
+    Publishing is not performed automatically. You must explicitly request publishing using the `--publish` CLI flag (e.g., `--publish always`, `--publish onTag`, `--publish onTagOrDraft`) or by setting the `publish` option in your configuration.
+
+If `GH_TOKEN` or `GITHUB_TOKEN` is defined — defaults to `[{provider: "github"}]`.
+
+If `KEYGEN_TOKEN` is defined and `GH_TOKEN` or `GITHUB_TOKEN` is not — defaults to `[{provider: "keygen"}]`.
+
+If `GITHUB_RELEASE_TOKEN` is defined, it will be used instead of (`GH_TOKEN` or `GITHUB_TOKEN`) to publish your release.
+- e.g. mac: ``` export GITHUB_RELEASE_TOKEN=<my token> ```
+- the `GITHUB_TOKEN` will still be used when your app checks for updates, etc.
+- you could make your `GITHUB_TOKEN` "Read-only" when creating a fine-grained personal access token, and "Read and write" for the `GITHUB_RELEASE_TOKEN`.
+- "Contents" fine-grained permission was sufficient. (at time of writing - Apr 2024)
+
+:::warning[Implicit publishing was removed in v27]
+In v26 and earlier, electron-builder auto-detected when to publish based on CI environment conditions (npm lifecycle event, a git tag in CI, etc.). **As of v27 this implicit behavior is removed** — publishing never happens unless you request it. This closes a hole where unfinished work or secrets could be published unintentionally.
+
+Explicitly specify your publish intent with the `--publish` CLI flag (e.g. `--publish always`, `--publish onTag`, `--publish onTagOrDraft`, `--publish never`) or set the `publish` option in your configuration. See [v27 Breaking Changes → implicit `--publish` removed](./migration/v27-build-changes.md#implicit-publish-removed).
+:::
+
+:::info[Snap store]
+`snap` target by default publishes to the Snap Store (the app store for Linux). To force publishing to another provider, explicitly specify publish configuration for `snap`.
+:::
+
+You can publish to multiple providers. For example, to publish Windows artifacts to both GitHub and Bitbucket (order is important — first item will be used as a default auto-update server, so in this example the app will use GitHub as the auto-update provider):
+
+```json
+{
+  "build": {
+    "win": {
+      "publish": ["github", "bitbucket"]
+    }
+  }
+}
+```
+
+```yaml
+win:
+  publish:
+      # an object provider for github with additional options
+    - provider: github
+      protocol: https
+      # a string provider for bitbucket that will use default options
+    - bitbucket
+```
+
+### Which settings become the auto-update feed (`app-update.yml`) {#app-update-yml-feed}
+
+The auto-update feed an installed app polls is the **first** provider written to `app-update.yml` inside the packaged app. One packaged app (for example `win-unpacked`, `linux-unpacked` or the `.app` bundle) holds a single `app-update.yml`, shared by every target built from it. Every option of that provider except `awsCredentials` is written to it in plain text, so never put a token in the `publish` configuration: use `private: true` with a `GH_TOKEN` provided at runtime, or a per-user token passed to `setFeedURL` — a token hard-coded in the app's code is just as easy to extract (see [Private GitHub Update Repo](./features/auto-update.md#private-github-update-repo)). The feed is resolved like this:
+
+1. The targets of that app that write update info — NSIS/NSIS web installer, AppX with `electronUpdaterAware`, macOS dmg/zip, AppImage, deb/rpm/pacman — each resolve their own `publish`: the target-level value (e.g. `nsis.publish`) first, then the platform level (`win.publish`), then the top level.
+2. If one or more of them emit a manifest under those settings, their first provider that receives the manifest becomes the feed — a provider with `publishAutoUpdate: false` gets no `latest*.yml`, so it is skipped (with `publish: [{ provider: "s3", …, publishAutoUpdate: false }, "github"]` the feed is GitHub). They must agree: two such targets whose first providers differ (for example `nsis.publish` pointing at S3 while an AppX inherits `win.publish: github`, or `dmg.publish` differing from `zip.publish`) would leave some installs polling a feed that never receives their manifest. A publishing build then fails at build start with an `InvalidConfigurationError`; a build without a publish policy logs a warning that publishing will fail, and writes no `app-update.yml` for that app. Configure `publish` once at the platform level, or give the targets the same first provider (later providers may differ). Only what decides the feed is compared — the provider and options such as `url`, `bucket`, `region`, `path`, `owner`, `repo` or `channel`; options that only affect the upload (`publishAutoUpdate`, `timeout`, and for S3-compatible providers `acl`, `storageClass`, `encryption`) may differ.
+3. If none of them emits a manifest — only non-updating targets such as snap or portable, or a target with `publish: null` or `publishAutoUpdate: false` on every provider — the platform/top-level `publish` is used, as before.
+4. If no level configures `publish` at all, the feed falls back to GitHub when the `repository` field points there (see [GitHub Repository](#github-repository-and-bintray-package)).
+
+For example, with only a target-level setting
+
+```yaml
+nsis:
+  publish:
+    provider: s3
+    bucket: my-updates
+```
+
+installed NSIS apps poll the S3 bucket and embed the update-manifest trust key. Before this rule, the target-level setting was not read for `app-update.yml`: such a build shipped no `app-update.yml` at all (no feed and no trusted key), or — with a GitHub `repository` — a GitHub feed while the manifests went to S3.
+
+You can also configure publishing using CLI arguments, for example, to force publishing snap not to Snap Store, but to GitHub: `-c.snap.publish=github`
+
+A [custom](#custom-publisher) publish provider can be used if needed.
+
+:::tip[Macros]
+In all publish options [File Macros](./file-patterns.md#file-macros) are supported.
+:::
+
+## How to Publish
+
+Excerpt from [CLI Usage](./cli.md) of `electron-builder` command:
+```
+Publishing:
+  --publish, -p  [choices: "onTag", "onTagOrDraft", "always", "never"]
+```
+CLI `--publish` option values:
+
+| Value          |  Description
+| -------------- | -----------
+| `onTag`        | on tag push only
+| `onTagOrDraft` | on tag push or if draft release exists
+| `always`       | always publish
+| `never`        | never publish
+
+But please consider using automatic rules instead of explicitly specifying `publish`:
+
+* If CI server detected, — `onTagOrDraft`.
+
+* If CI server reports that a tag was pushed, — `onTag`.
+
+  A release will be drafted (if one doesn't already exist) and artifacts published only if a tag was pushed.
+
+* If [npm script](https://docs.npmjs.com/misc/scripts) named `release`, — `always`.
+
+ Add to `scripts` in the development `package.json`:
+
+ ```json
+ "release": "electron-builder"
+ ```
+
+ and if you run `yarn release`, a release will be drafted (if doesn't already exist) and artifacts published.
+
+### Recommended GitHub Releases Workflow
+
+1. [Draft a new release](https://help.github.com/articles/creating-releases/). Set the "Tag version" to the value of `version` in your application `package.json`, and prefix it with `v`. "Release title" can be anything you want.
+
+    For example, if your application `package.json` version is `1.0`, your draft's "Tag version" would be `v1.0`.
+
+2. Push some commits. Every CI build will update the artifacts attached to this draft.
+3. Once you are done, publish the release. GitHub will tag the latest commit for you.
+
+The benefit of this workflow is that it allows you to always have the latest artifacts, and the release can be published once it is ready.
+
+### Continuous Deployment Workflow on Amazon S3 and other non-GitHub
+
+This example workflow is modeled on how releases are handled in Maven (it is an example of one of many possible workflows, you are not forced to follow it).
+
+1. Setup your CI to publish on each commit. E.g. `"dist": "electron-builder --publish always"` in your `package.json`.
+2. Set your version in your application `package.json` to `1.9.0-snapshot` (or `1.9.0-master` or whatever you want your development channel to be named). This will publish a file named `snapshot.yml` and a build named `something-snapshot.exe` (and corresponding for mac) to S3.
+3. When you are ready to deploy, simply change your package version to `1.9.0` and push. This will then produce a `latest.yml` and `something.exe` on s3. Usually you'll git-tag this version as well (just to keep track of it).
+4. Change the version back to a snapshot version right after, i.e. `1.10.0-snapshot`, and commit it.
+
+## GitHub Repository {#github-repository-and-bintray-package}
+
+Detected automatically using:
+
+* [repository](https://docs.npmjs.com/files/package.json#repository) in the application or development `package.json`,
+* if not set, env
+    * `TRAVIS_REPO_SLUG`
+    * or `APPVEYOR_REPO_NAME`
+    * or `CIRCLE_PROJECT_USERNAME`/`CIRCLE_PROJECT_REPONAME`,
+* if no env, from `.git/config` origin url.
+
+:::warning[The detected repository ships inside your app]
+Whatever is detected here becomes the publish/update destination and, for auto-update-capable targets, is written to `app-update.yml` inside every packaged build - that is where electron-updater looks for updates for the lifetime of that install. A build reports the repository it inferred, including the `source` it came from - at info level when it comes from the `repository` field of `package.json` (deliberate configuration), at warn level when it is picked up from CI environment variables or `.git/config`:
+
+```
+• update feed inferred from repository info; it will be used as the publish/update destination
+  (written to app-update.yml in auto-update-capable targets) - specify it explicitly to be sure
+  it stays under your control  reason=owner and repo not specified in the publish configuration
+  source=.git/config provider=github owner=my-org repo=my-app
+```
+
+Check that it is the repository you expect, and keep control of it. GitHub releases an owner or repository name for re-registration once it is renamed, transferred or deleted, so anyone who then claims that name can publish releases that already-installed copies of your app will download. Set `owner` and `repo` explicitly to avoid depending on detection at all:
+
+```json5
+{
+  "build": {
+    "publish": {
+      "provider": "github",
+      "owner": "my-org",
+      "repo": "my-app"
+    }
+  }
+}
+```
+:::
+
+# Publishers
+
+## Bitbucket
+
+:::note[v27: authentication mode]
+The Bitbucket publisher selects its auth scheme by whether a username is present:
+
+- **With a username** (`bitbucket.username`, or the `BITBUCKET_USERNAME` env var) → HTTP **Basic** auth. Use this for a Bitbucket **app password** or an Atlassian **API token** (the username is your Bitbucket username or Atlassian account email).
+- **Without a username** → the token is sent as `Authorization: Bearer <token>` (a repository / project / workspace **access token**). This is new in v27; previously a token was always sent as Basic auth with the repo owner as the username.
+
+If your CI sets `BITBUCKET_TOKEN` to an app password / API token **without** a username, set `BITBUCKET_USERNAME` too, or the request goes out as Bearer and fails authentication.
+:::
+
+  {!./builder-util-runtime.Interface.BitbucketOptions.md!}
+
+## Github
+
+:::note[v27: tagNamePrefix replaces vPrefixedTagName]
+The GitHub `vPrefixedTagName` boolean was removed — use `tagNamePrefix` to control the tag prefix (defaults to `"v"`; set `tagNamePrefix: ""` for no prefix). `electron-builder migrate-schema` rewrites it. Note that v26 ignored an empty `tagNamePrefix` and still tagged `v<version>`; v27 honors it, so the migrator rewrites a v26 `tagNamePrefix: ""` to `"v"` (with a warning) to keep your existing tag names. (On **GitLab**, `vPrefixedTagName` is unchanged and still works.)
+:::
+
+  {!./builder-util-runtime.Interface.GithubOptions.md!}
+
+## GitLab
+  {!./builder-util-runtime.Interface.GitlabOptions.md!}
+
+## Keygen
+  {!./builder-util-runtime.Interface.KeygenOptions.md!}
+
+## S3
+
+:::note[v27: choose the credential source with `awsCredentials`]
+Publishing to S3 requires `awsCredentials.source`; no credentials are read implicitly. Use `{ "source": "env" }` to read `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`. `AWS_PROFILE`, `AWS_SDK_LOAD_CONFIG` and the `~/.aws` files are not used unless you name a profile. To publish with a named profile, including an IAM Identity Center (SSO) session from `aws sso login`, a `credential_process` or an assume-role profile:
+
+```json
+"publish": {
+  "provider": "s3",
+  "bucket": "my-bucket",
+  "region": "us-west-2",
+  "awsCredentials": { "source": "profile", "profile": "release" }
+}
+```
+
+If the publishing role is assumed from an SSO profile through `source_profile` (a `role_arn` + `source_profile = <sso profile>` role profile), opt in with `{ "source": "sso-role-chain", "profile": "<role profile>" }`: electron-builder resolves the SSO profile and each `AssumeRole` hop from the same configured files.
+
+For a bucket name containing dots, set `region`: it is only looked up automatically when publishing. See [v27 Breaking Changes](./migration/v27-build-changes.md#s3-publishing-requires-an-explicit-awscredentialssource).
+:::
+
+  {!./builder-util-runtime.Interface.S3Options.md!}
+
+## Snap Store
+  {!./builder-util-runtime.Interface.SnapStoreOptions.md!}
+
+## Spaces
+  {!./builder-util-runtime.Interface.SpacesOptions.md!}
+
+## R2
+
+To publish to [Cloudflare R2](https://developers.cloudflare.com/r2/):
+
+1. Create an [R2 API token](https://developers.cloudflare.com/r2/api/s3/tokens/) with at least **Object Read & Write** permission on your bucket.
+2. Expose its credentials to electron-builder via the `CF_R2_ACCESS_KEY_ID` and `CF_R2_SECRET_ACCESS_KEY` environment variables.
+3. Enable [public access](https://developers.cloudflare.com/r2/buckets/public-buckets/) for the bucket via an `r2.dev` subdomain or a custom domain — R2's S3 API endpoint cannot serve unauthenticated downloads, so `electron-updater` cannot download updates from it.
+4. Set `publicUrl` to that public base URL.
+
+Auto-updating from R2 requires an `electron-updater` version that supports the `r2` provider: electron-updater >= 7.0.0 (the release line containing this feature).
+
+Note: files are uploaded with a single PUT request, and R2 limits single-PUT uploads to ~5 GiB per object.
+
+  {!./builder-util-runtime.Interface.R2Options.md!}
+
+## Custom Publisher {#custom-publisher}
+
+To upload artifacts with your own code, set the provider to `custom`. Any other options in the entry are passed to your publisher as is.
+
+```yaml
+publish:
+  provider: custom
+  url: https://updates.example.com
+```
+
+electron-builder then loads `electron-publisher-custom.mjs`, `.js` or `.cjs` (checked in that order) from the build resources directory (`directories.buildResources`, `build` by default) and uses the exported class (`export default` or `module.exports`) as the publisher. That directory is excluded from the app by default, so the publisher is not packaged unless your `files` patterns include it explicitly.
+
+The class is created with the publish context and the `publish` entry, and `upload(task)` is called for every artifact and update info file. `task.file` is the path of the file to upload; for update info files `task.fileContent` also holds the content.
+
+```js
+// build/electron-publisher-custom.js
+class CustomPublisher {
+  constructor(context, options) {
+    this.options = options
+  }
+
+  get providerName() {
+    return "custom"
+  }
+
+  async upload(task) {
+    // upload task.file to this.options.url
+  }
+}
+
+module.exports = CustomPublisher
+```
+
+electron-updater can only read a `custom` feed when the app passes a provider class itself, for example `autoUpdater.setFeedURL({ provider: "custom", updateProvider: MyProvider })`. The provider class returns its feed URL from `Provider.feedBaseUrl` (see [Auto Update](./features/auto-update.md#custom-options-instantiating-updater-directly)). To serve updates from your own server without writing a provider, use the [generic](#byo-generic-create-your-own) provider.
+
+## BYO Generic (create-your-own)
+(And maybe submit it upstream in a PR!)
+  {!./builder-util-runtime.Interface.GenericServerOptions.md!}

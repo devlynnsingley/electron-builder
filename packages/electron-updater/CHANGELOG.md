@@ -1,5 +1,1499 @@
 ## 4.3.0
 
+## 7.0.0-alpha.13
+### Minor Changes
+
+- Feat: binary, range-fetchable `.blockmap` format, chosen from `electronUpdaterCompatibility` (default raised to `>=7`). The block map published next to NSIS installers and macOS update zips is read by the electron-updater already installed in the users' apps, so its format follows the declared range: a range of electron-updater 7 and later (the new default) writes the binary map, a range that includes earlier versions writes the gzipped JSON map, with a once-per-build warning. The new `blockmap` option, `"v2" | "v3" | "latest"`, overrides the choice: `"v2"` is the JSON map (format version 2), `"v3"` the binary map (failing the build when the range includes electron-updater before 7), `"latest"` the newest format the range allows. The build also fails when the app's own electron-updater dependency is outside `electronUpdaterCompatibility`, e.g. electron-updater 6 with the default `>=7`: upgrade it, or set `electronUpdaterCompatibility: ">=6"` to keep the JSON map. _[`#10312`](https://github.com/electron-userland/electron-builder/pull/10312) [`c983462`](https://github.com/electron-userland/electron-builder/commit/c98346245aed022560e58bc7d435a6f9d04f5a78)_
+
+  The binary map is uncompressed with fixed-size tables (header, content-defined super-groups of groups, content-defined groups of blocks, 10-byte per-block records, with 8-byte hashes at every level). electron-updater fetches the header and super-group table with one `Range` request, matches super-groups against its cached previous map, fetches only the group entries of the super-groups that changed, matches those groups and fetches only the records of the groups that changed, verifies every hash, then runs the existing block-level plan and download pipeline. If that range fetch fails, it downloads the new map with a plain GET and stays differential. Because the map cost grows with the change rather than with the installer, the stored `app.asar` region (`nsis.differentialPackage: "store-asar"`, ideally with `asar.contentAlignment`) uses 512 B / 1 KiB / 2 KiB blocks and a block boundary at every packed file, and the 7z header of a differential-aware package is stored as is (`-mhc=off`) and chunked into its own small blocks, so a changed CRC no longer re-downloads the trailing block of the package (5–30 KB on every update). Builds that write the JSON map keep packages and block maps byte-for-byte as before. electron-updater tells the formats apart by the file's first bytes, so there is no extra artifact and `latest.yml` is unchanged. Installs still on electron-updater 6 download the first release with a binary map in full once; the update brings an updater that reads it. A format change between two releases costs the same one-time full download, logged once at `info`. Block maps embedded in an artifact (AppImage, NSIS web installer packages) stay JSON. A binary `.blockmap` is uploaded to S3 as `application/octet-stream`.
+
+  electron-updater additionally downloads through COPY gaps smaller than 8 KiB between two changed ranges on single-range hosts such as GitHub and S3 (one request per range there makes re-downloading a few KiB cheaper than an extra request), only up to 256 B on hosts that serve `multipart/byteranges`, and caps `multipart/byteranges` requests at 200 ranges (Apache's `MaxRanges` default; larger `Range` headers exceed common 8 KB header limits).
+- Feat(updater): on Linux (deb, rpm, pacman), a failed install on quit (e.g. the authentication dialog dismissed) emits and logs `error` and the app exits without the update, unless the new `cancelQuitOnInstallFailure` option is set: the install on quit then runs from `will-quit` and cancels the quit when it fails (the app keeps running with its windows closed, so reopen a window or quit from a later tick on `error`; register the app's own `will-quit` listeners before checking for updates, the updater only sees cancellations from listeners registered before its own). A quit while an update install runs waits for it to finish, a failed install is not retried by a later quit of the session (also for update info with only a legacy `sha2` checksum), and a dismissed or denied pkexec dialog stops the install instead of showing a second dialog for the `apt-get -f` or `pacman -Sy` recovery _[`#10460`](https://github.com/electron-userland/electron-builder/pull/10460) [`e15f702`](https://github.com/electron-userland/electron-builder/commit/e15f702d3bdf023ccf38b231c3a02325ba808b58)_
+
+### Patch Changes
+
+- Fix(updater): install deb/rpm/pacman updates without freezing the app while the elevation dialog is open. `quitAndInstall()` and `installPendingUpdateIfAvailable()` now run the package manager asynchronously and quit once it finished; the commands, environment and elevation helper are unchanged, the on-quit install stays synchronous, and other platforms are unaffected. The package manager's output goes to a file instead of a pipe, so quitting the app mid-install no longer kills it with SIGPIPE, and a failed install's error now ends with what it wrote to stderr _[`#10094`](https://github.com/electron-userland/electron-builder/pull/10094) [`3c4d9b5`](https://github.com/electron-userland/electron-builder/commit/3c4d9b5e6ecb91b811c831eadf120ff00ce9b0ac)_
+- Fix: cache the downloaded update's blockmap before emitting `update-downloaded`, so an app that calls `quitAndInstall()` from that listener still makes its next update differential _[`#10463`](https://github.com/electron-userland/electron-builder/pull/10463) [`a712cc9`](https://github.com/electron-userland/electron-builder/commit/a712cc96a6342a36d7d25fc636ee95bb71c7f596)_
+- Fix(updater): the install on quit follows `autoInstallEvent` as it is when the app quits, also when it was `"manual"` while the update downloaded, and the updater logs why nothing is installed when the app quits before the update finished downloading and verifying, without installing an update cached by an earlier launch that `verifyUpdateFile` has not accepted yet _[`#10095`](https://github.com/electron-userland/electron-builder/pull/10095) [`ea65a06`](https://github.com/electron-userland/electron-builder/commit/ea65a0695a9f8f6a134cf34487952c33525f18bd)_
+- Fix(updater): a failed `install()` or `installAsync()` no longer blocks every later install in the session: the next quit installs the update (on Linux deb/rpm/pacman, only a different update, so the dismissed authentication dialog is not shown again on quit), and the protected `quitAndInstallCalled` is deprecated _[`#10467`](https://github.com/electron-userland/electron-builder/pull/10467) [`476c3d5`](https://github.com/electron-userland/electron-builder/commit/476c3d522aebb2917799c5d977e4522b7e6d23cb)_
+- Fix(updater): deb/rpm/pacman installs pass the package-manager command to pkexec and sudo as an argv array, without a shell, both for `quitAndInstall()` / `installPendingUpdateIfAvailable()` and for the install when the app quits (`autoInstallEvent: "onQuit"`): the authentication dialog shows the command being authorized, the installer path is passed unescaped (paths containing a single quote are supported), the command is looked up in /usr/sbin, /usr/bin, /sbin and /bin rather than the caller's PATH, and Node's DEP0190 warning does not apply. gksudo, kdesudo and beesu take a single command string and keep the `/bin/bash -c` form. A command killed by a signal during the install on quit is reported as a failure _[`#10095`](https://github.com/electron-userland/electron-builder/pull/10095) [`ea65a06`](https://github.com/electron-userland/electron-builder/commit/ea65a0695a9f8f6a134cf34487952c33525f18bd)_
+- Fix: don't log "Differential download failed" on macOS when no differential download was attempted _[`#10486`](https://github.com/electron-userland/electron-builder/pull/10486) [`26195ba`](https://github.com/electron-userland/electron-builder/commit/26195ba9b86aa20bb64456f4a69a57bd52d5fcb8)_
+- Fix(updater): elevate Linux package installs with pkexec (polkit) whenever it is installed; gksudo and kdesudo, which are unmaintained, removed from Debian and Ubuntu and do not work under Wayland, are only used on systems without polkit, and the updater logs once when it skips one _[`#10095`](https://github.com/electron-userland/electron-builder/pull/10095) [`ea65a06`](https://github.com/electron-userland/electron-builder/commit/ea65a0695a9f8f6a134cf34487952c33525f18bd)_
+- Fix(updater): route all updater logging through a non-throwing logger (with an always-present `debug`), so a throwing logger or one without `debug()` cannot interrupt the update logic (exposed to subclasses as a protected `log` getter); `autoUpdater.logger` still returns the logger the app set _[`#10470`](https://github.com/electron-userland/electron-builder/pull/10470) [`cbd5c80`](https://github.com/electron-userland/electron-builder/commit/cbd5c805b6eba0ba03296883ba3124f8748be348)_
+- Fix: download the full update, without a failed differential attempt, when the installed version's blockmap URL is the update's own (artifact name without version) or the downloaded old blockmap does not describe the cached installer _[`#10463`](https://github.com/electron-userland/electron-builder/pull/10463) [`a712cc9`](https://github.com/electron-userland/electron-builder/commit/a712cc96a6342a36d7d25fc636ee95bb71c7f596)_
+- Fix(updater): the Linux install only elevates a bare command name found as an executable regular file in the system directories (`/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`), symlinks included only when their target lies there too _[`#10460`](https://github.com/electron-userland/electron-builder/pull/10460) [`e15f702`](https://github.com/electron-userland/electron-builder/commit/e15f702d3bdf023ccf38b231c3a02325ba808b58)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`c983462`](https://github.com/electron-userland/electron-builder/commit/c98346245aed022560e58bc7d435a6f9d04f5a78)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.13`
+
+</details>
+
+## 7.0.0-alpha.12
+### Major Changes
+
+- Feat(win)!: a missing `publisherName` fails Windows update signature verification closed. _[`#10380`](https://github.com/electron-userland/electron-builder/pull/10380) [`674e18d`](https://github.com/electron-userland/electron-builder/commit/674e18dd3e6d2720c46b42ce309cac83ae760e14)_
+
+  - **electron-updater**: an NSIS update is rejected with `ERR_UPDATER_INVALID_SIGNATURE` when `app-update.yml` (or `dev-app-update.yml` / the `updateConfigPath` file) has no `publisherName`. A custom `verifyUpdateFileAuthenticodeSignature` / `verifyUpdateCodeSignature` is never called without a `publisherName`. The only opt-out is `verifyUpdateCodeSignature: false` in `app-update.yml`, which electron-builder writes for `win.verifyUpdateCodeSignature: false`; verification is then skipped with one warning per updater. An app with no update config file at all (no `app-update.yml` / `dev-app-update.yml`, e.g. one that only uses `setFeedURL`) is not verified: its feed is configured by the developer.
+  - **app-builder-lib**: a Windows build that writes `app-update.yml` (`nsis`, `nsis-web` or `electronUpdaterAware` `appx` with a publish configuration of any provider, including one inferred from a GitHub `repository`) fails with `InvalidConfigurationError` while `win.verifyUpdateCodeSignature` is enabled and no `publisherName` resolves: `win.sign: false` / `null`, no code signing certificate, or `win.sign.publisherName: null`, which is not an opt-out. Sign the build, set `win.sign.publisherName` (e.g. `win.sign: { type: "signtool", publisherName: [...] }` when signing outside electron-builder), or set `win.verifyUpdateCodeSignature: false`, which writes `verifyUpdateCodeSignature: false` (and no `publisherName`) into `app-update.yml`. A `publisherName` in the `publish` configuration must be a distinguished name too, and `verifyUpdateCodeSignature` must not be set there.
+  - **builder-util-runtime**: `PublishConfiguration` has the private, Windows-only `verifyUpdateCodeSignature` field.
+  - **electron-builder**: `migrate-schema` prints an advisory for `win.sign: false` / `null` or `win.sign.publisherName: null` without `win.verifyUpdateCodeSignature: false`.
+
+  See https://www.electron.build/docs/migration/v27-build-changes#missing-publishername-fails-update-verification
+- Feat(updater)!: Windows update signature verification fails closed — electron-updater installs an NSIS update only when PowerShell (`Get-AuthenticodeSignature`) verifies it: an update it cannot verify (PowerShell cannot be started or run, times out, or prints unreadable output) is rejected with `ERR_UPDATER_SIGNATURE_UNVERIFIABLE`, and a Windows catalog signature is rejected as invalid unless the app opts in with the new `NsisUpdater.allowCatalogSignature` (default `false`; when `true`, a valid catalog signature is accepted with a warning only when its signer matches `publisherName`). A release can allow it instead with the new `win.allowCatalogSignature` build option (default `false`), which writes `allowCatalogSignature: true` into the `latest.yml` of the `nsis` and `nsis-web` targets; electron-updater honors it only when that manifest's signature was verified against a trusted key (`updateManifestPublicKey`) and ignores it with a warning otherwise. The manifest signature covers it as an extra `allowCatalogSignature:true` line of the `EBUM1` payload only when it is `true`, so manifests without it canonicalize and verify exactly as before, and changing it for a published release means re-signing or republishing `latest.yml`; a signed manifest with a non-boolean `allowCatalogSignature` is rejected. electron-updater 7.0.0-alpha.8 to alpha.11 installs with an update key configured reject a signed manifest that sets it (`ERR_UPDATER_MANIFEST_SIGNATURE_INVALID`), the same way alpha.8 treats a signed `files[].blockMapUrl`. `UpdateInfoAndProvider` gains `manifestSignatureVerified`, and `BaseUpdater.verifyInstallerSignatureOnLaunch` receives the update info the cached installer was matched against. PowerShell is started by absolute path, the installer path is passed in an environment variable, and non-ASCII output is escaped instead of setting a console encoding, so verification works under PowerShell Constrained Language Mode (fixing 7.0.0-alpha.8 to alpha.10). The build-time installer check uses the same invocation. builder-util-runtime adds `prepareAuthenticodeSignatureExec` and `POWERSHELL_ASCII_ESCAPE_FUNCTION`. Migration: where PowerShell may be blocked (AppLocker / WDAC), assign a native `verifyUpdateFileAuthenticodeSignature` in your first electron-updater 7 release — see https://www.electron.build/docs/migration/v27-runtime-changes#windows-update-signature-verification-fails-closed _[`#10416`](https://github.com/electron-userland/electron-builder/pull/10416) [`8366dc6`](https://github.com/electron-userland/electron-builder/commit/8366dc690ba5bc453c45f6ebbb8f8ad3561521df)_
+- Feat(win)!: the default Authenticode verification of NSIS updates accepts an update only when a `publisherName` entry in distinguished name (DN) format (e.g. `"CN=My Company, O=My Company, C=US"`) matches its signer: a bare name, which used to match the signer's Common Name with a warning, never matches. Such an entry (from an `app-update.yml` written by electron-builder before v27, a `dev-app-update.yml` or a direct call of `verifyUpdateFileAuthenticodeSignature`) is warned about once per updater, and the `ERR_UPDATER_INVALID_SIGNATURE` failure names it. Build the app with electron-builder v27, which writes a DN (`CN=<common name>` of the certificate unless `publisherName` is configured). See https://www.electron.build/docs/migration/v27-build-changes#windows-publishername-must-be-a-distinguished-name _[`#10380`](https://github.com/electron-userland/electron-builder/pull/10380) [`674e18d`](https://github.com/electron-userland/electron-builder/commit/674e18dd3e6d2720c46b42ce309cac83ae760e14)_
+
+### Patch Changes
+
+- Fix(updater): settle a cancelled differential download with a `CancellationError` instead of hanging or falling back to a full download, and log a throwing `download-progress` listener instead of letting it break the download or keep progress from the other listeners _[`#10356`](https://github.com/electron-userland/electron-builder/pull/10356) [`7efb3e6`](https://github.com/electron-userland/electron-builder/commit/7efb3e6211772778b4b2e17f86542a83cc49e179)_
+- Fix(updater): every request of a differential download (single-range, multi-range and reading the embedded block map) follows redirects through `ElectronHttpExecutor.addRedirectHandlers`: credential headers such as `Authorization`, `PRIVATE-TOKEN`, `X-Api-Key` and `Cookie` are sent to a redirect target only on the same origin, a single-range download requests its remaining ranges from the redirect target while each multi-range request starts at the update URL, and at most 10 redirects are followed per request, as for every `ElectronHttpExecutor` request _[`#10419`](https://github.com/electron-userland/electron-builder/pull/10419) [`2d97c85`](https://github.com/electron-userland/electron-builder/commit/2d97c85e3e3e63aade6497923d3012ce0569e414)_
+- Fix(updater): differential downloads made with single range requests no longer send credential headers such as `Authorization` to a redirect target on another origin, which made pre-signed S3 or R2 URLs reject the range requests and forced a full download _[`#10413`](https://github.com/electron-userland/electron-builder/pull/10413) [`7167926`](https://github.com/electron-userland/electron-builder/commit/71679266197a8b74c04f9b96a423e595750aab0b)_
+- Fix: secrets in logs and error messages (passwords, tokens and keys in redacted command lines, environments and request options) are shown as a fingerprint keyed with a random secret of the process, derived with scrypt: the same value has the same fingerprint within a run, but a fingerprint cannot be checked against guessed values offline. A value whose fingerprint cannot be computed is shown as `<redacted>`. _[`#10441`](https://github.com/electron-userland/electron-builder/pull/10441) [`955cd00`](https://github.com/electron-userland/electron-builder/commit/955cd00bd32f4dff0fd5f120b5c7bdad92ea1d7f)_
+- Fix(updater): the `ERR_UPDATER_INVALID_SIGNATURE` error for an `app-update.yml` without `publisherName` says how to configure one (sign the build or set `win.sign.publisherName`) and that `win.verifyUpdateCodeSignature: false` is the opt-out, with a link to the migration guide. _[`#10453`](https://github.com/electron-userland/electron-builder/pull/10453) [`ed05bd0`](https://github.com/electron-userland/electron-builder/commit/ed05bd0f734dd3b898b9c43c81abd56c08d242ef)_
+- Docs: split the v27 breaking-changes page into config, build, runtime and developer pages, point the migration links in build and updater messages at the page each change moved to, and add links to the v27 messages that had none _[`#10421`](https://github.com/electron-userland/electron-builder/pull/10421) [`b5e144d`](https://github.com/electron-userland/electron-builder/commit/b5e144dfeea1e0e8eaa13aec151457227ee4d7d5)_
+- Electron-builder starts the host programs it uses only from an absolute path, never by looking up a name on `PATH`: PowerShell, Wine, Mono (Squirrel.Windows on macOS and Linux), `prlctl`, `productbuild`, `pkgbuild`, `codesign`, `hdiutil`, `tiffutil`, `sips`, `actool`, `zip`, `notarytool` (passed to `@electron/notarize` as `notarytoolPath`, located with `/usr/bin/xcrun` by default), `lzip`, `snapcraft`, `flatpak` and `flatpak-builder`. Each comes from its default install locations or from the new `toolsets.executables` map, whose entries are `file://` URIs, or lists of them, that replace the defaults for that program. Child processes started without an explicit environment get no credential variables on Windows either, and `snapcraft upload` gets the store credentials but no other secret. The NSIS installer starts `tasklist` and `taskkill` from `$SYSDIR` (and passes the force flag in per-machine mode), the AppImage launcher runs the dialog tool it checked by its absolute path, and electron-updater on macOS starts `/usr/sbin/sysctl` and `/usr/bin/uname`. _[`#10430`](https://github.com/electron-userland/electron-builder/pull/10430) [`b98e1f2`](https://github.com/electron-userland/electron-builder/commit/b98e1f2910edaa14b554e603d3ff509c8b04ccf2)_
+- Fix: reject update download redirects to non-HTTP(S) URLs instead of throwing an uncaught exception _[`#10448`](https://github.com/electron-userland/electron-builder/pull/10448) [`f68074d`](https://github.com/electron-userland/electron-builder/commit/f68074d46f78891cde554e5359f6a7ab66758c77)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`6393d7a`](https://github.com/electron-userland/electron-builder/commit/6393d7ae75d15da5147691b135c5bcc7aa520f35) [`5028cb3`](https://github.com/electron-userland/electron-builder/commit/5028cb37a21b8bdd6d9447e858eacfb8e3834004) [`2d97c85`](https://github.com/electron-userland/electron-builder/commit/2d97c85e3e3e63aade6497923d3012ce0569e414) [`955cd00`](https://github.com/electron-userland/electron-builder/commit/955cd00bd32f4dff0fd5f120b5c7bdad92ea1d7f) [`674e18d`](https://github.com/electron-userland/electron-builder/commit/674e18dd3e6d2720c46b42ce309cac83ae760e14) [`2d97c85`](https://github.com/electron-userland/electron-builder/commit/2d97c85e3e3e63aade6497923d3012ce0569e414) [`674e18d`](https://github.com/electron-userland/electron-builder/commit/674e18dd3e6d2720c46b42ce309cac83ae760e14) [`ed05bd0`](https://github.com/electron-userland/electron-builder/commit/ed05bd0f734dd3b898b9c43c81abd56c08d242ef) [`ed05bd0`](https://github.com/electron-userland/electron-builder/commit/ed05bd0f734dd3b898b9c43c81abd56c08d242ef) [`8366dc6`](https://github.com/electron-userland/electron-builder/commit/8366dc690ba5bc453c45f6ebbb8f8ad3561521df) [`a7f005c`](https://github.com/electron-userland/electron-builder/commit/a7f005ce837df409cc7cf9049e3eff74a2d5a503)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.12`
+
+</details>
+
+## 7.0.0-alpha.11
+### Patch Changes
+
+- Fix: installing an AppImage update no longer deletes the installed app before the new one is in place. Before, the updater deleted the running AppImage and then ran `mv` through `PATH`; if `mv` failed (for example `spawnSync mv ENOTCONN` when a dead AppImage FUSE mount from an earlier launch was on `PATH`), the user was left with no app to launch. After, the new AppImage is staged next to the old one and atomically renamed over it without running any external command, so a failed install keeps the old AppImage. _[`#10386`](https://github.com/electron-userland/electron-builder/pull/10386) [`8512f4d`](https://github.com/electron-userland/electron-builder/commit/8512f4dae0ab01b066c4f23988cdf47822bd9aee)_
+- Fix: close embedded blockmap files exactly once on parse failures _[`#10120`](https://github.com/electron-userland/electron-builder/pull/10120) [`3bbc563`](https://github.com/electron-userland/electron-builder/commit/3bbc5634c288361a02311aa6ac25a0663a1c7e82)_
+- Fix(updater): download differentially when the update manifest has a hex-encoded sha512, never let a throwing logger stop a differential download or its fallback to a full download, time out stalled requests made with Electron's `net` module, and close the partially written file when a download's response fails or is aborted mid-body _[`#10366`](https://github.com/electron-userland/electron-builder/pull/10366) [`538aef4`](https://github.com/electron-userland/electron-builder/commit/538aef405d68940cb1322147ab050c24eb581342)_
+- Refactor(updater): split `GitHubProvider.getLatestVersion` into helpers (internal refactor, no behavior change) _[`#10290`](https://github.com/electron-userland/electron-builder/pull/10290) [`4705c20`](https://github.com/electron-userland/electron-builder/commit/4705c2084ca769b5bca98f08370bc89218048744)_
+- Fix(nsis): don't plan a differential download against a cached block map of another release. The cached block map is replaced when a download finishes, but the cached installer only when the update is installed, so a release found before the previous one was installed was planned against the wrong base: every differential byte was downloaded, the sha512 check failed, and the full installer was downloaded too. A cached block map that does not end at the cached installer's size is now ignored and the installed version's block map is fetched from the server. _[`#10337`](https://github.com/electron-userland/electron-builder/pull/10337) [`9ebb992`](https://github.com/electron-userland/electron-builder/commit/9ebb9924b76915d29fbb8c8097288eacc005e7f5)_
+- Fix: when a server rejects multi-range requests (GitHub release assets answer 501, Google Cloud Storage 400, S3 the whole file with 200), retry the differential download with one range per request instead of downloading the full update. Every range response must now be a 206 for exactly the requested range: a host that ignores ranges used to stream the whole file once per range before the checksum failed, and now fails on its first request and falls back to a full download. _[`#10343`](https://github.com/electron-userland/electron-builder/pull/10343) [`0fdce73`](https://github.com/electron-userland/electron-builder/commit/0fdce73d71b5949b91c8c893522efd73245a310e)_
+- Fix(updater): treat channel "latest" as stable-only when allowPrerelease is enabled _[`#10360`](https://github.com/electron-userland/electron-builder/pull/10360) [`a3c9240`](https://github.com/electron-userland/electron-builder/commit/a3c9240ca53bc33f0bee77c1d67aa8f4746ff6f4)_
+- Refactor(win): verify update signatures with the Authenticode helpers moved unchanged to builder-util-runtime (no behavior change) _[`#10378`](https://github.com/electron-userland/electron-builder/pull/10378) [`60e3708`](https://github.com/electron-userland/electron-builder/commit/60e3708955724138009f157cf0ad3f80a36ddeae)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`45d3bc4`](https://github.com/electron-userland/electron-builder/commit/45d3bc431b5274b38b6b50b0b299d9ae6575469b) [`538aef4`](https://github.com/electron-userland/electron-builder/commit/538aef405d68940cb1322147ab050c24eb581342) [`8b71ed8`](https://github.com/electron-userland/electron-builder/commit/8b71ed87224beed7c0674fdd312d54047095d965) [`370d18c`](https://github.com/electron-userland/electron-builder/commit/370d18cb25e18b204d9ddbaf010879f8939cbeef) [`46be1f4`](https://github.com/electron-userland/electron-builder/commit/46be1f48e51a59b846ca76e631fc9e4e33348fb5) [`60e3708`](https://github.com/electron-userland/electron-builder/commit/60e3708955724138009f157cf0ad3f80a36ddeae)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.11`
+
+</details>
+
+## 7.0.0-alpha.10
+### Patch Changes
+
+- Fix: reject missing and path-valued cached update file names _[`#10115`](https://github.com/electron-userland/electron-builder/pull/10115) [`4ca053b`](https://github.com/electron-userland/electron-builder/commit/4ca053bb8a84735b4d807239c6cbebe59ebe4365)_
+- Fix(docs): repair broken links and anchors across the docs site and JSDoc, and export the `SnapOptions24`, `SnapOptionsLegacy`, `SnapOptionsCustom` and `RemoteBuildOptions` types from `app-builder-lib` so their API reference pages are generated _[`#10305`](https://github.com/electron-userland/electron-builder/pull/10305) [`2fdbcae`](https://github.com/electron-userland/electron-builder/commit/2fdbcae5b136c486d3afa3e564d032b5a79dae05)_
+- Fix(updater): make GitHubProvider pick the highest eligible release for alpha/beta channel clients instead of the first feed entry, so a stable hotfix published after a pre-release no longer hides that newer pre-release (or offers a downgrade) (#10287) _[`#10289`](https://github.com/electron-userland/electron-builder/pull/10289) [`a1ad1a5`](https://github.com/electron-userland/electron-builder/commit/a1ad1a5c2f1147d7e9242c0f3067464cad76e026)_
+- Refactor: once-only build and updater warnings use `log.once` / `log.limit` (and the updater's per-instance counter) instead of hand-rolled flags and sets; a concurrently resolved NSIS ProgID notice can no longer print twice _[`#10303`](https://github.com/electron-userland/electron-builder/pull/10303) [`6fe881e`](https://github.com/electron-userland/electron-builder/commit/6fe881ea4db4a92c8fbac7d435607d0ccebe2775)_
+- Feat(builder-util): `log.limit({ key, max, scope })` / `log.once(key, scope)` emit a keyed message at most N times (per process, or per scope object), replacing hand-rolled "already warned" flags; electron-updater counts once-per-updater warnings internally without changing the injectable `Logger` interface. Both share one limiter (`wrap()` on any `{ info, warn, error, debug? }` logger, including `console`), and its `LogLevel`, `LogLimitOptions`, `LoggerLike` and `LimitedLogger` types are now exported from builder-util-runtime (builder-util re-exports them) _[`#10302`](https://github.com/electron-userland/electron-builder/pull/10302) [`5cbbc8d`](https://github.com/electron-userland/electron-builder/commit/5cbbc8de8e0fb585cfa97e80644e8a29ab7d8ff4)_
+- Fix: handle a deferred native macOS update download only once _[`#10116`](https://github.com/electron-userland/electron-builder/pull/10116) [`10c4b54`](https://github.com/electron-userland/electron-builder/commit/10c4b5433dce8c325adabe3630b244919d5bc0a2)_
+- Fix: handle multipart headers split across download chunks _[`#10117`](https://github.com/electron-userland/electron-builder/pull/10117) [`dde668d`](https://github.com/electron-userland/electron-builder/commit/dde668d148c5d88b8369b447f2e791c724b8743c)_
+- Docs: document `files[].isAdminRightsRequired` as an intentionally unsigned launch hint in signed update manifests. It only selects how the hash-verified installer is launched (directly or via `elevate.exe`), so publishers can correct it in `latest.yml` without re-signing. _[`#10318`](https://github.com/electron-userland/electron-builder/pull/10318) [`434f6e9`](https://github.com/electron-userland/electron-builder/commit/434f6e98b017c14176be9aaf06891f09624c88fc)_
+- Fix: validate the initial update channel and allow resetting a configured channel to the default _[`#10112`](https://github.com/electron-userland/electron-builder/pull/10112) [`1e167b8`](https://github.com/electron-userland/electron-builder/commit/1e167b8cc73ccd7d10fcd3e2b1bf8e85befb5b06)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`68aa2ff`](https://github.com/electron-userland/electron-builder/commit/68aa2ff1d5bc713819cd98bfb34c890fbe03a93a) [`2fdbcae`](https://github.com/electron-userland/electron-builder/commit/2fdbcae5b136c486d3afa3e564d032b5a79dae05) [`5cbbc8d`](https://github.com/electron-userland/electron-builder/commit/5cbbc8de8e0fb585cfa97e80644e8a29ab7d8ff4) [`8f55928`](https://github.com/electron-userland/electron-builder/commit/8f5592839b6b2752754c19b8b7190ec86f55ef94) [`434f6e9`](https://github.com/electron-userland/electron-builder/commit/434f6e98b017c14176be9aaf06891f09624c88fc)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.10`
+
+</details>
+
+## 7.0.0-alpha.9
+
+### Major Changes
+
+- Feat(updater): add `verifyUpdateFile` to `AppUpdater`, and rename the NSIS Authenticode verification interface _[`#10239`](https://github.com/electron-userland/electron-builder/pull/10239) [`317fc9e`](https://github.com/electron-userland/electron-builder/commit/317fc9e7a820c55005179d3c648b36204efd1288) [@Lemonexe](https://github.com/Lemonexe)_
+
+  `AppUpdater.verifyUpdateFile` lets an app run its own verification of an update file before that file is allowed to become installable. The default implementation is a stub that immediately succeeds. It runs on every path that can lead to an install — right after a fresh download (while the file still sits under a temporary name, so an unverified file is never executable under its real name), when an update downloaded by an earlier session is reused from the cache, and before an install-on-next-launch spawns the cached installer. On failure the file is deleted and an `ERR_UPDATER_INVALID_UPDATE_FILE` error is emitted. Assigning `null` restores the default.
+
+  The NSIS Authenticode verification interface now returns an unambiguous result object instead of the `null`-means-success / `string`-means-error convention:
+
+  ```ts
+  type VerifyUpdateFileResult =
+    | { response: "success" }
+    | { response: "failure"; message: string };
+  ```
+
+  BREAKING CHANGE: `NsisUpdater.verifyUpdateCodeSignature` is deprecated in favour of `verifyUpdateFileAuthenticodeSignature`, which differs in return type. The old name is kept as a compatibility shim that translates in both directions and shall be removed in electron-builder v28.
+
+  ```ts
+  // Before
+  autoUpdater.verifyUpdateCodeSignature = async (publisherNames, path) =>
+    isValid ? null : "why it failed";
+
+  // After
+  autoUpdater.verifyUpdateFileAuthenticodeSignature = async (
+    publisherNames,
+    path
+  ) =>
+    isValid
+      ? { response: "success" }
+      : { response: "failure", message: "why it failed" };
+  ```
+
+  BREAKING CHANGE: the protected `NsisUpdater._verifyUpdateCodeSignature` member is renamed to `_verifyUpdateFileAuthenticodeSignature` and takes the new return type. A deprecated accessor under the old name forwards to it, so a subclass that **assigns** `this._verifyUpdateCodeSignature` keeps working; a subclass that **redeclares** it as a class field shadows the accessor and must be migrated.
+
+  BREAKING CHANGE: the protected `BaseUpdater.verifyInstallerSignatureOnLaunch` returns `Promise<VerifyUpdateFileResult>` instead of `Promise<string | null>`. An override that resolves `null` to mean "verified" now reports every install-on-next-launch as unsigned; return `{ response: "success" }` instead. (This member was introduced earlier in the same v27 pre-release cycle, so only apps on a 7.0.0-alpha are affected.)
+
+- Feat!: electron-updater sends update-feed credentials only to downloads on the feed's origin. With the generic, s3, spaces, r2, keygen, bitbucket, github and gitlab providers, a download on another origin than the feed (scheme, host or port) — an absolute `files[].url` or `packages.<arch>.path` in `latest*.yml`, a GitLab release asset link, and the blockmaps and differential range requests derived from them — is requested without the credential headers from `requestHeaders` / `addAuthHeader` (headers such as `Authorization`, the same set that is removed on a cross-origin redirect) and without the feed URL's query string. Such a URL keeps its own query string, so pre-signed URLs work. With every provider, including custom ones, a URL that electron-updater resolves against the feed URL (such as a `files[].url` or a blockmap) gets the feed query only on the feed's origin; as on redirects, an `http` → `https` upgrade of the feed host on the default ports keeps the headers and the query. Downloads on the feed origin are unchanged, and the old blockmap from an app-set `previousBlockmapBaseUrlOverride` keeps the credentials on that origin. If your `latest*.yml` points downloads at another origin that needs these credentials, serve the files from the feed origin or use pre-signed URLs. The NSIS web-package differential download now uses the same per-download headers as other downloads. A custom provider that does not extend a built-in one must declare `Provider.feedBaseUrl` — its feed URL (the credential headers then only go to that origin) or `null` (the request headers go to every download URL) — when the download headers include a credential header: if it does not, `downloadUpdate()` fails with `ERR_UPDATER_FEED_BASE_URL_NOT_DECLARED` before any download request. The first download that loses the credential headers, and the first that does not get the feed query, each log a warning once per updater, naming the headers, the query parameters and the origins (never their values), with a link to the migration guide; `ERR_UPDATER_FEED_BASE_URL_NOT_DECLARED` links it too. New APIs: `Provider.feedBaseUrl` (`undefined`, not declared, by default), `HttpExecutor.sensitiveHeaderNames`, `HttpExecutor.removeCrossOriginSensitiveHeaders` and `HttpExecutor.isCrossOrigin`. _[`#10270`](https://github.com/electron-userland/electron-builder/pull/10270) [`ec9135d`](https://github.com/electron-userland/electron-builder/commit/ec9135d0626879479ffa4235006f06b14375cc43) [@mmaietta](https://github.com/mmaietta)_
+- Feat!: NSIS web-installer updates are rejected unless `disableWebInstaller` is `false` (the v27 grace period is removed; cached and install-on-next-launch web updates re-verify the web package), and the nsis-web installer verifies `--package-file` and versioned package downloads against its built-in SHA-512 hashes (opt out with `nsisWeb.allowUnverifiedAppPackage`). Set `disableWebInstaller` before the app is ready: a pending install-on-next-launch web update is checked against it at app `ready` _[`#10264`](https://github.com/electron-userland/electron-builder/pull/10264) [`c8ca1ac`](https://github.com/electron-userland/electron-builder/commit/c8ca1ac573f2160cf1c15a9e8c028b60960a94df) [@mmaietta](https://github.com/mmaietta)_
+
+### Minor Changes
+
+- Feat(updater): optional `files[].blockMapUrl` in `latest*.yml` names a file's blockmap URL (e.g. a separately pre-signed one) instead of `${url}.blockmap` with the file URL's query string. A relative value resolves like `url` (against the feed URL); an absolute URL is used as-is, with its own host and query string. It gets the feed query and credential headers only on the feed's origin. With a `blockMapUrl`, the old blockmap is not derived from the new file's URL: it comes from the local cache, else from `previousBlockmapBaseUrlOverride`, else that update is downloaded in full (which caches the new blockmap). The manifest signature covers `blockMapUrl` when present, as an extra field on the file record, so manifests without it canonicalize and verify exactly as before; an electron-updater without this change refuses a signed manifest that has one. electron-builder does not write it. The private GitHub and GitLab providers, which resolve files from the release assets, ignore it. _[`#10270`](https://github.com/electron-userland/electron-builder/pull/10270) [`ec9135d`](https://github.com/electron-userland/electron-builder/commit/ec9135d0626879479ffa4235006f06b14375cc43) [@mmaietta](https://github.com/mmaietta)_
+
+### Patch Changes
+
+- Fix: report accurate differential download progress deltas _[`#10118`](https://github.com/electron-userland/electron-builder/pull/10118) [`58e5d2e`](https://github.com/electron-userland/electron-builder/commit/58e5d2e2b26cc7665f39e7f19e93c59259d5ee76) [@OskarEichler](https://github.com/OskarEichler)_
+- Feat!: a code-signed Windows build that writes `app-update.yml` (an `nsis`, `nsis-web` or `electronUpdaterAware` `appx` target with a publish configuration, including one inferred from a GitHub `repository`) now fails with an `InvalidConfigurationError` when its publisher name cannot be determined: any custom `win.sign.sign` hook without `win.sign.publisherName` (its publisher name is never derived from a certificate, not even one in the config — `certificateFile`, `certificateSubjectName`, `certificateSha1`, `cscLink` — or from `WIN_CSC_LINK` / `CSC_LINK`, because the hook may sign with another one), or a certificate without a Common Name (including a certificate-store subject, which no longer yields an undefined publisher name). Set `win.sign.publisherName` to the subject of the signing certificate (copy it from a binary your hook already signed), or set `win.verifyUpdateCodeSignature: false` only if your updates are not Authenticode-signed or you don't use electron-updater. Error and warning messages now name `win.sign.publisherName` instead of the removed `win.publisherName`. _[`#10264`](https://github.com/electron-userland/electron-builder/pull/10264) [`c8ca1ac`](https://github.com/electron-userland/electron-builder/commit/c8ca1ac573f2160cf1c15a9e8c028b60960a94df) [@mmaietta](https://github.com/mmaietta)_
+- Fix(updater): pass the web installer package to `verifyUpdateFile` as `packageFilePath` when a pending web update is installed on next launch _[`#10264`](https://github.com/electron-userland/electron-builder/pull/10264) [`c8ca1ac`](https://github.com/electron-userland/electron-builder/commit/c8ca1ac573f2160cf1c15a9e8c028b60960a94df) [@mmaietta](https://github.com/mmaietta)_
+- Fix: handle background download rejections from `checkForUpdatesAndNotify` _[`#10113`](https://github.com/electron-userland/electron-builder/pull/10113) [`c10345f`](https://github.com/electron-userland/electron-builder/commit/c10345f7c016cb1ebaa3cf954a55e61df56d50a4) [@OskarEichler](https://github.com/OskarEichler)_
+- Fix(updater): pass the NSIS install directory (`installDirectory`, `/D=`) as the last installer argument, after `--package-file` _[`#10264`](https://github.com/electron-userland/electron-builder/pull/10264) [`c8ca1ac`](https://github.com/electron-userland/electron-builder/commit/c8ca1ac573f2160cf1c15a9e8c028b60960a94df) [@mmaietta](https://github.com/mmaietta)_
+- Chore: replace ESLint and Prettier with oxlint and oxfmt _[`#10240`](https://github.com/electron-userland/electron-builder/pull/10240) [`a578e53`](https://github.com/electron-userland/electron-builder/commit/a578e53441ede7f6fb3e9d69292dc135ef37ed17) [@claude](https://github.com/apps/claude)_
+- Fix: reject traversal segments as update cache filenames _[`#10127`](https://github.com/electron-userland/electron-builder/pull/10127) [`e832c81`](https://github.com/electron-userland/electron-builder/commit/e832c8135b2e42ec06919434b678f777ef986ff1) [@OskarEichler](https://github.com/OskarEichler)_
+- Fix(updater): the warning about `disableWebInstaller` set to `false` for a full-installer update is logged only when the app set it; for the default of an install made by an nsis-web installer an info line says that web-installer updates need `disableWebInstaller = false` after that update _[`#10264`](https://github.com/electron-userland/electron-builder/pull/10264) [`c8ca1ac`](https://github.com/electron-userland/electron-builder/commit/c8ca1ac573f2160cf1c15a9e8c028b60960a94df) [@mmaietta](https://github.com/mmaietta)_
+- Feat!: the nsis-web installer verifies and installs its own copy of a local app package. A package passed via `--package-file` (electron-updater does this for updates) or found next to the installer is first copied into the installer's own temporary directory; the checksum is computed on that copy and that copy is what is extracted. With `nsisWeb.allowUnverifiedAppPackage` a package passed via `--package-file` is still copied, but not verified. The local package file is now left in place (the installer's copy is moved into the app's update cache instead), and the installation is aborted (exit code `2`) if a `--package-file` package cannot be copied; a package found next to the installer that cannot be copied is ignored and the package is downloaded, as when its checksum doesn't match. electron-updater removes the package it passed via `--package-file` from its `pending` cache directory at startup once the app runs the version of that update (`update-info.json` records the version of a web installer update for this); the package of an update that is not installed yet, or whose install failed, is kept. _[`#10264`](https://github.com/electron-userland/electron-builder/pull/10264) [`c8ca1ac`](https://github.com/electron-userland/electron-builder/commit/c8ca1ac573f2160cf1c15a9e8c028b60960a94df) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`ec9135d`](https://github.com/electron-userland/electron-builder/commit/ec9135d0626879479ffa4235006f06b14375cc43) [`ec9135d`](https://github.com/electron-userland/electron-builder/commit/ec9135d0626879479ffa4235006f06b14375cc43) [`ec9135d`](https://github.com/electron-userland/electron-builder/commit/ec9135d0626879479ffa4235006f06b14375cc43)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.9`
+
+</details>
+
+## 7.0.0-alpha.8
+
+### Major Changes
+
+- Refactor(updater): `downloadUpdate()` and `UpdateCheckResult.downloadPromise` resolve with a `DownloadExecutorResult` object instead of a positional `Array<string>` _[`#10164`](https://github.com/electron-userland/electron-builder/pull/10164) [`0d47ef5`](https://github.com/electron-userland/electron-builder/commit/0d47ef5c4dda24939e5a6b02927440bdc2da1cd1) [@claude](https://github.com/apps/claude)_
+
+  BREAKING CHANGE: the promise returned by `AppUpdater.downloadUpdate()` (and `UpdateCheckResult.downloadPromise` when `autoDownload` is enabled) now resolves with `{ updateFile, packageFile? }` instead of `[updateFile]` / `[updateFile, packageFile]`. The array shape depended on element order to tell the installer apart from the optional NSIS web-installer package; the new `DownloadExecutorResult` type (exported from `electron-updater`) names both files. `UpdateDownloadedEvent` additionally gains an optional `packageFile` field for web installers.
+
+  ```ts
+  // Before (v6)
+  const files = await autoUpdater.downloadUpdate();
+  const installer = files[0];
+  const webInstallerPackage = files[1]; // only for NSIS web installers
+
+  // After (v7)
+  const { updateFile, packageFile } = await autoUpdater.downloadUpdate();
+  ```
+
+  The same applies to the result of `checkForUpdates()`:
+
+  ```ts
+  // Before (v6)
+  const result = await autoUpdater.checkForUpdates();
+  const [installer] = (await result?.downloadPromise) ?? [];
+
+  // After (v7)
+  const result = await autoUpdater.checkForUpdates();
+  const download = await result?.downloadPromise;
+  const installer = download?.updateFile;
+  ```
+
+  The underlying cache-consistency fix from #10098 already produced this object internally; this change stops converting it back to an array at the public API boundary.
+
+### Minor Changes
+
+- Feat: v27 upgrade guardrails: make every breaking change self-announcing _[`#10182`](https://github.com/electron-userland/electron-builder/pull/10182) [`318f6fb`](https://github.com/electron-userland/electron-builder/commit/318f6fb93f9a6f92231320aa876db9e66bd78b6a) [@mmaietta](https://github.com/mmaietta)_
+- Feat(updater): improve PowerShell invocation reliability for Windows code-signature verification _[`#9764`](https://github.com/electron-userland/electron-builder/pull/9764) [`df1bce3`](https://github.com/electron-userland/electron-builder/commit/df1bce3eb032194c970c605286ab9b11655469dd) [@mmaietta](https://github.com/mmaietta)_
+- Feat(security): signed update manifests (Ed25519) with trust lists and multi-signature manifests _[`#9877`](https://github.com/electron-userland/electron-builder/pull/9877) [`d45536f`](https://github.com/electron-userland/electron-builder/commit/d45536f74e63e5c19dd4a590238521f6315812f5) [@mmaietta](https://github.com/mmaietta)_
+
+  Optional Ed25519 signing of auto-update manifests (`latest*.yml`). When signing keys are configured
+  (`updateManifest.signingKey`/`signingKeyFile` in config, or `ELECTRON_BUILDER_UPDATE_SIGN_KEY`/`ELECTRON_BUILDER_UPDATE_SIGN_KEY_FILE`
+  env vars), each manifest is signed over its integrity-critical fields and the matching public keys are
+  embedded into `app-update.yml` (both resolved from the same keys on the platform packager, so signing and
+  embedding cannot disagree). electron-updater verifies the signature before downloading and refuses to
+  update on tamper/missing-signature (fail-closed). Opt-in: when no public key is configured, verification is
+  skipped with a one-time warning. New CLI: `electron-builder create-update-key` (prints the public key and its key id).
+
+  Key rotation without a flag day: an install trusts a **list** of public keys (`updateManifestPublicKey` is a
+  string or an array; `updateManifest.publicKey`, `signingKey` and `signingKeyFile` accept arrays, a PEM value may
+  hold several concatenated keys, and `ELECTRON_BUILDER_UPDATE_SIGN_KEY_FILE` accepts several paths joined with
+  the OS path delimiter), and a manifest may carry **several signatures** (`signatures: [{ keyId, signature }]`,
+  one per signing key, next to the legacy `signature` of the first key). A manifest is accepted when any trusted
+  key validates any of its signatures, so a release signed with `[old, new]` verifies on installs that trust
+  either. `AppUpdater.updateManifestPublicKey` accepts a string or an array. A build-time warning flags an
+  explicit `publicKey` list that contains none of the signing keys.
+
+  Gating of the Linux package-manager signature-bypass flags landed separately as
+  `AppUpdater.allowUnverifiedLinuxPackages` (#9990).
+
+### Patch Changes
+
+- Fix: make multi-range differential downloads work on real servers. Three independent defects made `downloadUpdate` fall back to a full download with `Response ends without calling any handlers`: _[`#10192`](https://github.com/electron-userland/electron-builder/pull/10192) [`8e22767`](https://github.com/electron-userland/electron-builder/commit/8e227679fe34befde8fa31f6b811b86c79f010d5) [@yi-ge](https://github.com/yi-ge)_
+
+  - `DataSplitter` only recognised CRLF. Some CDNs answer `multipart/byteranges` with bare LF line endings, so no part was ever split and the whole response accumulated in memory. Header lists now end at whichever of `\r\n\r\n` / `\n\n` comes first, and the `<EOL>--boundary` separator size follows the line ending the server actually uses.
+  - A header-list terminator split across two chunks was never found: only the new chunk was searched, the buffered bytes never were, so the parser locked onto the next part's header instead. Only the last few bytes of an unfinished header list are now carried over and searched together with the next chunk, instead of accumulating the whole list.
+  - The 10s watchdog armed when a batch response ends was never disarmed after that batch succeeded. With more than 1000 operations (several range requests) it failed the whole download whenever a later batch took longer than the grace period.
+
+- Fix: preserve fractional staged rollout percentages _[`#10114`](https://github.com/electron-userland/electron-builder/pull/10114) [`23bccfb`](https://github.com/electron-userland/electron-builder/commit/23bccfb6accd2eb082633d592d15486e81c89374) [@OskarEichler](https://github.com/OskarEichler)_
+- Fix: strip `PSModulePath` from the PowerShell child environment case-insensitively during Windows code-signature verification. Windows environment variable names are case-insensitive but JS object keys are not, so a differently-cased key (e.g. `PSMODULEPATH`) could previously survive into the spawned PowerShell process. _[`#10159`](https://github.com/electron-userland/electron-builder/pull/10159) [`61bd5f6`](https://github.com/electron-userland/electron-builder/commit/61bd5f6044ff8c09f44d443b956a96e0aba105b2) [@claude](https://github.com/apps/claude)_
+- Fix: keep the cached blockmap consistent with the cached installer. A download round that did not produce a new blockmap (e.g. the differential download was skipped because the cached installer was evicted) now removes the cached `current.blockmap` instead of leaving a stale one next to the freshly cached file, which poisoned the next differential download and surfaced as a generic sha512 checksum mismatch before falling back to a full download (#10097). Leftover pending blockmaps from previous update rounds are also cleared before a fresh download. sha512-mismatch logging now distinguishes a differential download that failed against stale/corrupt cached inputs (including whether the old blockmap came from the local cache or the server) from a genuine checksum failure of a fully downloaded file. _[`#10098`](https://github.com/electron-userland/electron-builder/pull/10098) [`9306160`](https://github.com/electron-userland/electron-builder/commit/93061602d9ee89d824834cef0b06c75353fa6a4a) [@claude](https://github.com/apps/claude)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`d45536f`](https://github.com/electron-userland/electron-builder/commit/d45536f74e63e5c19dd4a590238521f6315812f5) [`6ab9a8c`](https://github.com/electron-userland/electron-builder/commit/6ab9a8c5fbed759e0c9e26064208c422c612b200)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.8`
+
+</details>
+
+## 7.0.0-alpha.7
+
+### Patch Changes
+
+- Docs: fix broken electron.build documentation links in readmes, TSDoc comments, and error messages — point auto-update, code-signing, and multi-platform-build references at their new `/docs/features/` locations, repair the `electron.build./` domain typo, and replace anchors that no longer exist (#10107) _[`#10111`](https://github.com/electron-userland/electron-builder/pull/10111) [`cf39086`](https://github.com/electron-userland/electron-builder/commit/cf39086fbb71e34d1fef0359a026697153e6ee3b) [@claude](https://github.com/apps/claude)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`cf39086`](https://github.com/electron-userland/electron-builder/commit/cf39086fbb71e34d1fef0359a026697153e6ee3b)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.7`
+
+</details>
+
+## 7.0.0-alpha.6
+
+### Minor Changes
+
+- Feat: warn on silently skipped update signature verification and validate `publisherName` against the signing certificate at build time _[`#10056`](https://github.com/electron-userland/electron-builder/pull/10056) [`331afdd`](https://github.com/electron-userland/electron-builder/commit/331afdd30bd59aa0185f7df31b5712e62a5acfbf) [@claude](https://github.com/apps/claude)_
+
+  Two guards around Windows update signature verification:
+
+  - **electron-updater**: when `app-update.yml` exists but contains no `publisherName`, the updater used to skip signature verification (including custom `verifyUpdateCodeSignature` hooks) completely silently. It now logs a warning explaining that verification was skipped, how to fix it (sign the build so `publisherName` is derived automatically, or set `win.publisherName` explicitly), and that this fail-open behavior is deprecated: electron-builder v28 will treat a missing `publisherName` as a verification failure (fail-closed). The no-`app-update.yml` path (unpackaged/dev mode) stays silent.
+  - **app-builder-lib**: when `publisherName` is explicitly configured and the subject of the local code signing certificate is known, the build now fails with a clear error if none of the configured names match the certificate (same DN-subset/CN matching semantics as the updater's verifier; any one of multiple configured names matching passes, so certificate-rotation setups keep working). This catches signing with the wrong certificate at build time instead of at update time. The check is skipped whenever the actual signing certificate's subject is not genuinely known (custom `sign` hooks, Azure Trusted Signing, PKCS#11 without an extractable certificate, x509 files without a CN), and `publisherName: null` remains a pure opt-out.
+
+### Patch Changes
+
+- Fix: expose `./package.json` in the `exports` map so tooling (including electron-builder's installed-version check) can resolve the installed version via `require.resolve("electron-updater/package.json")` _[`#10019`](https://github.com/electron-userland/electron-builder/pull/10019) [`0fdb4cb`](https://github.com/electron-userland/electron-builder/commit/0fdb4cb4fd08a2adb7a64dce2a0c347b235e8192) [@claude](https://github.com/apps/claude)_
+- Security hardening and a migrate-schema fix: _[`#10036`](https://github.com/electron-userland/electron-builder/pull/10036) [`b87a0b7`](https://github.com/electron-userland/electron-builder/commit/b87a0b7a533eef1711e600864f2540dc163176d7) [@mmaietta](https://github.com/mmaietta)_
+  - `builder-util` `removePassword`: redact single-letter/URI secret flags (`security … -k <password>`, `osslsigncode -key <pkcs11-uri?pin-value=…>`) and whitespace-containing secrets in debug logs, and make the `/b … /c` block-redaction regex ReDoS-safe.
+  - `builder-util-runtime` `httpExecutor`: fix the non-functional `maxRedirects` guard (the redirect counter was never advanced), so a redirect loop from a malicious feed/mirror no longer hangs the updater.
+  - `electron-updater` `GitLabProvider`: only forward the GitLab token to the channel-file request when its URL is same-origin as the API host, so an off-host/`http://` `direct_asset_url` in the release JSON cannot exfiltrate the token.
+  - `app-builder-lib`: defense-in-depth hardening — validate `executableName` before interpolating it into the generated Flatpak launcher, contain custom-toolset extraction within the cache dir, and XML-escape MSI file-association `ext`/`description`.
+  - `electron-builder` `migrate-schema`: auto-remove the removed `linux.syncDesktopName` flag.
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`b87a0b7`](https://github.com/electron-userland/electron-builder/commit/b87a0b7a533eef1711e600864f2540dc163176d7)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.6`
+
+</details>
+
+## 7.0.0-alpha.5
+
+### Major Changes
+
+- Feat(updater): default `disableWebInstaller` to `true` _[`#9979`](https://github.com/electron-userland/electron-builder/pull/9979) [`7a0abca`](https://github.com/electron-userland/electron-builder/commit/7a0abca14439514fc817da609a169b9973c38864) [@mmaietta](https://github.com/mmaietta)_
+
+  BREAKING CHANGE: `AppUpdater.disableWebInstaller` now defaults to `true`. NSIS web-installer packages are no longer loaded unless you opt in, because their payload is fetched from a manifest-supplied URL that may not undergo signature verification.
+
+  v27 ships a one-major-version grace period so existing deployments are not broken without warning:
+
+  - If you never set `disableWebInstaller` (the default) and a web-installer update is received, the updater logs a deprecation warning and still downloads it. In v28 this becomes an error and the download is blocked (`ERR_UPDATER_WEB_INSTALLER_DISABLED`).
+  - If you explicitly set `disableWebInstaller = true`, the download throws `ERR_UPDATER_WEB_INSTALLER_DISABLED` immediately.
+
+  If you intentionally publish and rely on an NSIS web installer, opt back in before v28 by setting `autoUpdater.disableWebInstaller = false` in your main process.
+
+- Feat(updater)!: install-on-next-launch mode, OS session-end guard, object-form `quitAndInstall`, and `autoInstallEvent` enum _[`#10011`](https://github.com/electron-userland/electron-builder/pull/10011) [`1798f6b`](https://github.com/electron-userland/electron-builder/commit/1798f6b67151777cedce4dab1a3778717c8feab0) [@claude](https://github.com/apps/claude)_
+
+  **BREAKING:** `quitAndInstall` now takes a single destructured options object instead of positional booleans, so v27 migrators discover the new deferred-install flag and can never swap arguments silently. Defaults are unchanged; there is no backward-compat shim.
+
+  ```ts
+  // Before (v26)
+  autoUpdater.quitAndInstall(true, false);
+
+  // After (v27)
+  autoUpdater.quitAndInstall({ isSilent: true, isForceRunAfter: false });
+  ```
+
+  **BREAKING:** the `autoInstallOnAppQuit` boolean is replaced by an `autoInstallEvent: "manual" | "onQuit" | "onNextLaunch"` enum (default `"onQuit"`, which preserves prior behavior). There is no compat alias — a single boolean cannot express the three states.
+
+  ```ts
+  // Before (v26)
+  autoUpdater.autoInstallOnAppQuit = false;
+
+  // After (v27)
+  autoUpdater.autoInstallEvent = "manual";
+  ```
+
+  Installing an update while the app quits spawns a detached installer process; when the quit is caused by the OS session ending (shutdown/reboot/log off on Windows), the OS can kill that installer mid-install and leave the app uninstalled but not re-installed (#7807). Two mitigations, both implemented in `BaseUpdater` so NSIS, AppImage, deb, rpm and pacman targets all inherit them:
+
+  - **Session-end guard (always on):** when the OS session is ending, the on-quit install is skipped with a warning and the downloaded update stays cached for the next quit. Detection is best-effort: `powerMonitor` `shutdown` on macOS/Linux, `BrowserWindow` `session-end` on Windows (windowless apps cannot be covered on Windows).
+  - **`autoInstallEvent: "onNextLaunch"` (opt-in; default is `"onQuit"`):** any app quit persists the downloaded update as pending instead of spawning the installer. On the next launch the updater re-validates the cached installer against freshly fetched update info (checksum, code signature on Windows, and an installable-change version check — newer, or a downgrade when `allowDowngrade` is set — as a loop guard) and installs it silently, restarting the app. A single quit can be deferred via the new `quitAndInstall({ waitUntilNextLaunch: true })` option.
+
+  The automatic install at startup is restricted to targets that install without an elevation prompt: **NSIS (per-user installs) and AppImage only**. deb/rpm/pacman always elevate via pkexec/sudo to install — an authentication dialog at app launch is not acceptable — so they keep the pending update and log why; per-machine NSIS installs (UAC) are skipped the same way. For those targets, call the new `installPendingUpdateIfAvailable()` explicitly at a moment the app controls.
+
+  `autoInstallEvent: "onNextLaunch"` is opt-in in v27 and is planned to become the DEFAULT in v28 to resolve this class of session-end corruption once and for all. macOS is unaffected: Squirrel.Mac natively stages downloaded updates and applies them on relaunch (there `"onQuit"` and `"onNextLaunch"` behave identically).
+
+### Minor Changes
+
+- Feat: add Cloudflare R2 publish provider _[`#9773`](https://github.com/electron-userland/electron-builder/pull/9773) [`a086ef3`](https://github.com/electron-userland/electron-builder/commit/a086ef37855406d0abe418ca1beeca605608b510) [@kyletaylored](https://github.com/kyletaylored)_
+- Feat(nsis): self-identify install method via `resources/package-type` so nsis-web installs default `disableWebInstaller` to `false` _[`#9979`](https://github.com/electron-userland/electron-builder/pull/9979) [`7a0abca`](https://github.com/electron-userland/electron-builder/commit/7a0abca14439514fc817da609a169b9973c38864) [@mmaietta](https://github.com/mmaietta)_
+
+  NSIS installers now write a `resources/package-type` marker (`nsis` or `nsis-web`) at install time, mirroring the existing Linux `package-type` mechanism. electron-updater's `NsisUpdater` reads this marker and, for `nsis-web` installs, pre-seeds `disableWebInstaller = false` so web-installer auto-updates keep working without the app wiring the flag by hand.
+
+  This is a default only: an explicit `autoUpdater.disableWebInstaller = …` set by the app still wins, and a plain `nsis` marker leaves the secure `?? true` default (and the v27 grace-period warning) untouched. The marker is written by the installer script — the only build artifact that differs between `nsis` and `nsis-web` (the app payload is byte-identical, since both targets share one app archive). Only go-forward installs carry the marker; existing deployments are unaffected.
+
+- Feat(updater): add `allowUnverifiedLinuxPackages` to optionally enforce Linux package signature verification _[`#9990`](https://github.com/electron-userland/electron-builder/pull/9990) [`65f0403`](https://github.com/electron-userland/electron-builder/commit/65f04035f722199c7bbd5360f7ecbf2bf352a645) [@mmaietta](https://github.com/mmaietta)_
+
+  Adds `AppUpdater.allowUnverifiedLinuxPackages`. Because electron-builder does not sign Linux packages, this defaults to `true`, preserving the existing behavior: `.deb`/`.rpm` auto-updates install with the package manager's signature/GPG checks bypassed where a bypass flag exists (`--allow-unauthenticated` for the apt fallback, `--allow-unsigned-rpm` for zypper, `--nogpgcheck` for dnf/yum).
+
+  If you sign your Linux packages through your own pipeline and the target systems trust your keys, set `autoUpdater.allowUnverifiedLinuxPackages = false`. What this enforces depends on the package manager used on the target system:
+
+  - dpkg (the default for `.deb`): no effect — dpkg performs no signature verification (a warning is logged); enforcing `.deb` signatures requires a debsig-verify/debsigs policy on the target system.
+  - apt (`.deb` fallback): `--allow-unauthenticated` is omitted.
+  - zypper: enforced — unsigned/untrusted packages fail to install.
+  - dnf/yum: enforced via `--setopt=localpkg_gpgcheck=1` (local package files are not GPG-checked by default).
+  - bare rpm (fallback): cannot be enforced via the CLI (a warning is logged) — rpm verifies signatures when present but by default does not fail the install on unsigned/untrusted packages; the `rpm -Uvh ... --nodeps` fallback command is unchanged (`--nodeps` is a dependency-resolution bypass, not a signature bypass).
+
+  The new `allowUnverified` parameter on `DebUpdater.installWithCommandRunner` / `RpmUpdater.installWithCommandRunner` is a trailing optional argument (default `true`), so existing callers remain source- and runtime-compatible.
+
+### Patch Changes
+
+- Fix: Reject the differential download promise instead of crashing with an uncaughtException when the multipart range response emits a network error _[`#10021`](https://github.com/electron-userland/electron-builder/pull/10021) [`5eed26b`](https://github.com/electron-userland/electron-builder/commit/5eed26b2a9cfd06a1dbe207b25a46ce2c0b05ae9) [@claude](https://github.com/apps/claude)_
+- Fix(updater): make GitHubProvider pick the newest available release if `allowPrerelease=true` but current version is stable _[`#9895`](https://github.com/electron-userland/electron-builder/pull/9895) [`1f681e1`](https://github.com/electron-userland/electron-builder/commit/1f681e18292c318f2563d7b87cc480ee290e99e2) [@AbdulrhmanGoni](https://github.com/AbdulrhmanGoni)_
+
+  - `allowPrerelease=true` with no explicit channel and a stable current version now selects the newest valid semver release in the Atom feed (skipping unrelated non-semver tags such as other packages in a monorepo) instead of blindly taking the first feed entry (#9894).
+  - When every published release is older than the installed version, the updater now reports "update not available" gracefully (and honors `allowDowngrade`) instead of throwing.
+  - `allowPrerelease=false` no longer throws `ERR_UPDATER_NO_PUBLISHED_VERSIONS` when the latest release tag (from `/releases/latest`) is absent from GitHub's truncated Atom feed; it proceeds with the resolved tag.
+  - Harden the release download path against path traversal: a tag containing `.`/`..` path segments is rejected with `ERR_UPDATER_INVALID_TAG`.
+
+- Fix(updater): detect legacy hex `sha512` manifest values strictly and deprecate them for removal in v28 _[`#9990`](https://github.com/electron-userland/electron-builder/pull/9990) [`65f0403`](https://github.com/electron-userland/electron-builder/commit/65f04035f722199c7bbd5360f7ecbf2bf352a645) [@mmaietta](https://github.com/mmaietta)_
+
+  The updater previously used a fuzzy heuristic (looking for `+`, `/`, `Z`, or `=` characters) to decide whether a manifest `sha512` was hex- or base64-encoded. It now uses a strict check: a value that is exactly 128 hexadecimal characters is treated as legacy hex; anything else is decoded as base64, which is what electron-builder has emitted since 19.x (2017). The two forms cannot collide — base64-encoded sha512 is always 88 characters ending in `==` — and a wrong pick can only fail closed with a checksum mismatch.
+
+  Hex-encoded `sha512` values (from pre-19.x manifests or hand-rolled manifests built from raw `sha512sum` output) remain accepted in v27 but are deprecated: support will be removed in v28. Emit base64 instead, e.g. `sha512sum file.ext | cut -d' ' -f1 | xxd -r -p | base64 -w0`.
+
+  SHA-256 (`sha2`) update checksums are unchanged here — they remain accepted in v27 under the existing v28-removal grace period.
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`a086ef3`](https://github.com/electron-userland/electron-builder/commit/a086ef37855406d0abe418ca1beeca605608b510) [`65f0403`](https://github.com/electron-userland/electron-builder/commit/65f04035f722199c7bbd5360f7ecbf2bf352a645) [`2c10f1f`](https://github.com/electron-userland/electron-builder/commit/2c10f1fe9c409379208aa5c0a5bc102689fb5cb6)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.5`
+
+</details>
+
+## 7.0.0-alpha.4
+
+### Patch Changes
+
+- Chore(refactor): reducing duplicate code and extracting helper functions _[`#9947`](https://github.com/electron-userland/electron-builder/pull/9947) [`8f3d9fa`](https://github.com/electron-userland/electron-builder/commit/8f3d9fa442aae342c1c5d2a4448a687de1aff8df) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`8f3d9fa`](https://github.com/electron-userland/electron-builder/commit/8f3d9fa442aae342c1c5d2a4448a687de1aff8df)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.4`
+
+</details>
+
+## 7.0.0-alpha.3
+
+### Patch Changes
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`deafee9`](https://github.com/electron-userland/electron-builder/commit/deafee9fe5f7bccbf52e73cd0c6085e767f921ce)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.3`
+
+</details>
+
+## 7.0.0-alpha.2
+
+### Patch Changes
+
+- Fix: declare the missing `electron-publish` dependency on `electron-builder`, and switch type-checking to `nodenext` module resolution so the compiler models Node's real ESM loader _[`#9885`](https://github.com/electron-userland/electron-builder/pull/9885) [`96e47b5`](https://github.com/electron-userland/electron-builder/commit/96e47b5b89b76c719b1c06cfdd62a9a17376484e) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`96e47b5`](https://github.com/electron-userland/electron-builder/commit/96e47b5b89b76c719b1c06cfdd62a9a17376484e)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.2`
+
+</details>
+
+## 7.0.0-alpha.1
+
+### Patch Changes
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`7674e60`](https://github.com/electron-userland/electron-builder/commit/7674e6092645df5c7ae0a31530446efe449cd3d6)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.1`
+
+</details>
+
+## 7.0.0-alpha.0
+
+### Major Changes
+
+- Feat!: migrate to native ESM, require Node.js >=22.12.0, remove electron-compile _[`#9544`](https://github.com/electron-userland/electron-builder/pull/9544) [`a5121de`](https://github.com/electron-userland/electron-builder/commit/a5121de49582eaa8870d4c05e6ae55eff160a592) [@mmaietta](https://github.com/mmaietta)_
+
+### Patch Changes
+
+- Chore: Code quality modernization: adopt native Node.js APIs and modern TypeScript patterns across the codebase. _[`#9867`](https://github.com/electron-userland/electron-builder/pull/9867) [`f8feadb`](https://github.com/electron-userland/electron-builder/commit/f8feadb0c39934565197d69248274fd62173a94e) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`f8feadb`](https://github.com/electron-userland/electron-builder/commit/f8feadb0c39934565197d69248274fd62173a94e) [`9d755c6`](https://github.com/electron-userland/electron-builder/commit/9d755c68f845d169c9b68963c9711d2e75b4800b) [`a5121de`](https://github.com/electron-userland/electron-builder/commit/a5121de49582eaa8870d4c05e6ae55eff160a592)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.0`
+
+</details>
+
+## 6.8.9
+
+### Patch Changes
+
+- Fix: holistic field detection for sha256 hash redaction _[`#9834`](https://github.com/electron-userland/electron-builder/pull/9834) [`22a7532`](https://github.com/electron-userland/electron-builder/commit/22a7532bd01b9fb42cff7c58d599c7ad683569fe) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`198c10c`](https://github.com/electron-userland/electron-builder/commit/198c10c9693d1244bac80cb11af6b75ad363e5a0) [`22a7532`](https://github.com/electron-userland/electron-builder/commit/22a7532bd01b9fb42cff7c58d599c7ad683569fe)
+
+</small>
+
+- `builder-util-runtime@9.7.0`
+
+</details>
+
+## 6.8.8
+
+### Patch Changes
+
+- Fix(updater): ensure full changelog includes only release notes up to the latest release _[`#9573`](https://github.com/electron-userland/electron-builder/pull/9573) [`ac45083`](https://github.com/electron-userland/electron-builder/commit/ac450835015b18720c5bc5de0221b4c770d0fac2) [@AbdulrhmanGoni](https://github.com/AbdulrhmanGoni)_
+- Fix: harden the auto-update flow relative paths in PATH, path traversals, and environment variable intercepts _[`#9796`](https://github.com/electron-userland/electron-builder/pull/9796) [`2dc409f`](https://github.com/electron-userland/electron-builder/commit/2dc409f1e4ab1c82795ad731a50beb1296315730) [@mmaietta](https://github.com/mmaietta)_
+- Chore: extracting helper function to add coverage in MacUpdater test suite _[`#9794`](https://github.com/electron-userland/electron-builder/pull/9794) [`d664ed0`](https://github.com/electron-userland/electron-builder/commit/d664ed0968e6c4010688eebe97babcfe5e43bd51) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`59efef1`](https://github.com/electron-userland/electron-builder/commit/59efef1a8b81ed1ead4e8004043726d2b49cf81f)
+
+</small>
+
+- `builder-util-runtime@9.6.3`
+
+</details>
+
+## 6.8.7
+
+### Patch Changes
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`d6a5aee`](https://github.com/electron-userland/electron-builder/commit/d6a5aee821138449dc0c082606da6a1bf5ba0798) [`4866737`](https://github.com/electron-userland/electron-builder/commit/4866737e4fe1f0cca210d318b9ce440f8e978a63)
+
+</small>
+
+- `builder-util-runtime@9.6.2`
+
+</details>
+
+## 6.8.6
+
+### Patch Changes
+
+- Chore(docs): documentation updates and docusaurus migration _[`#9744`](https://github.com/electron-userland/electron-builder/pull/9744) [`d846315`](https://github.com/electron-userland/electron-builder/commit/d84631587d816a1aa0bff57680bab0f865d7a84f) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`d846315`](https://github.com/electron-userland/electron-builder/commit/d84631587d816a1aa0bff57680bab0f865d7a84f)
+
+</small>
+
+- `builder-util-runtime@9.6.1`
+
+</details>
+
+## 6.8.5
+
+### Patch Changes
+
+- Fix: GitLab auth token differs between fetching channel yaml & API requests _[`#9703`](https://github.com/electron-userland/electron-builder/pull/9703) [`4bcf68a`](https://github.com/electron-userland/electron-builder/commit/4bcf68abc957faae827ca50fa5c1bed3ddf7c956) [@mmaietta](https://github.com/mmaietta)_
+- Fix(electron-updater): filter draft releases in PrivateGitHubProvider.getLatestVersionInfo _[`#9694`](https://github.com/electron-userland/electron-builder/pull/9694) [`a5d8ab9`](https://github.com/electron-userland/electron-builder/commit/a5d8ab9436dd7db0c58a08cf9594e47613c4fc8e) [@copilot-swe-agent](https://github.com/apps/copilot-swe-agent)_
+
+## 6.8.4
+
+### Patch Changes
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`b7df0bc`](https://github.com/electron-userland/electron-builder/commit/b7df0bcef5790814fd6df187346dcec625dc681e)
+
+</small>
+
+- `builder-util-runtime@9.6.0`
+
+</details>
+
+## 6.8.3
+
+### Patch Changes
+
+- Chore: Remove console logs for autoupdate checks _[`#9561`](https://github.com/electron-userland/electron-builder/pull/9561) [`9c67fd3`](https://github.com/electron-userland/electron-builder/commit/9c67fd31ce982d11c82aae71263ba1f0055a77cc) [@Kilian](https://github.com/Kilian)_
+
+## 6.8.2
+
+### Patch Changes
+
+- Fix(updater): ignore releases with non-semver tags when collecting full changelog _[`#9550`](https://github.com/electron-userland/electron-builder/pull/9550) [`8aee1e6`](https://github.com/electron-userland/electron-builder/commit/8aee1e6944afae05a60d2a392743a78f818ee6de) [@AbdulrhmanGoni](https://github.com/AbdulrhmanGoni)_
+
+## 6.8.1
+
+### Patch Changes
+
+- Chore: running `eslint --fix` on more files _[`#9502`](https://github.com/electron-userland/electron-builder/pull/9502) [`6c20eeb`](https://github.com/electron-userland/electron-builder/commit/6c20eeb1cf9fd10980cde3c9ce0602fa6b7c6972) [@mmaietta](https://github.com/mmaietta)_
+
+## 6.8.0
+
+### Minor Changes
+
+- Emit download-progress events when downloading with multiple range differential downloader _[`#9448`](https://github.com/electron-userland/electron-builder/pull/9448) [`3533a3e`](https://github.com/electron-userland/electron-builder/commit/3533a3eb5af01416db3ecac703d6da031b05e615) [@eliotschu](https://github.com/eliotschu)_
+
+## 6.7.3
+
+### Patch Changes
+
+- Chore(deps): unpinning semver and updating it for app-builder-lib and electron-updater _[`#9349`](https://github.com/electron-userland/electron-builder/pull/9349) [`e043df5`](https://github.com/electron-userland/electron-builder/commit/e043df57604fb029fd8f9cf7d835b8366ee71aa6) [@panther7](https://github.com/panther7)_
+
+## 6.7.2
+
+### Patch Changes
+
+- Chore: bumping version packages of all packages to trigger Trusted Signing provedance release _[`#9362`](https://github.com/electron-userland/electron-builder/pull/9362) [`030269b`](https://github.com/electron-userland/electron-builder/commit/030269bca94b5e3621dbf8883976e1f85a1524f0) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`030269b`](https://github.com/electron-userland/electron-builder/commit/030269bca94b5e3621dbf8883976e1f85a1524f0)
+
+</small>
+
+- `builder-util-runtime@9.5.1`
+
+</details>
+
+## 6.7.1
+
+### Patch Changes
+
+- [#9334](https://github.com/electron-userland/electron-builder/pull/9334) [`21623e1b037e4509af04e767ca1c1458682b0eba`](https://github.com/electron-userland/electron-builder/commit/21623e1b037e4509af04e767ca1c1458682b0eba) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: remove "beta" labels from a few features
+
+## 6.7.0
+
+### Minor Changes
+
+- [#9209](https://github.com/electron-userland/electron-builder/pull/9209) [`6fd391d9e8390c00c8b0674d8ac3a5b7b6f0f19f`](https://github.com/electron-userland/electron-builder/commit/6fd391d9e8390c00c8b0674d8ac3a5b7b6f0f19f) Thanks [@daihere1993](https://github.com/daihere1993)! - feat: Support gitlab publisher
+
+### Patch Changes
+
+- [#9301](https://github.com/electron-userland/electron-builder/pull/9301) [`85cb4d031a060976b2519665b98294bb3c735aa0`](https://github.com/electron-userland/electron-builder/commit/85cb4d031a060976b2519665b98294bb3c735aa0) Thanks [@mmaietta](https://github.com/mmaietta)! - chore(deps): updating semver to 7.7.2
+
+- Updated dependencies [[`6fd391d9e8390c00c8b0674d8ac3a5b7b6f0f19f`](https://github.com/electron-userland/electron-builder/commit/6fd391d9e8390c00c8b0674d8ac3a5b7b6f0f19f)]:
+  - builder-util-runtime@9.5.0
+
+## 6.6.8
+
+### Patch Changes
+
+- [#9248](https://github.com/electron-userland/electron-builder/pull/9248) [`8cbf079e`](https://github.com/electron-userland/electron-builder/commit/8cbf079ec20bbc642f9b6c306e3e9141a1fcc385) Thanks [@DamonYu6](https://github.com/DamonYu6)! - fix: uncaught exception during differential downloading via multipleRangDownloader
+
+- [#9232](https://github.com/electron-userland/electron-builder/pull/9232) [`cfc4f36a`](https://github.com/electron-userland/electron-builder/commit/cfc4f36a5af20fb6c61dc7dfa6202cbc0fd9f201) Thanks [@michalzaq12](https://github.com/michalzaq12)! - fix: auto-update powershell script
+
+- [#9225](https://github.com/electron-userland/electron-builder/pull/9225) [`d27ac523`](https://github.com/electron-userland/electron-builder/commit/d27ac523bb1581f274c018952d55162315e7a9b8) Thanks [@yannishuber](https://github.com/yannishuber)! - fix(electron-updater): do not use quotes when installing update with sudo
+
+- Updated dependencies [[`44b28997`](https://github.com/electron-userland/electron-builder/commit/44b28997f15314730d1bb69303a47dc26f7950d1), [`7c7fd6ca`](https://github.com/electron-userland/electron-builder/commit/7c7fd6ca240eda72048835f754adac92c4ab4e8c)]:
+  - builder-util-runtime@9.4.0
+
+## 6.6.7
+
+### Patch Changes
+
+- [#9186](https://github.com/electron-userland/electron-builder/pull/9186) [`1a6ea016`](https://github.com/electron-userland/electron-builder/commit/1a6ea016b7793c75e7586e0e14d5f26d3535c292) Thanks [@daihere1993](https://github.com/daihere1993)! - feat(electron-updater): add GitLab provider support
+
+- [#9177](https://github.com/electron-userland/electron-builder/pull/9177) [`35f5f6e5`](https://github.com/electron-userland/electron-builder/commit/35f5f6e55762ffc377fcd5587a8cea8753184d50) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: remove `shell: true` from node_modules collector so as to prevent shell console logging from malforming the json output
+
+- Updated dependencies [[`1a6ea016`](https://github.com/electron-userland/electron-builder/commit/1a6ea016b7793c75e7586e0e14d5f26d3535c292), [`35f5f6e5`](https://github.com/electron-userland/electron-builder/commit/35f5f6e55762ffc377fcd5587a8cea8753184d50)]:
+  - builder-util-runtime@9.3.3
+
+## 6.6.6
+
+### Patch Changes
+
+- [#9172](https://github.com/electron-userland/electron-builder/pull/9172) [`cb651ddb`](https://github.com/electron-userland/electron-builder/commit/cb651ddb732dd0b8614b1af25054261b978900dd) Thanks [@beyondkmp](https://github.com/beyondkmp)! - feat(updater): Cache the new blockmap file and allow customization of the old blockmap file base URL
+
+## 6.6.5
+
+### Patch Changes
+
+- [#9113](https://github.com/electron-userland/electron-builder/pull/9113) [`8ba9be48`](https://github.com/electron-userland/electron-builder/commit/8ba9be481e3b777aa77884d265fd9b7f927a8a99) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: don't error out when trying to determine package manager
+
+## 6.6.4
+
+### Patch Changes
+
+- [#9059](https://github.com/electron-userland/electron-builder/pull/9059) [`cb775088`](https://github.com/electron-userland/electron-builder/commit/cb775088427d25e9ce0489067445716d35e09997) Thanks [@beyondkmp](https://github.com/beyondkmp)! - feat: support upgrading from ARM to ARM, rather than upgrading to x64 in window and linux
+
+- [#9064](https://github.com/electron-userland/electron-builder/pull/9064) [`444b791f`](https://github.com/electron-userland/electron-builder/commit/444b791f9d2812f2a0f60481f7b25297585d9c5a) Thanks [@beyondkmp](https://github.com/beyondkmp)! - fix: update regex for multipart content-type parsing in multipleRange
+
+- [#9024](https://github.com/electron-userland/electron-builder/pull/9024) [`e641751c`](https://github.com/electron-userland/electron-builder/commit/e641751ce36cdf099d62a897c591b2763705dbff) Thanks [@Lemonexe](https://github.com/Lemonexe)! - fix: allow forceDevUpdateConfig also on Linux
+
+## 6.6.3
+
+### Patch Changes
+
+- [#9021](https://github.com/electron-userland/electron-builder/pull/9021) [`cf43f056`](https://github.com/electron-userland/electron-builder/commit/cf43f0567c6addaf3cefd7eadada95bd543165e1) Thanks [@Lemonexe](https://github.com/Lemonexe)! - feat: allow overriding AppUpdater.isStagingMatch
+
+- [#8992](https://github.com/electron-userland/electron-builder/pull/8992) [`1f505400`](https://github.com/electron-userland/electron-builder/commit/1f5054004468f76d316cee33ef6cc8717987b146) Thanks [@Sytten](https://github.com/Sytten)! - Fixed missing lowercase in extension comparison.
+
+- Updated dependencies [[`a2f7f735`](https://github.com/electron-userland/electron-builder/commit/a2f7f7350be2379c4917417c92ece5a6ab241708)]:
+  - builder-util-runtime@9.3.2
+
+## 6.6.2
+
+### Patch Changes
+
+- [#8933](https://github.com/electron-userland/electron-builder/pull/8933) [`324032c5`](https://github.com/electron-userland/electron-builder/commit/324032c5ea94b983cda8a5510fcc1a3fb752a1a1) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: re-export `CancellationToken`, `PackageFileInfo`, `ProgressInfo`, `UpdateFileInfo`, `UpdateInfo` from electron-updater
+
+## 6.6.1
+
+### Patch Changes
+
+- [#8913](https://github.com/electron-userland/electron-builder/pull/8913) [`065c6a45`](https://github.com/electron-userland/electron-builder/commit/065c6a456e34e7f8c13cba483d433502b9325168) Thanks [@mmaietta](https://github.com/mmaietta)! - chore(refactor): refactoring code to reduce cyclical imports in order to migrate to rollup + vite (which have much more strict module resolutions)
+
+## 6.6.0
+
+### Minor Changes
+
+- [#8817](https://github.com/electron-userland/electron-builder/pull/8817) [`ea3e0f5f`](https://github.com/electron-userland/electron-builder/commit/ea3e0f5ff8ac9a5e01bcd11585d9f5e6a57b076e) Thanks [@Akatroj](https://github.com/Akatroj)! - fix: Dispatch error in updater if `spawnSyncLog` fails
+
+## 6.5.0
+
+### Minor Changes
+
+- [#8829](https://github.com/electron-userland/electron-builder/pull/8829) [`14ee2d6b`](https://github.com/electron-userland/electron-builder/commit/14ee2d6be32fd6e9165381e0709e5a2e8049ece2) Thanks [@Julusian](https://github.com/Julusian)! - feat: add `isUpdateAvailable` property to `checkForUpdates` result
+
+- [#8692](https://github.com/electron-userland/electron-builder/pull/8692) [`96c5d140`](https://github.com/electron-userland/electron-builder/commit/96c5d14027d56473ae5dd843c023709a01782963) Thanks [@mmaietta](https://github.com/mmaietta)! - feat: add support for custom `isUpdateSupported` hook for validating `UpdateInfo`, with fallback to previous `minimumSystemVersion` logic
+
+## 6.4.1
+
+### Patch Changes
+
+- Updated dependencies [[`8e7811d1`](https://github.com/electron-userland/electron-builder/commit/8e7811d18de3acb39ce9253cf2cd9afa4e23f99c), [`07429661`](https://github.com/electron-userland/electron-builder/commit/07429661c0da2248cec5b92eb03390ae19266328)]:
+  - builder-util-runtime@9.3.1
+
+## 6.4.0
+
+### Minor Changes
+
+- [#8711](https://github.com/electron-userland/electron-builder/pull/8711) [`6f0fb8e4`](https://github.com/electron-userland/electron-builder/commit/6f0fb8e44f035bcd6ff0d6f234b38c20fde066af) Thanks [@hrueger](https://github.com/hrueger)! - Add `host` property to support self-hosted Keygen instances
+
+- [#8633](https://github.com/electron-userland/electron-builder/pull/8633) [`96f5c3eb`](https://github.com/electron-userland/electron-builder/commit/96f5c3ebbd6b3b58c9c5d3e777577d49edcb6e5a) Thanks [@mmaietta](https://github.com/mmaietta)! - feat(updater): allow usage of `autoRunAppAfterInstall` on mac updater
+
+- [#8394](https://github.com/electron-userland/electron-builder/pull/8394) [`ae9221d9`](https://github.com/electron-userland/electron-builder/commit/ae9221d947c2dedff7b655ddafceb9746f9f4460) Thanks [@xyloflake](https://github.com/xyloflake)! - feat: Implement autoupdates for pacman
+
+### Patch Changes
+
+- [#8802](https://github.com/electron-userland/electron-builder/pull/8802) [`4a68fd2d`](https://github.com/electron-userland/electron-builder/commit/4a68fd2d3d529b0f854877a5415f9ccad00b61fd) Thanks [@erijo](https://github.com/erijo)! - fix(linux): AppImage update fails when filename contains spaces
+
+- [#8623](https://github.com/electron-userland/electron-builder/pull/8623) [`cfa67c01`](https://github.com/electron-userland/electron-builder/commit/cfa67c01827a44c88fb8448562dbe928ba37494f) Thanks [@DamonYu6](https://github.com/DamonYu6)! - fix: copyFileSync operation will block the main thread
+
+- [#8695](https://github.com/electron-userland/electron-builder/pull/8695) [`819eff7b`](https://github.com/electron-userland/electron-builder/commit/819eff7bf7f319275d70faf3a64a5a18a3793a7c) Thanks [@peter-sanderson](https://github.com/peter-sanderson)! - fix: respect `disableDifferentialDownload` flag for AppImage
+
+- Updated dependencies [[`eacbbf59`](https://github.com/electron-userland/electron-builder/commit/eacbbf593f6ea01a92ffb41d8d28ee5e4e480ea1), [`6f0fb8e4`](https://github.com/electron-userland/electron-builder/commit/6f0fb8e44f035bcd6ff0d6f234b38c20fde066af)]:
+  - builder-util-runtime@9.3.0
+
+## 6.4.0-alpha.4
+
+### Patch Changes
+
+- [#8802](https://github.com/electron-userland/electron-builder/pull/8802) [`4a68fd2d`](https://github.com/electron-userland/electron-builder/commit/4a68fd2d3d529b0f854877a5415f9ccad00b61fd) Thanks [@erijo](https://github.com/erijo)! - fix(linux): AppImage update fails when filename contains spaces
+
+## 6.4.0-alpha.3
+
+### Patch Changes
+
+- [#8695](https://github.com/electron-userland/electron-builder/pull/8695) [`819eff7b`](https://github.com/electron-userland/electron-builder/commit/819eff7bf7f319275d70faf3a64a5a18a3793a7c) Thanks [@peter-sanderson](https://github.com/peter-sanderson)! - fix: respect `disableDifferentialDownload` flag for AppImage
+
+## 6.4.0-alpha.2
+
+### Minor Changes
+
+- [#8711](https://github.com/electron-userland/electron-builder/pull/8711) [`6f0fb8e4`](https://github.com/electron-userland/electron-builder/commit/6f0fb8e44f035bcd6ff0d6f234b38c20fde066af) Thanks [@hrueger](https://github.com/hrueger)! - Add `host` property to support self-hosted Keygen instances
+
+### Patch Changes
+
+- Updated dependencies [[`eacbbf59`](https://github.com/electron-userland/electron-builder/commit/eacbbf593f6ea01a92ffb41d8d28ee5e4e480ea1), [`6f0fb8e4`](https://github.com/electron-userland/electron-builder/commit/6f0fb8e44f035bcd6ff0d6f234b38c20fde066af)]:
+  - builder-util-runtime@9.3.0-alpha.0
+
+## 6.4.0-alpha.1
+
+### Minor Changes
+
+- [#8633](https://github.com/electron-userland/electron-builder/pull/8633) [`96f5c3eb`](https://github.com/electron-userland/electron-builder/commit/96f5c3ebbd6b3b58c9c5d3e777577d49edcb6e5a) Thanks [@mmaietta](https://github.com/mmaietta)! - feat(updater): allow usage of `autoRunAppAfterInstall` on mac updater
+
+### Patch Changes
+
+- [#8623](https://github.com/electron-userland/electron-builder/pull/8623) [`cfa67c01`](https://github.com/electron-userland/electron-builder/commit/cfa67c01827a44c88fb8448562dbe928ba37494f) Thanks [@q837477816](https://github.com/q837477816)! - fix: copyFileSync operation will block the main thread
+
+## 6.4.0-alpha.0
+
+### Minor Changes
+
+- [#8394](https://github.com/electron-userland/electron-builder/pull/8394) [`ae9221d9`](https://github.com/electron-userland/electron-builder/commit/ae9221d947c2dedff7b655ddafceb9746f9f4460) Thanks [@xyloflake](https://github.com/xyloflake)! - feat: Implement autoupdates for pacman
+
+## 6.3.9
+
+### Patch Changes
+
+- [#8541](https://github.com/electron-userland/electron-builder/pull/8541) [`b6d6ea993fd3b368d28786c259bb50486aaac417`](https://github.com/electron-userland/electron-builder/commit/b6d6ea993fd3b368d28786c259bb50486aaac417) Thanks [@beyondkmp](https://github.com/beyondkmp)! - fix: Unable to copy file for caching: ENOENT
+
+- [#8545](https://github.com/electron-userland/electron-builder/pull/8545) [`fc3a78e4e61f916058fca9b15fc16f076c3fabd1`](https://github.com/electron-userland/electron-builder/commit/fc3a78e4e61f916058fca9b15fc16f076c3fabd1) Thanks [@mmaietta](https://github.com/mmaietta)! - chore(deps): update devDependencies, including typescript
+
+- Updated dependencies [[`fc3a78e4e61f916058fca9b15fc16f076c3fabd1`](https://github.com/electron-userland/electron-builder/commit/fc3a78e4e61f916058fca9b15fc16f076c3fabd1)]:
+  - builder-util-runtime@9.2.10
+
+## 6.3.8
+
+### Patch Changes
+
+- [#8516](https://github.com/electron-userland/electron-builder/pull/8516) [`d1cb6bdb`](https://github.com/electron-userland/electron-builder/commit/d1cb6bdbf8111156bb16839f501bdd9e6d477338) Thanks [@mmaietta](https://github.com/mmaietta)! - fix(chore): upgrading typescript and fixing compiler errors
+
+- Updated dependencies [[`d1cb6bdb`](https://github.com/electron-userland/electron-builder/commit/d1cb6bdbf8111156bb16839f501bdd9e6d477338)]:
+  - builder-util-runtime@9.2.9
+
+## 6.3.7
+
+### Patch Changes
+
+- [#8491](https://github.com/electron-userland/electron-builder/pull/8491) [`178a3c40`](https://github.com/electron-userland/electron-builder/commit/178a3c40f35fa9e91a2e4942f61423effa1289e4) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: migrating to typedoc and updating/improving type+interface definitions
+
+- Updated dependencies [[`178a3c40`](https://github.com/electron-userland/electron-builder/commit/178a3c40f35fa9e91a2e4942f61423effa1289e4)]:
+  - builder-util-runtime@9.2.8
+
+## 6.3.6
+
+### Patch Changes
+
+- [#8486](https://github.com/electron-userland/electron-builder/pull/8486) [`d56cd274`](https://github.com/electron-userland/electron-builder/commit/d56cd274b9d0fedb71889293164a15e51f7cc744) Thanks [@mmaietta](https://github.com/mmaietta)! - fix(deploy): redeploy all packages to sync semver ranges
+
+- Updated dependencies [[`d56cd274`](https://github.com/electron-userland/electron-builder/commit/d56cd274b9d0fedb71889293164a15e51f7cc744)]:
+  - builder-util-runtime@9.2.7
+
+## 6.3.5
+
+### Patch Changes
+
+- [#8437](https://github.com/electron-userland/electron-builder/pull/8437) [`be625e06`](https://github.com/electron-userland/electron-builder/commit/be625e06273e56de09ed3298209858043fcd1151) Thanks [@juwonjung-hdj](https://github.com/juwonjung-hdj)! - fix: retry renaming update file when EBUSY error occurs due to file lock
+
+- Updated dependencies [[`be625e06`](https://github.com/electron-userland/electron-builder/commit/be625e06273e56de09ed3298209858043fcd1151)]:
+  - builder-util-runtime@9.2.6
+
+## 6.3.4
+
+### Patch Changes
+
+- [#8417](https://github.com/electron-userland/electron-builder/pull/8417) [`e77de9f6`](https://github.com/electron-userland/electron-builder/commit/e77de9f66184b0cfdab6f1aa9a9c95b041d99c84) Thanks [@beyondkmp](https://github.com/beyondkmp)! - update semver to latest
+
+- [#8409](https://github.com/electron-userland/electron-builder/pull/8409) [`5fae1cf3`](https://github.com/electron-userland/electron-builder/commit/5fae1cf3be0388c2bd95a341a0340faa839d2aa7) Thanks [@ckarich](https://github.com/ckarich)! - fix: windows signature verification special chars
+
+- [#8282](https://github.com/electron-userland/electron-builder/pull/8282) [`15ce5b41`](https://github.com/electron-userland/electron-builder/commit/15ce5b4164378f7398ff84cabe8ee97eef5cfd1b) Thanks [@beyondkmp](https://github.com/beyondkmp)! - fix aborted event
+
+## 6.3.3
+
+### Patch Changes
+
+- [#8400](https://github.com/electron-userland/electron-builder/pull/8400) [`9dc0b49a`](https://github.com/electron-userland/electron-builder/commit/9dc0b49aea1d3bb56b42c3b1bdb6001708a34439) Thanks [@Ryan432](https://github.com/Ryan432)! - fix: Handle Linux deb auto update installation on applications having spaces in `artifactName`.
+
+- [#8393](https://github.com/electron-userland/electron-builder/pull/8393) [`8dabf64b`](https://github.com/electron-userland/electron-builder/commit/8dabf64b8f84975cf4eb016dcd23411ab0d4bf64) Thanks [@beyondkmp](https://github.com/beyondkmp)! - fix: allow custom channel in github provider
+
+- [#8403](https://github.com/electron-userland/electron-builder/pull/8403) [`1c14820b`](https://github.com/electron-userland/electron-builder/commit/1c14820b97fad802b300dd93ccd4d6a10a72360f) Thanks [@xyloflake](https://github.com/xyloflake)! - fix: handle spaces for all linux package managers
+
+## 6.3.2
+
+### Patch Changes
+
+- [#8378](https://github.com/electron-userland/electron-builder/pull/8378) [`c8fe1462`](https://github.com/electron-userland/electron-builder/commit/c8fe1462d529edeed0ad3fe0b7e99e8af1ca61ac) Thanks [@s77rt](https://github.com/s77rt)! - Limit concurrent downloads to 1
+
+## 6.3.1
+
+### Patch Changes
+
+- [#8372](https://github.com/electron-userland/electron-builder/pull/8372) [`c85b73d7`](https://github.com/electron-userland/electron-builder/commit/c85b73d7c8dcefe86b0b350946af1cea951e6aae) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: allow enabling tsc lib checking on electron-updater package
+
+## 6.3.0
+
+### Minor Changes
+
+- [#8095](https://github.com/electron-userland/electron-builder/pull/8095) [`53cec79b`](https://github.com/electron-userland/electron-builder/commit/53cec79bdc3f56c9371bdfb7901e97650d9ac4bc) Thanks [@beyondkmp](https://github.com/beyondkmp)! - feat: adding differential downloader for updates on macOS
+
+### Patch Changes
+
+- [#8108](https://github.com/electron-userland/electron-builder/pull/8108) [`3d4cc7ae`](https://github.com/electron-userland/electron-builder/commit/3d4cc7ae01c4f6154d6ea59726578b1ff99b9daf) Thanks [@beyondkmp](https://github.com/beyondkmp)! - feat: add `minimumSystemVersion` in electron updater
+
+- [#8304](https://github.com/electron-userland/electron-builder/pull/8304) [`1ac86c9e`](https://github.com/electron-userland/electron-builder/commit/1ac86c9ea277a89611d415eb7f2ef70441b0eb28) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: update pnpm to 9.4.0
+
+- [#8323](https://github.com/electron-userland/electron-builder/pull/8323) [`fa3275c0`](https://github.com/electron-userland/electron-builder/commit/fa3275c05b334f59453d04551fffa24bfa558e48) Thanks [@mmaietta](https://github.com/mmaietta)! - chore(deps): update dependency typescript to v5.5.3
+
+- [#8135](https://github.com/electron-userland/electron-builder/pull/8135) [`c2392de7`](https://github.com/electron-userland/electron-builder/commit/c2392de71a8f7abc092a00452eac63dd24b34e88) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: unstable hdiutil retry mechanism
+
+- [#8295](https://github.com/electron-userland/electron-builder/pull/8295) [`ac2e6a25`](https://github.com/electron-userland/electron-builder/commit/ac2e6a25aa491c1ef5167a552c19fc2085cd427f) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: verify LiteralPath of update file during windows signature verification
+
+- [#8311](https://github.com/electron-userland/electron-builder/pull/8311) [`35a0784e`](https://github.com/electron-userland/electron-builder/commit/35a0784eb4cffc2fcbf33ec58fefbacf8e8e5125) Thanks [@rastiqdev](https://github.com/rastiqdev)! - fix(rpm-updater): stop uninstalling app before update
+
+- [#8227](https://github.com/electron-userland/electron-builder/pull/8227) [`48c59535`](https://github.com/electron-userland/electron-builder/commit/48c59535f84cd16fb2e44d71f6b75c25c739b993) Thanks [@rotu](https://github.com/rotu)! - fix(docs): update autoupdate docs noting that channels work with Github
+
+- [#8110](https://github.com/electron-userland/electron-builder/pull/8110) [`fa7982f1`](https://github.com/electron-userland/electron-builder/commit/fa7982f19feddcb9479ff83af8db1974aea1f8d6) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: entering alpha release stage
+
+- Updated dependencies [[`3d4cc7ae`](https://github.com/electron-userland/electron-builder/commit/3d4cc7ae01c4f6154d6ea59726578b1ff99b9daf), [`1ac86c9e`](https://github.com/electron-userland/electron-builder/commit/1ac86c9ea277a89611d415eb7f2ef70441b0eb28), [`ad668ae1`](https://github.com/electron-userland/electron-builder/commit/ad668ae14ef60fb91dd74aa71562f2fd68fbaa48), [`445911a7`](https://github.com/electron-userland/electron-builder/commit/445911a75f9efd6fe61e586ebed6a210d0efcd41), [`140e2f0e`](https://github.com/electron-userland/electron-builder/commit/140e2f0eb0df79c2a46e35024e96d0563355fc89), [`fa7982f1`](https://github.com/electron-userland/electron-builder/commit/fa7982f19feddcb9479ff83af8db1974aea1f8d6)]:
+  - builder-util-runtime@9.2.5
+
+## 6.3.0-alpha.8
+
+### Patch Changes
+
+- [#8323](https://github.com/electron-userland/electron-builder/pull/8323) [`fa3275c0`](https://github.com/electron-userland/electron-builder/commit/fa3275c05b334f59453d04551fffa24bfa558e48) Thanks [@mmaietta](https://github.com/mmaietta)! - chore(deps): update dependency typescript to v5.5.3
+
+- [#8311](https://github.com/electron-userland/electron-builder/pull/8311) [`35a0784e`](https://github.com/electron-userland/electron-builder/commit/35a0784eb4cffc2fcbf33ec58fefbacf8e8e5125) Thanks [@rastiqdev](https://github.com/rastiqdev)! - fix(rpm-updater): stop uninstalling app before update
+
+## 6.3.0-alpha.7
+
+### Patch Changes
+
+- [#8304](https://github.com/electron-userland/electron-builder/pull/8304) [`1ac86c9e`](https://github.com/electron-userland/electron-builder/commit/1ac86c9ea277a89611d415eb7f2ef70441b0eb28) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: update pnpm to 9.4.0
+
+- Updated dependencies [[`1ac86c9e`](https://github.com/electron-userland/electron-builder/commit/1ac86c9ea277a89611d415eb7f2ef70441b0eb28), [`ad668ae1`](https://github.com/electron-userland/electron-builder/commit/ad668ae14ef60fb91dd74aa71562f2fd68fbaa48)]:
+  - builder-util-runtime@9.2.5-alpha.4
+
+## 6.3.0-alpha.6
+
+### Patch Changes
+
+- [#8295](https://github.com/electron-userland/electron-builder/pull/8295) [`ac2e6a25`](https://github.com/electron-userland/electron-builder/commit/ac2e6a25aa491c1ef5167a552c19fc2085cd427f) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: verify LiteralPath of update file during windows signature verification
+
+## 6.3.0-alpha.5
+
+### Patch Changes
+
+- Updated dependencies [[`140e2f0e`](https://github.com/electron-userland/electron-builder/commit/140e2f0eb0df79c2a46e35024e96d0563355fc89)]:
+  - builder-util-runtime@9.2.5-alpha.3
+
+## 6.3.0-alpha.4
+
+### Patch Changes
+
+- [#8227](https://github.com/electron-userland/electron-builder/pull/8227) [`48c59535`](https://github.com/electron-userland/electron-builder/commit/48c59535f84cd16fb2e44d71f6b75c25c739b993) Thanks [@rotu](https://github.com/rotu)! - fix(docs): update autoupdate docs noting that channels work with Github
+
+## 6.3.0-alpha.3
+
+### Patch Changes
+
+- [#8135](https://github.com/electron-userland/electron-builder/pull/8135) [`c2392de7`](https://github.com/electron-userland/electron-builder/commit/c2392de71a8f7abc092a00452eac63dd24b34e88) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: unstable hdiutil retry mechanism
+
+## 6.3.0-alpha.2
+
+### Patch Changes
+
+- Updated dependencies [[`445911a7`](https://github.com/electron-userland/electron-builder/commit/445911a75f9efd6fe61e586ebed6a210d0efcd41)]:
+  - builder-util-runtime@9.2.5-alpha.2
+
+## 6.3.0-alpha.1
+
+### Patch Changes
+
+- [#8108](https://github.com/electron-userland/electron-builder/pull/8108) [`3d4cc7ae`](https://github.com/electron-userland/electron-builder/commit/3d4cc7ae01c4f6154d6ea59726578b1ff99b9daf) Thanks [@beyondkmp](https://github.com/beyondkmp)! - feat: add `minimumSystemVersion` in electron updater
+
+- Updated dependencies [[`3d4cc7ae`](https://github.com/electron-userland/electron-builder/commit/3d4cc7ae01c4f6154d6ea59726578b1ff99b9daf)]:
+  - builder-util-runtime@9.2.5-alpha.1
+
+## 6.3.0-alpha.0
+
+### Minor Changes
+
+- [#8095](https://github.com/electron-userland/electron-builder/pull/8095) [`53cec79b`](https://github.com/electron-userland/electron-builder/commit/53cec79bdc3f56c9371bdfb7901e97650d9ac4bc) Thanks [@beyondkmp](https://github.com/beyondkmp)! - feat: adding differential downloader for updates on macOS
+
+### Patch Changes
+
+- [#8110](https://github.com/electron-userland/electron-builder/pull/8110) [`fa7982f1`](https://github.com/electron-userland/electron-builder/commit/fa7982f19feddcb9479ff83af8db1974aea1f8d6) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: entering alpha release stage
+
+- Updated dependencies [[`fa7982f1`](https://github.com/electron-userland/electron-builder/commit/fa7982f19feddcb9479ff83af8db1974aea1f8d6)]:
+  - builder-util-runtime@9.2.5-alpha.0
+
+## 6.2.1
+
+### Patch Changes
+
+- [#8091](https://github.com/electron-userland/electron-builder/pull/8091) [`e2a181d9`](https://github.com/electron-userland/electron-builder/commit/e2a181d9fe3fbdd84690359e275daaef24584729) Thanks [@mmaietta](https://github.com/mmaietta)! - fix(mac): revert autoupdate for mac differential
+
+## 6.2.0
+
+### Minor Changes
+
+- [#7709](https://github.com/electron-userland/electron-builder/pull/7709) [`79df5423`](https://github.com/electron-userland/electron-builder/commit/79df54238621fbe48ba20444129950ba2dc49983) Thanks [@beyondkmp](https://github.com/beyondkmp)! - feat: adding differential downloader for updates on macOS
+
+## 6.1.9
+
+### Patch Changes
+
+- [#8051](https://github.com/electron-userland/electron-builder/pull/8051) [`48603ba0`](https://github.com/electron-userland/electron-builder/commit/48603ba09dc7103849a2975799c19068fd08fc07) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: auto-update powershell script requires reset of `PSModulePath`
+
+- [#8057](https://github.com/electron-userland/electron-builder/pull/8057) [`ccbb80de`](https://github.com/electron-userland/electron-builder/commit/ccbb80dea4b6146ea2d2186193a1f307096e4d1e) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: upgrading connected dependencies (typescript requires higher eslint version)
+
+- Updated dependencies [[`ccbb80de`](https://github.com/electron-userland/electron-builder/commit/ccbb80dea4b6146ea2d2186193a1f307096e4d1e)]:
+  - builder-util-runtime@9.2.4
+
+## 6.1.8
+
+### Patch Changes
+
+- [#7950](https://github.com/electron-userland/electron-builder/pull/7950) [`03c94516`](https://github.com/electron-userland/electron-builder/commit/03c94516ef3b1b31b2f5b7bcdb9c6d3753d36b8d) Thanks [@bronsonmock](https://github.com/bronsonmock)! - feat(nsis): add option to disable differential download
+
+## 6.1.7
+
+### Patch Changes
+
+- Updated dependencies [[`db424e8e`](https://github.com/electron-userland/electron-builder/commit/db424e8e876e6ac1985668bf78bd52a02824dd7f), [`db424e8e`](https://github.com/electron-userland/electron-builder/commit/db424e8e876e6ac1985668bf78bd52a02824dd7f)]:
+  - builder-util-runtime@9.2.3
+
+## 6.1.6
+
+### Patch Changes
+
+- Updated dependencies [[`549d07b0`](https://github.com/electron-userland/electron-builder/commit/549d07b0a04b8686cf4998dc102edad390ddd09a)]:
+  - builder-util-runtime@9.2.2
+
+## 6.1.5
+
+### Patch Changes
+
+- [#7767](https://github.com/electron-userland/electron-builder/pull/7767) [`21f3069c`](https://github.com/electron-userland/electron-builder/commit/21f3069cb6dcad30959af4bfd8f3014133a3dfde) Thanks [@jackple](https://github.com/jackple)! - fix: When error code is ENOENT, try to use electron.shell.openPath to run installer on Windows
+
+## 6.1.4
+
+### Patch Changes
+
+- [#7666](https://github.com/electron-userland/electron-builder/pull/7666) [`441da40d`](https://github.com/electron-userland/electron-builder/commit/441da40d814d90154ed9b120684e7c1a7d919c52) Thanks [@sethjray](https://github.com/sethjray)! - fix: check null for `isCustomChannel` in GitHubProvider.ts
+
+## 6.1.3
+
+### Patch Changes
+
+- [#7637](https://github.com/electron-userland/electron-builder/pull/7637) [`b3dfe64b`](https://github.com/electron-userland/electron-builder/commit/b3dfe64b22dc51375861f6b8a3517ff9ab562aaf) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: trigger `app.relaunch()` if `isForceRunAfter = true` for (beta) deb and rpm updaters
+
+- [#7633](https://github.com/electron-userland/electron-builder/pull/7633) [`531a6309`](https://github.com/electron-userland/electron-builder/commit/531a6309283ea1b2b262817a170e2c030735f8b6) Thanks [@s00d](https://github.com/s00d)! - fix: change typed-emitter to tiny-typed-emitter to remove rxjs dependency
+
+## 6.1.2
+
+### Patch Changes
+
+- [#7628](https://github.com/electron-userland/electron-builder/pull/7628) [`98f535e1`](https://github.com/electron-userland/electron-builder/commit/98f535e1f80b7f84dc3c2f135a4a5ea8cd142f31) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: removing stdio from spawnSync to fix crash on rpm/deb updaters
+
+## 6.1.1
+
+### Patch Changes
+
+- [#7597](https://github.com/electron-userland/electron-builder/pull/7597) [`cd15e161`](https://github.com/electron-userland/electron-builder/commit/cd15e161031e180200ab772f01198a5b68fa42fe) Thanks [@marcuskirsch](https://github.com/marcuskirsch)! - fix: default file name of `update.${fileExtension}` for downloaded files in private repositories.
+
+## 6.1.0
+
+### Minor Changes
+
+- [#7533](https://github.com/electron-userland/electron-builder/pull/7533) [`4786d415`](https://github.com/electron-userland/electron-builder/commit/4786d41575c638137c7016c905d089ab74bf5e28) Thanks [@vitto-moz](https://github.com/vitto-moz)! - feat: nsis install method - exposed as public to avoid quit the app for the install
+
+### Patch Changes
+
+- [#7544](https://github.com/electron-userland/electron-builder/pull/7544) [`dab3aeba`](https://github.com/electron-userland/electron-builder/commit/dab3aeba2240ead4300c8fdb35e3d9c16b04a23d) Thanks [@NoahAndrews](https://github.com/NoahAndrews)! - Fix differential downloads when the server compresses the blockmap file HTTP response
+
+- Updated dependencies [[`dab3aeba`](https://github.com/electron-userland/electron-builder/commit/dab3aeba2240ead4300c8fdb35e3d9c16b04a23d)]:
+  - builder-util-runtime@9.2.1
+
+## 6.0.4
+
+### Patch Changes
+
+- [#7542](https://github.com/electron-userland/electron-builder/pull/7542) [`9123e31e`](https://github.com/electron-userland/electron-builder/commit/9123e31eb792211da717804e5a5b8029fe694d5f) Thanks [@ganthern](https://github.com/ganthern)! - fix: handle errors on responses in differential download (#2398)
+
+## 6.0.3
+
+### Patch Changes
+
+- [#7524](https://github.com/electron-userland/electron-builder/pull/7524) [`1a134800`](https://github.com/electron-userland/electron-builder/commit/1a13480036a2219007f866c64beea45292bc2946) Thanks [@NoahAndrews](https://github.com/NoahAndrews)! - Fixed error handling when launching updater (fixes NSIS updates when isAdminRightsRequired is incorrectly set to false)
+
+## 6.0.2
+
+### Patch Changes
+
+- [#7508](https://github.com/electron-userland/electron-builder/pull/7508) [`d4c90b67`](https://github.com/electron-userland/electron-builder/commit/d4c90b676aa22c745de4129f98453b97f264805c) Thanks [@NoahAndrews](https://github.com/NoahAndrews)! - Removed DefinitelyTyped dependencies from production dependencies list
+
+## 6.0.1
+
+### Patch Changes
+
+- [#7503](https://github.com/electron-userland/electron-builder/pull/7503) [`a2ab1ff3`](https://github.com/electron-userland/electron-builder/commit/a2ab1ff36dbe99a9c9d22bde15e83482eb5be340) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: NsisUpdater - only resolving true if pid !== undefined
+
+## 6.0.0
+
+### Major Changes
+
+- [#7032](https://github.com/electron-userland/electron-builder/pull/7032) [`caa32e07`](https://github.com/electron-userland/electron-builder/commit/caa32e0708ba4347dd37e93174fce1d2c5660160) Thanks [@kidonng](https://github.com/kidonng)! - fix: use appropriate `electron-updater` cache directory on macOS
+
+### Minor Changes
+
+- [#7060](https://github.com/electron-userland/electron-builder/pull/7060) [`1d130012`](https://github.com/electron-userland/electron-builder/commit/1d130012737e77b57c8923fcc0e6ad2cbc5da0e8) Thanks [@mmaietta](https://github.com/mmaietta)! - feat: Introducing deb and rpm auto-updates as beta feature
+
+- [#7337](https://github.com/electron-userland/electron-builder/pull/7337) [`9c0c4228`](https://github.com/electron-userland/electron-builder/commit/9c0c422834369f42b311b5d9ecd301f8b50bccfa) Thanks [@beyondkmp](https://github.com/beyondkmp)! - feat: Provide a custom verify function interface to enable nsis signature verification alternatives instead of powershell
+
+### Patch Changes
+
+- [#7380](https://github.com/electron-userland/electron-builder/pull/7380) [`7862e388`](https://github.com/electron-userland/electron-builder/commit/7862e388a2049ccbe1e01a5624c6a8a5f2942d54) Thanks [@beyondkmp](https://github.com/beyondkmp)! - fix: add reject in handleError in Windows `verifySignature` function
+
+- [#7230](https://github.com/electron-userland/electron-builder/pull/7230) [`346af1d4`](https://github.com/electron-userland/electron-builder/commit/346af1d470ebbf12733a9619a2389bcfdf452bc6) Thanks [@jeremyspiegel](https://github.com/jeremyspiegel)! - fix: support powershell constrained language mode
+
+- [#7394](https://github.com/electron-userland/electron-builder/pull/7394) [`1bbcfb3d`](https://github.com/electron-userland/electron-builder/commit/1bbcfb3dc5f36b0803c69e9170db16ded52a0043) Thanks [@ganthern](https://github.com/ganthern)! - fix: inherit stdio for updated processes (#7393)
+
+- [#7306](https://github.com/electron-userland/electron-builder/pull/7306) [`01c67910`](https://github.com/electron-userland/electron-builder/commit/01c679107435c6afd0b2de8c44d3f140d20c5577) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: Update dependencies per audit/outdated
+
+- [#7213](https://github.com/electron-userland/electron-builder/pull/7213) [`17863671`](https://github.com/electron-userland/electron-builder/commit/1786367194272dff90e63d0a43f3ad5c3cc151f0) Thanks [@mmaietta](https://github.com/mmaietta)! - chore(deps): Updating dependencies and fixing `pnpm audit` with dependency overrides
+
+- Updated dependencies [[`cc1ddabd`](https://github.com/electron-userland/electron-builder/commit/cc1ddabd45f239ee06fde9b2d1534467908791fa), [`93930cf0`](https://github.com/electron-userland/electron-builder/commit/93930cf0b04b60896835e1d9feeab20722cd1b98), [`01c67910`](https://github.com/electron-userland/electron-builder/commit/01c679107435c6afd0b2de8c44d3f140d20c5577), [`53327d51`](https://github.com/electron-userland/electron-builder/commit/53327d51101b83641ece9f497577c3ac93d3e91d)]:
+  - builder-util-runtime@9.2.0
+
+## 6.0.0-alpha.9
+
+### Patch Changes
+
+- [#7394](https://github.com/electron-userland/electron-builder/pull/7394) [`1bbcfb3d`](https://github.com/electron-userland/electron-builder/commit/1bbcfb3dc5f36b0803c69e9170db16ded52a0043) Thanks [@ganthern](https://github.com/ganthern)! - fix: inherit stdio for updated processes (#7393)
+
+## 6.0.0-alpha.8
+
+### Patch Changes
+
+- [#7380](https://github.com/electron-userland/electron-builder/pull/7380) [`7862e388`](https://github.com/electron-userland/electron-builder/commit/7862e388a2049ccbe1e01a5624c6a8a5f2942d54) Thanks [@beyondkmp](https://github.com/beyondkmp)! - fix: add reject in handleError in Windows `verifySignature` function
+
+- Updated dependencies [[`93930cf0`](https://github.com/electron-userland/electron-builder/commit/93930cf0b04b60896835e1d9feeab20722cd1b98)]:
+  - builder-util-runtime@9.2.0-alpha.3
+
+## 6.0.0-alpha.7
+
+### Minor Changes
+
+- [#7337](https://github.com/electron-userland/electron-builder/pull/7337) [`9c0c4228`](https://github.com/electron-userland/electron-builder/commit/9c0c422834369f42b311b5d9ecd301f8b50bccfa) Thanks [@beyondkmp](https://github.com/beyondkmp)! - feat: Provide a custom verify function interface to enable nsis signature verification alternatives instead of powershell
+
+## 6.0.0-alpha.6
+
+### Patch Changes
+
+- Updated dependencies [[`cc1ddabd`](https://github.com/electron-userland/electron-builder/commit/cc1ddabd45f239ee06fde9b2d1534467908791fa)]:
+  - builder-util-runtime@9.2.0-alpha.2
+
+## 6.0.0-alpha.5
+
+### Patch Changes
+
+- [#7306](https://github.com/electron-userland/electron-builder/pull/7306) [`01c67910`](https://github.com/electron-userland/electron-builder/commit/01c679107435c6afd0b2de8c44d3f140d20c5577) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: Update dependencies per audit/outdated
+
+- Updated dependencies [[`01c67910`](https://github.com/electron-userland/electron-builder/commit/01c679107435c6afd0b2de8c44d3f140d20c5577)]:
+  - builder-util-runtime@9.1.2-alpha.1
+
+## 6.0.0-alpha.4
+
+### Minor Changes
+
+- [#7060](https://github.com/electron-userland/electron-builder/pull/7060) [`1d130012`](https://github.com/electron-userland/electron-builder/commit/1d130012737e77b57c8923fcc0e6ad2cbc5da0e8) Thanks [@mmaietta](https://github.com/mmaietta)! - feat: Introducing deb and rpm auto-updates as beta feature
+
+## 6.0.0-alpha.3
+
+### Patch Changes
+
+- [#7230](https://github.com/electron-userland/electron-builder/pull/7230) [`346af1d4`](https://github.com/electron-userland/electron-builder/commit/346af1d470ebbf12733a9619a2389bcfdf452bc6) Thanks [@jeremyspiegel](https://github.com/jeremyspiegel)! - fix: support powershell constrained language mode
+
+## 6.0.0-alpha.2
+
+### Patch Changes
+
+- [#7213](https://github.com/electron-userland/electron-builder/pull/7213) [`17863671`](https://github.com/electron-userland/electron-builder/commit/1786367194272dff90e63d0a43f3ad5c3cc151f0) Thanks [@mmaietta](https://github.com/mmaietta)! - chore(deps): Updating dependencies and fixing `pnpm audit` with dependency overrides
+
+## 6.0.0-alpha.1
+
+### Patch Changes
+
+- Updated dependencies [[`53327d51`](https://github.com/electron-userland/electron-builder/commit/53327d51101b83641ece9f497577c3ac93d3e91d)]:
+  - builder-util-runtime@9.1.2-alpha.0
+
+## 6.0.0-alpha.0
+
+### Major Changes
+
+- [#7032](https://github.com/electron-userland/electron-builder/pull/7032) [`caa32e07`](https://github.com/electron-userland/electron-builder/commit/caa32e0708ba4347dd37e93174fce1d2c5660160) Thanks [@kidonng](https://github.com/kidonng)! - fix: use appropriate `electron-updater` cache directory on macOS
+
+## 5.3.0
+
+### Minor Changes
+
+- [#7136](https://github.com/electron-userland/electron-builder/pull/7136) [`4d989a8a`](https://github.com/electron-userland/electron-builder/commit/4d989a8a52bf7baac22742769abcc795ce193fbd) Thanks [@shenglianlee](https://github.com/shenglianlee)! - feat: non-silent mode allow not to run the app when the installation is complete
+
+## 5.2.4
+
+### Patch Changes
+
+- [#7117](https://github.com/electron-userland/electron-builder/pull/7117) [`0c528411`](https://github.com/electron-userland/electron-builder/commit/0c528411fb8a7de23e974f44e36c5e69bd3bb167) Thanks [@mmaietta](https://github.com/mmaietta)! - feat: allow dev update config to be forced for testing auto-updater flow
+
+## 5.2.3
+
+### Patch Changes
+
+- [#7099](https://github.com/electron-userland/electron-builder/pull/7099) [`cd21b091`](https://github.com/electron-userland/electron-builder/commit/cd21b0918843fe1269ddaf8dde099c8faeb54b80) Thanks [@alefoll](https://github.com/alefoll)! - fix(docs): improve `downloadUpdate` typing to match the doc
+
+- Updated dependencies [[`1023a93e`](https://github.com/electron-userland/electron-builder/commit/1023a93e92eaa26bf33b52edda5b22e56ed1ec18)]:
+  - builder-util-runtime@9.1.1
+
+## 5.2.2
+
+### Patch Changes
+
+- Updated dependencies [[`e7179b57`](https://github.com/electron-userland/electron-builder/commit/e7179b57bdba192acfdb439c03099e6629e98f6a)]:
+  - builder-util-runtime@9.1.0
+
+## 5.2.1
+
+### Patch Changes
+
+- [#6998](https://github.com/electron-userland/electron-builder/pull/6998) [`d6115bc5`](https://github.com/electron-userland/electron-builder/commit/d6115bc5d066d6eee2638015be0c804b31ffcc18) Thanks [@matejkriz](https://github.com/matejkriz)! - fix(electron-updater): fix backward compatibility for GitHub provider without channels
+
+* [#6995](https://github.com/electron-userland/electron-builder/pull/6995) [`c9f0da51`](https://github.com/electron-userland/electron-builder/commit/c9f0da51cab25a60d4adea94f8c8e7e05362b0ca) Thanks [@panther7](https://github.com/panther7)! - Fix installDir definition #6907
+
+## 5.2.0
+
+### Minor Changes
+
+- [#6907](https://github.com/electron-userland/electron-builder/pull/6907) [`e7f28677`](https://github.com/electron-userland/electron-builder/commit/e7f286776643823f9c906738aade1d71eb1bdd9c) Thanks [@panther7](https://github.com/panther7)! - Add installDir property for NsisUpdater. Now is it posible change install folder from AppUpdater.
+
+## 5.1.0
+
+### Minor Changes
+
+- [#6941](https://github.com/electron-userland/electron-builder/pull/6941) [`14503ceb`](https://github.com/electron-userland/electron-builder/commit/14503ceb99c1a31c54a261a1ae60a34980f36a50) Thanks [@ezekg](https://github.com/ezekg)! - Upgrade Keygen publisher/updater integration to API version v1.1.
+
+### Patch Changes
+
+- [#6975](https://github.com/electron-userland/electron-builder/pull/6975) [`8279d053`](https://github.com/electron-userland/electron-builder/commit/8279d053d520e7506d84bf9710972b998e70b752) Thanks [@ezekg](https://github.com/ezekg)! - Fix artifact conflicts for Keygen provider when multiple artifacts share the same filename across products.
+
+- Updated dependencies [[`adeaa347`](https://github.com/electron-userland/electron-builder/commit/adeaa347c03b8947b0812ecef23398c0822646bb)]:
+  - builder-util-runtime@9.0.3
+
+## 5.0.6
+
+### Patch Changes
+
+- [#6909](https://github.com/electron-userland/electron-builder/pull/6909) [`0b6db59e`](https://github.com/electron-userland/electron-builder/commit/0b6db59ec10dfe05903f29d6790972f55746bef7) Thanks [@ezekg](https://github.com/ezekg)! - Pin Keygen publisher/updater integration to API version v1.0.
+
+## 5.0.5
+
+### Patch Changes
+
+- [#6889](https://github.com/electron-userland/electron-builder/pull/6889) [`869ec27f`](https://github.com/electron-userland/electron-builder/commit/869ec27fd1d99b9913875cb4d7ae7c733c1f3e25) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: moving typed-emitter from devDependency to dependencies
+
+## 5.0.4
+
+### Patch Changes
+
+- [#6822](https://github.com/electron-userland/electron-builder/pull/6822) [`bfe29a5e`](https://github.com/electron-userland/electron-builder/commit/bfe29a5e991c2719032877bd7225b15b6b836221) Thanks [@RoikkuTo](https://github.com/RoikkuTo)! - fix: Unable to find latest version on GitHub
+
+* [#6825](https://github.com/electron-userland/electron-builder/pull/6825) [`db075480`](https://github.com/electron-userland/electron-builder/commit/db0754805b4d6c5d8a4d86af7cb107db87bda303) Thanks [@Nokel81](https://github.com/Nokel81)! - Added types for AppUpdater's events
+
+## 5.0.3
+
+### Patch Changes
+
+- [#6810](https://github.com/electron-userland/electron-builder/pull/6810) [`817e68ba`](https://github.com/electron-userland/electron-builder/commit/817e68ba54f4fa60fec789fcfcfb527473a610fc) Thanks [@blakebyrnes](https://github.com/blakebyrnes)! - fix: github provider prerelease check incorrectly casts undefined to String. Resolves #6809
+
+- Updated dependencies [[`7af4c226`](https://github.com/electron-userland/electron-builder/commit/7af4c226af9f7759092cbd9d2c63d85e0c54ad43)]:
+  - builder-util-runtime@9.0.2
+
+## 5.0.2
+
+### Patch Changes
+
+- [`9a7ed436`](https://github.com/electron-userland/electron-builder/commit/9a7ed4360618e540810337c5f02d99cd2a9b8441) - chore: updating dependency tree
+
+- Updated dependencies [[`9a7ed436`](https://github.com/electron-userland/electron-builder/commit/9a7ed4360618e540810337c5f02d99cd2a9b8441)]:
+  - builder-util-runtime@9.0.1
+
+## 5.0.1
+
+### Patch Changes
+
+- [#6743](https://github.com/electron-userland/electron-builder/pull/6743) [`27f18aa1`](https://github.com/electron-userland/electron-builder/commit/27f18aa1d890f3a82e856f4834b8387066fb697f) Thanks [@YanDevDe](https://github.com/YanDevDe)! - fix: Updater "Error: Could not connect to the server." in macOS. Don't close server directly at quitAndInstall #6743
+
+## 5.0.0
+
+### Major Changes
+
+- [#6556](https://github.com/electron-userland/electron-builder/pull/6556) [`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222) Thanks [@mmaietta](https://github.com/mmaietta)! - Breaking changes
+  Removing Bintray support since it was sunset. Ref: https://jfrog.com/blog/into-the-sunset-bintray-jcenter-gocenter-and-chartcenter/
+  Fail-fast for windows signature verification failures. Adding `-LiteralPath` to update file path to disregard injected wildcards
+  Force strip path separators for backslashes on Windows during update process
+  Force authentication for local mac squirrel update server
+
+  Fixes:
+  fix(nsis): Adding --INPUTCHARSET to makensis. (#4898 #6232 #6259)
+
+  Adding additional details to error console logging
+
+* [#6575](https://github.com/electron-userland/electron-builder/pull/6575) [`5e381c55`](https://github.com/electron-userland/electron-builder/commit/5e381c556d12ce185bb7ea720380509c1ddc5cf7) Thanks [@devinbinnie](https://github.com/devinbinnie)! - fix: Allow disabling of webinstaller files to avoid confusion with actual installers
+
+- [#6576](https://github.com/electron-userland/electron-builder/pull/6576) [`53467c72`](https://github.com/electron-userland/electron-builder/commit/53467c724dacc11fc270cebaba22f8cf84dff24f) Thanks [@devinbinnie](https://github.com/devinbinnie)! - fix: Update certificate validation on Windows to check full DN
+
+### Minor Changes
+
+- [#6505](https://github.com/electron-userland/electron-builder/pull/6505) [`1de0adbd`](https://github.com/electron-userland/electron-builder/commit/1de0adbd615b3b3d26faeb6a449f522355b36041) Thanks [@KenCorma](https://github.com/KenCorma)! - feat(updater): Add Channel Support for Github with PreRelease
+
+### Patch Changes
+
+- [#6594](https://github.com/electron-userland/electron-builder/pull/6594) [`edc4b030`](https://github.com/electron-userland/electron-builder/commit/edc4b030703ee3929b31608a496798635169f5b1) Thanks [@mmaietta](https://github.com/mmaietta)! - fix(updater): Replacing fs/promises with fs-extra to support legacy versions of Electron that use node 12 and below. Fixes: #6000
+
+* [#6587](https://github.com/electron-userland/electron-builder/pull/6587) [`8746f910`](https://github.com/electron-userland/electron-builder/commit/8746f910d136fb9b531e688d0a646eeb9528adc6) Thanks [@devinbinnie](https://github.com/devinbinnie)! - fix: fixes for server auth for MacUpdater
+
+- [#6589](https://github.com/electron-userland/electron-builder/pull/6589) [`633ee5dc`](https://github.com/electron-userland/electron-builder/commit/633ee5dc292174ed1486c53af93320f20cf02169) Thanks [@devinbinnie](https://github.com/devinbinnie)! - - Removed backtick escaping for Windows code signing as it is unnecessary for Powershell and can cause the script to attempt to access the wrong file
+  - Updated the proxy filename to be more secure (512-bit string)
+
+* [#6616](https://github.com/electron-userland/electron-builder/pull/6616) [`86e6d150`](https://github.com/electron-userland/electron-builder/commit/86e6d1509f9b9c76c559e9c3a12b7a1595fe3ac4) Thanks [@mmaietta](https://github.com/mmaietta)! - fix(updater): Remove checks for app-update.yml when auto-updates are not supported
+
+* Updated dependencies [[`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222)]:
+  - builder-util-runtime@9.0.0
+
+## 5.0.0-alpha.4
+
+### Patch Changes
+
+- [#6616](https://github.com/electron-userland/electron-builder/pull/6616) [`86e6d150`](https://github.com/electron-userland/electron-builder/commit/86e6d1509f9b9c76c559e9c3a12b7a1595fe3ac4) Thanks [@mmaietta](https://github.com/mmaietta)! - fix(updater): Remove checks for app-update.yml when auto-updates are not supported
+
+## 5.0.0-alpha.3
+
+### Patch Changes
+
+- [#6594](https://github.com/electron-userland/electron-builder/pull/6594) [`edc4b030`](https://github.com/electron-userland/electron-builder/commit/edc4b030703ee3929b31608a496798635169f5b1) Thanks [@mmaietta](https://github.com/mmaietta)! - fix(updater): Replacing fs/promises with fs-extra to support legacy versions of Electron that use node 12 and below. Fixes: #6000
+
+* [#6589](https://github.com/electron-userland/electron-builder/pull/6589) [`633ee5dc`](https://github.com/electron-userland/electron-builder/commit/633ee5dc292174ed1486c53af93320f20cf02169) Thanks [@devinbinnie](https://github.com/devinbinnie)! - - Removed backtick escaping for Windows code signing as it is unnecessary for Powershell and can cause the script to attempt to access the wrong file
+  - Updated the proxy filename to be more secure (512-bit string)
+
+## 5.0.0-alpha.2
+
+### Minor Changes
+
+- [#6505](https://github.com/electron-userland/electron-builder/pull/6505) [`1de0adbd`](https://github.com/electron-userland/electron-builder/commit/1de0adbd615b3b3d26faeb6a449f522355b36041) Thanks [@KenCorma](https://github.com/KenCorma)! - feat(updater): Add Channel Support for Github with PreRelease
+
+### Patch Changes
+
+- [#6587](https://github.com/electron-userland/electron-builder/pull/6587) [`8746f910`](https://github.com/electron-userland/electron-builder/commit/8746f910d136fb9b531e688d0a646eeb9528adc6) Thanks [@devinbinnie](https://github.com/devinbinnie)! - fix: fixes for server auth for MacUpdater
+
+## 5.0.0-alpha.1
+
+### Major Changes
+
+- [#6575](https://github.com/electron-userland/electron-builder/pull/6575) [`5e381c55`](https://github.com/electron-userland/electron-builder/commit/5e381c556d12ce185bb7ea720380509c1ddc5cf7) Thanks [@devinbinnie](https://github.com/devinbinnie)! - fix: Allow disabling of webinstaller files to avoid confusion with actual installers
+
+* [#6576](https://github.com/electron-userland/electron-builder/pull/6576) [`53467c72`](https://github.com/electron-userland/electron-builder/commit/53467c724dacc11fc270cebaba22f8cf84dff24f) Thanks [@devinbinnie](https://github.com/devinbinnie)! - fix: Update certificate validation on Windows to check full DN
+
+## 5.0.0-alpha.0
+
+### Major Changes
+
+- [#6556](https://github.com/electron-userland/electron-builder/pull/6556) [`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222) Thanks [@mmaietta](https://github.com/mmaietta)! - Breaking changes
+  Removing Bintray support since it was sunset. Ref: https://jfrog.com/blog/into-the-sunset-bintray-jcenter-gocenter-and-chartcenter/
+  Fail-fast for windows signature verification failures. Adding `-LiteralPath` to update file path to disregard injected wildcards
+  Force strip path separators for backslashes on Windows during update process
+  Force authentication for local mac squirrel update server
+
+  Fixes:
+  fix(nsis): Adding --INPUTCHARSET to makensis. (#4898 #6232 #6259)
+
+  Adding additional details to error console logging
+
+### Patch Changes
+
+- Updated dependencies [[`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222)]:
+  - builder-util-runtime@9.0.0-alpha.0
+
+## 4.6.5
+
+### Patch Changes
+
+- [#6381](https://github.com/electron-userland/electron-builder/pull/6381) [`828fcd37`](https://github.com/electron-userland/electron-builder/commit/828fcd378c2df28763893ef68f92d5b1a72fead3) Thanks [@zhanjinfeng](https://github.com/zhanjinfeng)! - fix: use `uname -a` to get arch instead of 'process.arch' in mac silicon
+
+## 4.6.4
+
+### Patch Changes
+
+- [#6450](https://github.com/electron-userland/electron-builder/pull/6450) [`661a6522`](https://github.com/electron-userland/electron-builder/commit/661a6522520e9ea59549cb7e18986fcfb58e873a) Thanks [@robertpatrick](https://github.com/robertpatrick)! - fix(nsis): fix per-machine installs to properly elevate during silent install/updates
+
+## 4.6.3
+
+### Patch Changes
+
+- [#6395](https://github.com/electron-userland/electron-builder/pull/6395) [`3c38af42`](https://github.com/electron-userland/electron-builder/commit/3c38af4288908abeea1be1f245d9e3db6c62b227) Thanks [@Nokel81](https://github.com/Nokel81)! - Emulate electron.autoUpdater's event lifecycle for AppImageUpdater
+
+## 4.6.2
+
+### Patch Changes
+
+- [#6390](https://github.com/electron-userland/electron-builder/pull/6390) [`a5e8073e`](https://github.com/electron-userland/electron-builder/commit/a5e8073e21b1ff791905cdb4ab011a724533d8c1) Thanks [@Nokel81](https://github.com/Nokel81)! - Fix updating only on demand not working on macOS
+
+- Updated dependencies [[`66ca625f`](https://github.com/electron-userland/electron-builder/commit/66ca625f892329fd7bedf52fddc6659ec83b7cd3)]:
+  - builder-util-runtime@8.9.2
+
+## 4.6.1
+
+### Patch Changes
+
+- Updated dependencies [[`54ee4e72`](https://github.com/electron-userland/electron-builder/commit/54ee4e72c5db859b9a00104179786567a0e977ff)]:
+  - builder-util-runtime@8.9.1
+
+## 4.6.0
+
+### Minor Changes
+
+- [#6228](https://github.com/electron-userland/electron-builder/pull/6228) [`a9453216`](https://github.com/electron-userland/electron-builder/commit/a94532164709a545c0f6551fdc336dbc5377bda8) Thanks [@mmaietta](https://github.com/mmaietta)! - feat: adding Bitbucket publisher and autoupdater
+
+### Patch Changes
+
+- Updated dependencies [[`a9453216`](https://github.com/electron-userland/electron-builder/commit/a94532164709a545c0f6551fdc336dbc5377bda8)]:
+  - builder-util-runtime@8.9.0
+
+## 4.5.2
+
+### Patch Changes
+
+- [#6212](https://github.com/electron-userland/electron-builder/pull/6212) [`0c21cd69`](https://github.com/electron-userland/electron-builder/commit/0c21cd69663a7eebe0687eaba9eea851cc2fea9e) Thanks [@johnnyopao](https://github.com/johnnyopao)! - Fix upgrade flows on intel mac when both x64 and arm64 versions published
+
+## 4.5.1
+
+### Patch Changes
+
+- Updated dependencies [[`7f933d00`](https://github.com/electron-userland/electron-builder/commit/7f933d0004a0a5f808a2a1c71dca7362cab2728e)]:
+  - builder-util-runtime@8.8.1
+
+## 4.5.0
+
+### Minor Changes
+
+- [#6167](https://github.com/electron-userland/electron-builder/pull/6167) [`f45110cb`](https://github.com/electron-userland/electron-builder/commit/f45110cbf66572d5748d21fc24dc26cabd06f35f) Thanks [@mmaietta](https://github.com/mmaietta)! - feat: Adding Keygen as an official publisher/updater for electron-builder (#6167)
+
+### Patch Changes
+
+- Updated dependencies [[`f45110cb`](https://github.com/electron-userland/electron-builder/commit/f45110cbf66572d5748d21fc24dc26cabd06f35f)]:
+  - builder-util-runtime@8.8.0
+
+## 4.4.6
+
+### Patch Changes
+
+- a3c72b24: fix(electron-updater): workaround vite's process.env.\* replacement
+- ca0e8454: fix(electron-updater): `null` object error when MacUpdater attempts to log the server port before it is listening
+
+## 4.4.5
+
+### Patch Changes
+
+- a3f2cd15: fix(electron-updater): default import throws error for fs and path leading to always requiring elevation
+- ae363e51: fix: removing data from error being thrown. It's unnecessary and also unnecessarily large to be passing to the console. Resolves: #6131
+
+## 4.4.4
+
+### Patch Changes
+
+- ae81dfae: fix(electron-updater): small cleanup and add more debug logging for MacUpdater to investigate #6120
+
+## 4.4.3
+
+### Patch Changes
+
+- a4eae34f: Synchronizing CLI and package.json versions. Updating auto-publish values + changeset generation to be more frictionless
+- Updated dependencies [a4eae34f]
+  - builder-util-runtime@8.7.10
+
 ## 4.4.2
 
 ### Patch Changes

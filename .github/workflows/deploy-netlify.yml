@@ -1,0 +1,74 @@
+name: 'Netlify Deploy - Release'
+
+on:
+  release:
+    types: ['published']
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# one deploy per release tag at a time (a manual re-run waits for the one in progress); deploys of different
+# releases are not serialized or cancelled, so none is skipped
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: 'Deploy Release'
+    permissions:
+      contents: read  # actions/checkout
+      statuses: write  # the "Netlify Documentation Site preview" commit status
+    runs-on: ubuntu-24.04
+    # No release-line guard, deliberately: every `published` event that reaches THIS
+    # copy of the file should prod-deploy, master's `next` prereleases included. A
+    # release event runs the workflow from the release tag's own commit, so master's
+    # copy only ever runs for tags in master's history (electron-builder@26.15.7 ran
+    # at ce825f12, reachable only from release/v26), and release/v26 runs its own copy,
+    # which deploys previews instead of prod.
+    #
+    # Don't add `release.target_commitish == 'master'`: changesets/action creates the
+    # releases for pre-existing tags without target_commitish, so GitHub records the
+    # default branch — every release here, v26 ones included, reports "master".
+
+    steps:
+      - name: Checkout code repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install deps and audit
+        uses: $/.github/actions/pnpm
+
+      - name: Build composed multi-version docusaurus site
+        # One self-contained docker build: the container builds the current
+        # checkout at "/" and every other version declared in
+        # website/docs-versions.json under its own sub-path (release/v26 →
+        # /v26/). That file also drives the navbar version dropdown, so adding a
+        # line to the site is a one-file change and needs no edit here.
+        # (RELEASE_TAGS can override the list ad hoc; see
+        # website/scripts/build-versioned-site.sh.)
+        run: pnpm docs:all
+
+      - uses: jsmrcaga/action-netlify-deploy@ae36ac1b3d1ad3646eecb5631977e7314d3a6a2f # v2.4.0
+        with:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+          NETLIFY_DEPLOY_MESSAGE: "Prod deploy v${{ github.ref }}"
+          NETLIFY_DEPLOY_TO_PROD: true
+          install_command: "echo Skipping installing the dependencies"
+          build_command: "echo Skipping building the web files"
+          build_directory: "website/build"
+          monorepo_package: "electron-builder"
+
+      # Creates a status check with link to preview
+      - name: Set Status check on commit
+        uses: guibranco/github-status-action-v2@77639353504055053524efa7a3719aaf0b731ce9 # v1.2.4
+        with:
+          authToken: ${{ secrets.GITHUB_TOKEN }}
+          state: success
+          context: Netlify Documentation Site preview
+          description: Production - Click "details"
+          target_url: ${{ env.NETLIFY_PREVIEW_URL }}
+          sha: ${{github.event.pull_request.head.sha || github.sha}}

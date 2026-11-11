@@ -1,10 +1,8 @@
-import { Filter, FileConsumer } from "builder-util/out/fs"
-import { readlink, stat, Stats } from "fs-extra"
-import { FileMatcher } from "../fileMatcher"
-import { Packager } from "../packager"
+import { FileConsumer, Filter, FilterStats } from "builder-util"
+import fsExtra from "fs-extra"
 import * as path from "path"
-
-const nodeModulesSystemDependentSuffix = `${path.sep}node_modules`
+import { FileMatcher } from "../fileMatcher.js"
+import { PlatformPackager } from "../platformPackager.js"
 
 function addAllPatternIfNeed(matcher: FileMatcher) {
   if (!matcher.isSpecifiedAsEmptyArray && (matcher.isEmpty() || matcher.containsOnlyIgnore())) {
@@ -14,32 +12,36 @@ function addAllPatternIfNeed(matcher: FileMatcher) {
 }
 
 export abstract class FileCopyHelper {
-  readonly metadata = new Map<string, Stats>()
+  readonly metadata = new Map<string, fsExtra.Stats>()
 
-  protected constructor(protected readonly matcher: FileMatcher, readonly filter: Filter | null, protected readonly packager: Packager) {}
+  protected constructor(
+    protected readonly matcher: FileMatcher,
+    readonly filter: Filter | null,
+    protected readonly packager: PlatformPackager<any>
+  ) {}
 
-  protected handleFile(file: string, parent: string, fileStat: Stats): Promise<Stats | null> | null {
+  protected handleFile(file: string, parent: string, fileStat: fsExtra.Stats): Promise<fsExtra.Stats | null> | null {
     if (!fileStat.isSymbolicLink()) {
       return null
     }
 
-    return readlink(file).then((linkTarget): any => {
+    return fsExtra.readlink(file).then((linkTarget): any => {
       // http://unix.stackexchange.com/questions/105637/is-symlinks-target-relative-to-the-destinations-parent-directory-and-if-so-wh
       return this.handleSymlink(fileStat, file, parent, linkTarget)
     })
   }
 
-  private handleSymlink(fileStat: Stats, file: string, parent: string, linkTarget: string): Promise<Stats> | null {
+  private handleSymlink(fileStat: fsExtra.Stats, file: string, parent: string, linkTarget: string): Promise<fsExtra.Stats> | null {
     const resolvedLinkTarget = path.resolve(parent, linkTarget)
     const link = path.relative(this.matcher.from, resolvedLinkTarget)
-    if (link.startsWith("..")) {
+    if (isOutsidePath(link)) {
       // outside of project, linked module (https://github.com/electron-userland/electron-builder/issues/675)
-      return stat(resolvedLinkTarget).then(targetFileStat => {
+      return fsExtra.stat(resolvedLinkTarget).then(targetFileStat => {
         this.metadata.set(file, targetFileStat)
         return targetFileStat
       })
     } else {
-      const s = fileStat as any
+      const s: FilterStats = fileStat
       s.relativeLink = link
       s.linkRelativeToFile = path.relative(parent, resolvedLinkTarget)
     }
@@ -47,52 +49,36 @@ export abstract class FileCopyHelper {
   }
 }
 
-function createAppFilter(matcher: FileMatcher, packager: Packager): Filter | null {
+/** @internal */
+export function isOutsidePath(relativePath: string): boolean {
+  if (relativePath === ".." || path.isAbsolute(relativePath)) {
+    return true
+  }
+  // Windows path APIs accept both "/" and "\" as separators; on POSIX a backslash is an ordinary filename character
+  return relativePath.startsWith("../") || (path.sep === "\\" && relativePath.startsWith("..\\"))
+}
+
+function createAppFilter(matcher: FileMatcher, packager: PlatformPackager<any>): Filter | null {
   if (packager.areNodeModulesHandledExternally) {
     return matcher.isEmpty() ? null : matcher.createFilter()
   }
-
-  const nodeModulesFilter: Filter = (file, fileStat) => {
-    return !(fileStat.isDirectory() && file.endsWith(nodeModulesSystemDependentSuffix))
-  }
-
-  if (matcher.isEmpty()) {
-    return nodeModulesFilter
-  }
-
-  const filter = matcher.createFilter()
-  return (file, fileStat) => {
-    if (!nodeModulesFilter(file, fileStat)) {
-      return !!packager.config.includeSubNodeModules
-    }
-    return filter(file, fileStat)
-  }
+  return matcher.createFilter()
 }
 
 /** @internal */
 export class AppFileWalker extends FileCopyHelper implements FileConsumer {
   readonly matcherFilter: any
-  constructor(matcher: FileMatcher, packager: Packager) {
+  constructor(matcher: FileMatcher, packager: PlatformPackager<any>) {
     super(addAllPatternIfNeed(matcher), createAppFilter(matcher, packager), packager)
     this.matcherFilter = matcher.createFilter()
   }
 
   // noinspection JSUnusedGlobalSymbols
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  consume(file: string, fileStat: Stats, parent: string, siblingNames: Array<string>): any {
+  consume(file: string, fileStat: fsExtra.Stats, parent: string, siblingNames: Array<string>): any {
     if (fileStat.isDirectory()) {
-      // https://github.com/electron-userland/electron-builder/issues/1539
-      // but do not filter if we inside node_modules dir
-      // update: solution disabled, node module resolver should support such setup
-      if (file.endsWith(nodeModulesSystemDependentSuffix)) {
-        if (!this.packager.config.includeSubNodeModules) {
-          const matchesFilter = this.matcherFilter(file, fileStat)
-          if (!matchesFilter) {
-            // Skip the file
-            return false
-          }
-        }
-      }
+      const matchesFilter = this.matcherFilter(file, fileStat)
+      return !matchesFilter
     } else {
       // save memory - no need to store stat for directory
       this.metadata.set(file, fileStat)

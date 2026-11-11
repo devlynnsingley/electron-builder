@@ -1,10 +1,43 @@
-import { PlatformSpecificBuildOptions, TargetConfigType, TargetSpecificOptions } from "../index"
+import { TargetConfigType, TargetSpecificOptions } from "../core.js"
+import { PlatformSpecificBuildOptions } from "./PlatformSpecificBuildOptions.js"
+
+/**
+ * Example Spec: https://specifications.freedesktop.org/desktop-entry-spec/latest/example.html
+ */
+export interface LinuxDesktopFile {
+  /**
+   * `[Desktop Entry]` metadata entries (name to value). Overwrites default values calculated by electron-builder
+   *
+   * Keys and values are written as given. A key must not be empty or contain `=` or a line break, and brackets are only allowed around a trailing locale of letters, digits, `-`, `_`, `.` and `@`, right after the key, such as `Name[de]`. A value must be on one line: a line break inside a value fails the build (write a newline in a string value as `\n`), and line breaks at its end are dropped.
+   */
+  entry?: {
+    [k: string]: string
+  } | null
+  /**
+   * `[Desktop Actions <ActionName>]` metadata entries (name to value).
+   *
+   * An action name must not contain `[`, `]` or control characters. Its keys and values follow the rules of `entry`.
+   *
+   * Config Example:
+   * ```js
+   * desktopActions: {
+   *    NewWindow: {
+   *       Name: 'New Window',
+   *       Exec: 'app --new-window',
+   *    }
+   * }
+   * ```
+   */
+  desktopActions?: {
+    [ActionName: string]: any
+  } | null
+}
 
 export interface LinuxConfiguration extends CommonLinuxOptions, PlatformSpecificBuildOptions {
   /**
-   * Target package type: list of `AppImage`, `snap`, `deb`, `rpm`, `freebsd`, `pacman`, `p5p`, `apk`, `7z`, `zip`, `tar.xz`, `tar.lz`, `tar.gz`, `tar.bz2`, `dir`.
+   * Target package type: list of `AppImage`, `flatpak`, `snap`, `deb`, `rpm`, `freebsd`, `pacman`, `p5p`, `apk`, `7z`, `zip`, `tar.xz`, `tar.lz`, `tar.gz`, `tar.bz2`, `dir`.
    *
-   * electron-builder [docker image](/multi-platform-build#docker) can be used to build Linux targets on any platform.
+   * electron-builder [docker image](https://www.electron.build/docs/features/multi-platform-build#docker) can be used to build Linux targets on any platform.
    *
    * Please [do not put an AppImage into another archive](https://github.com/probonopd/AppImageKit/wiki/Creating-AppImages#common-mistake) like a .zip or .tar.gz.
    * @default AppImage
@@ -12,28 +45,37 @@ export interface LinuxConfiguration extends CommonLinuxOptions, PlatformSpecific
   readonly target?: TargetConfigType
 
   /**
-   * The maintainer. Defaults to [author](/configuration/configuration#Metadata-author).
+   * The maintainer. Defaults to [author](https://www.electron.build/configuration#author).
    */
   readonly maintainer?: string | null
 
   /**
-   * The vendor. Defaults to [author](/configuration/configuration#Metadata-author).
+   * The vendor. Defaults to [author](https://www.electron.build/configuration#author).
    */
   readonly vendor?: string | null
 
   /**
-   * The path to icon set directory or one png file, relative to the [build resources](/configuration/configuration#MetadataDirectories-buildResources) or to the project directory. The icon filename must contain the size (e.g. 32x32.png) of the icon.
+   * The path to icon set directory or one png file, relative to the [build resources](https://www.electron.build/contents#extraresources) or to the project directory. The icon filename must contain the size (e.g. 32x32.png) of the icon.
    * By default will be generated automatically based on the macOS icns file.
    */
   readonly icon?: string
 
   /**
-   * backward compatibility + to allow specify fpm-only category for all possible fpm targets in one place
    * @private
+   * @internal Allows specifying an FPM-only package category for all FPM targets in one place.
+   * For user-facing category configuration use the target-specific options (e.g. {@link DebOptions}).
    */
   readonly packageCategory?: string | null
 }
 
+/**
+ * Desktop-entry and runtime fields shared by all Linux targets and all snap core strategies.
+ *
+ * Fields set under `linux.*` in your build config (i.e. on {@link LinuxConfiguration}) are
+ * automatically cascaded into each snap core's options by `LinuxTargetHelper.getSnapCore()`.
+ * You do not need to duplicate them under `snapcraft.core24.*`, `snapcraft.core22.*`, etc.
+ * Per-core values always take precedence when both are set.
+ */
 export interface CommonLinuxOptions {
   /**
    * The [short description](https://www.debian.org/doc/debian-policy/ch-controlfields.html#s-f-Description).
@@ -41,7 +83,7 @@ export interface CommonLinuxOptions {
   readonly synopsis?: string | null
 
   /**
-   * As [description](/configuration/configuration#Metadata-description) from application package.json, but allows you to specify different for Linux.
+   * As [description](https://www.electron.build/configuration#description) from application package.json, but allows you to specify different for Linux.
    */
   readonly description?: string | null
 
@@ -56,9 +98,9 @@ export interface CommonLinuxOptions {
   readonly mimeTypes?: Array<string> | null
 
   /**
-   * The [Desktop file](https://developer.gnome.org/integration-guide/stable/desktop-files.html.en) entries (name to value).
+   * The [Desktop file](https://developer.gnome.org/documentation/guidelines/maintainer/integrating.html#desktop-files)
    */
-  readonly desktop?: any | null
+  readonly desktop?: LinuxDesktopFile | null
 
   /**
    * The executable parameters. Pass to executableName
@@ -70,14 +112,21 @@ export interface CommonLinuxOptions {
 export interface LinuxTargetSpecificOptions extends CommonLinuxOptions, TargetSpecificOptions {
   /**
    * Package dependencies.
+   * `rpm` defaults to `["gtk3", "libnotify", "nss", "libXScrnSaver", "(libXtst or libXtst6)", "xdg-utils", "at-spi2-core", "(libuuid or libuuid1)"]`
+   * `pacman` defaults to `["c-ares", "ffmpeg", "gtk3", "libevent", "libvpx", "libxslt", "libxss", "minizip", "nss", "re2", "snappy", "libnotify", "libappindicator-gtk3"]`
+   *
+   * Use the `"default"` keyword to extend the target's default list instead of replacing it:
+   * `["default", "my-extra-lib"]` appends `my-extra-lib` to the defaults. The resulting list is deduplicated.
    */
   readonly depends?: Array<string> | null
 
   /**
-   * The compression type.
+   * The compression type passed to fpm. For `deb`, `rpm`, and `pacman` targets prefer the
+   * typed per-format interfaces (`DebOptions`, `RpmOptions`, `PacmanOptions`) which narrow
+   * this to only the values that fpm actually accepts for that format.
    * @default xz
    */
-  readonly compression?: "gz" | "bzip2" | "xz" | null
+  readonly compression?: "gz" | "bzip2" | "xz" | "xzmt" | "gzip" | "zst" | "zstd" | null
 
   readonly icon?: string
 
@@ -94,22 +143,43 @@ export interface LinuxTargetSpecificOptions extends CommonLinuxOptions, TargetSp
   readonly vendor?: string | null
   readonly maintainer?: string | null
 
+  /**
+   * File path to script to be passed to FPM for `--after-install` arg.
+   */
   readonly afterInstall?: string | null
+  /**
+   * File path to script to be passed to FPM for `--after-remove` arg.
+   */
   readonly afterRemove?: string | null
+  /**
+   * File path to custom AppArmor profile (Ubuntu 24+)
+   */
+  readonly appArmorProfile?: string | null
 
   /**
-   * *Advanced only* The [fpm](https://github.com/jordansissel/fpm/wiki#usage) options.
+   * *Advanced only* The [fpm](https://fpm.readthedocs.io/en/latest/cli-reference.html) options.
    *
    * Example: `["--before-install=build/deb-preinstall.sh", "--after-upgrade=build/deb-postinstall.sh"]`
    */
   readonly fpm?: Array<string> | null
 }
-
 export interface DebOptions extends LinuxTargetSpecificOptions {
   /**
-   * Package dependencies. Defaults to `["gconf2", "gconf-service", "libnotify4", "libappindicator1", "libxtst6", "libnss3"]`.
+   * Package dependencies.
+   * If need to support Debian, `libappindicator1` should be removed, it is [deprecated in Debian](https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=895037).
+   * If need to support KDE, `gconf2` and `gconf-service` should be removed as it's no longer used [by GNOME](https://packages.debian.org/bullseye/gconf2).
+   *
+   * Use the `"default"` keyword to extend the default list instead of replacing it:
+   * `["default", "my-extra-lib"]` appends `my-extra-lib` to the defaults. The resulting list is deduplicated.
+   * @default ["libgtk-3-0", "libnotify4", "libnss3", "libxss1", "libxtst6", "xdg-utils", "libatspi2.0-0", "libuuid1", "libsecret-1-0"]
    */
   readonly depends?: Array<string> | null
+
+  /**
+   * The [recommended package dependencies](https://www.debian.org/doc/debian-policy/ch-relationships.html#s-binarydeps).
+   * @default ["libappindicator3-1"]
+   */
+  readonly recommends?: Array<string> | null
 
   /**
    * The [package category](https://www.debian.org/doc/debian-policy/ch-controlfields.html#s-f-Section).
@@ -120,6 +190,23 @@ export interface DebOptions extends LinuxTargetSpecificOptions {
    * The [Priority](https://www.debian.org/doc/debian-policy/ch-controlfields.html#s-f-Priority) attribute.
    */
   readonly priority?: string | null
+
+  /** @default xz */
+  readonly compression?: "gz" | "bzip2" | "xz" | "zst" | null
+}
+
+export interface RpmOptions extends LinuxTargetSpecificOptions {
+  /**
+   * Passed to fpm via `--rpm-compression`. `"xzmt"` uses multi-threaded xz (fpm's RPM default).
+   * `"xz"` is automatically promoted to `"xzmt"`. `"gzip"` and `"bzip2"` pass through as-is.
+   * @default xzmt
+   */
+  readonly compression?: "xz" | "xzmt" | "gzip" | "bzip2" | null
+}
+
+export interface PacmanOptions extends LinuxTargetSpecificOptions {
+  /** @default xz */
+  readonly compression?: "gz" | "bzip2" | "xz" | "zstd" | null
 }
 
 export interface AppImageOptions extends CommonLinuxOptions, TargetSpecificOptions {
@@ -127,6 +214,22 @@ export interface AppImageOptions extends CommonLinuxOptions, TargetSpecificOptio
    * The path to EULA license file. Defaults to `license.txt` or `eula.txt` (or uppercase variants). Only plain text is supported.
    */
   readonly license?: string | null
+  /**
+   * The compression algorithm passed to the AppImage build tool.
+   *
+   * **FUSE2 toolset (`"0.0.0"`):** only `"xz"` and `"gzip"` are forwarded
+   * to mksquashfs (`-comp <value>`); `"xz"` additionally passes `-Xdict-size 100% -b 1048576`.
+   * `"zstd"`, `null`, and unset fall through to the root-level `compression` option:
+   * - `"maximum"` → `"xz"`
+   * - anything else → flag omitted (mksquashfs defaults to gzip)
+   *
+   * **Static-runtime toolsets (unset / `"latest"` or `>= 1.0.0`):** `"gzip"` and `"zstd"` are forwarded
+   * directly. `"xz"` is mapped to `"zstd"` (nearest supported equivalent). `null`
+   * or unset falls through to the root-level `compression` option:
+   * - `"store"` → `"gzip"`
+   * - `"normal"` / `"maximum"` / unset → `"zstd"`
+   */
+  readonly compression?: "gzip" | "xz" | "zstd" | null
 }
 
 export interface FlatpakOptions extends CommonLinuxOptions, TargetSpecificOptions {
@@ -143,7 +246,7 @@ export interface FlatpakOptions extends CommonLinuxOptions, TargetSpecificOption
   readonly runtime?: string
 
   /**
-   * The version of the runtime that the application uses. Defaults to `20.08`.
+   * The version of the runtime that the application uses, which is also the version of the SDK. Defaults to `26.08`. Set it together with `baseVersion`.
    *
    * See [flatpak manifest documentation](https://docs.flatpak.org/en/latest/flatpak-builder-command-reference.html#flatpak-manifest).
    */
@@ -165,7 +268,7 @@ export interface FlatpakOptions extends CommonLinuxOptions, TargetSpecificOption
   readonly base?: string
 
   /**
-   * Use this specific version of the application specified in base. Defaults to `20.08`.
+   * Use this specific version of the application specified in base. It is not derived from `runtimeVersion`. Defaults to `26.08`.
    *
    * See [flatpak manifest documentation](https://docs.flatpak.org/en/latest/flatpak-builder-command-reference.html#flatpak-manifest).
    */
@@ -179,7 +282,7 @@ export interface FlatpakOptions extends CommonLinuxOptions, TargetSpecificOption
   readonly branch?: string
 
   /**
-   * An array of arguments passed to the flatpak build-finish command. Defaults to:
+   * An array of arguments passed to the flatpak build-finish command: the permissions of the sandboxed app. Setting it replaces the default list. The defaults are broad grants for a typical Electron app, not requirements: each one widens what code running in the app can reach, see [Finish Args](https://www.electron.build/docs/flatpak#finish-args-permissions). Defaults to:
    * ```json
    * [
    *   // Wayland/X11 Rendering
@@ -188,44 +291,80 @@ export interface FlatpakOptions extends CommonLinuxOptions, TargetSpecificOption
    *   "--share=ipc",
    *   // Open GL
    *   "--device=dri",
-   *   // Audio output
+   *   // Sound: playback and recording (microphone included), MIDI and the /dev/snd devices
    *   "--socket=pulseaudio",
-   *   // Read/write home directory access
-   *   "--filesystem=home",
+   *   // Read/write access to the Downloads folder only
+   *   "--filesystem=xdg-download",
    *   // Allow communication with network
    *   "--share=network",
-   *   // System notifications with libnotify
-   *   "--talk-name=org.freedesktop.Notifications",
    * ]
    * ```
+   *
+   * When `base` is the default `org.electronjs.Electron2.BaseApp` and `baseVersion` is older than `23.08`, the default list also has `"--talk-name=org.freedesktop.Notifications"`, for system notifications: those base apps ship a libnotify older than 0.8, which talks to the notification daemon instead of the notification portal.
+   *
+   * Before v27 the default list had `--filesystem=home`, read/write access to the whole home directory, instead of `--filesystem=xdg-download`, and always had `--talk-name=org.freedesktop.Notifications`.
    *
    * See [flatpak manifest documentation](https://docs.flatpak.org/en/latest/flatpak-builder-command-reference.html#flatpak-manifest).
    */
   readonly finishArgs?: string[]
 
   /**
-   * An array of objects specifying the modules to be built in order.
+   * An array of objects specifying the modules to be built in order. Modules are built in a bubblewrap sandbox, so they cannot be built where bubblewrap cannot create namespaces, such as an unprivileged container.
    *
    * See [flatpak manifest documentation](https://docs.flatpak.org/en/latest/flatpak-builder-command-reference.html#flatpak-manifest).
    */
   readonly modules?: (string | any)[]
 
   /**
-   * Files to copy directly into the app. Should be a list of [source, dest] tuples. Source should be a relative/absolute path to a file/directory to copy into the flatpak, and dest should be the path inside the app install prefix (e.g. /share/applications/).
-   *
-   * See [@malept/flatpak-bundler documentation](https://github.com/malept/flatpak-bundler#build-options).
+   * Extra files and directories for the app, as `[source, destination]` pairs. A source is a path on the build machine; a relative one is resolved against the current working directory. A destination is a path relative to the app prefix, which is `/app` inside the sandbox: `["build/extra.so", "/lib/extra.so"]` ends up at `/app/lib/extra.so`. A directory is merged into a destination that already exists. For a file, the destination is the path of the file itself, not of the directory that receives it. The pairs are copied in order, after the app itself, so a later pair can replace what an earlier one placed. A destination outside the app prefix (one that climbs out of it with `..`, or that leads out of it through a symlink placed by the base app, a module or an earlier pair) fails the build.
    */
   readonly files?: [string, string][]
 
   /**
-   * Symlinks to create in the app files. Should be a list of [target, location] symlink tuples. Target can be either a relative or absolute path inside the app install prefix, and location should be a absolute path inside the prefix to create the symlink at.
-   *
-   * See [@malept/flatpak-bundler documentation](https://github.com/malept/flatpak-bundler#build-options).
+   * Symlinks for the app, as `[target, link]` pairs. Both are paths relative to the app prefix, which is `/app` inside the sandbox: `["/lib/tool", "/bin/tool"]` creates `/app/bin/tool`, pointing at `/app/lib/tool`. The links are created after the files are copied. A link outside the app prefix (also through a symlink that leads out of it) fails the build.
    */
   readonly symlinks?: [string, string][]
 
   /**
-   * Whether to enable the Wayland specific flags (`--enable-features=UseOzonePlatform --ozone-platform=wayland`) in the wrapper script. These flags are only available starting with Electron version 12. Defaults to `false`.
+   * Whether the wrapper script makes Electron use Wayland when the session is a Wayland one (`XDG_SESSION_TYPE` is `wayland`). The flags depend on the Electron version: none from Electron 38, which picks Wayland there by itself (the build logs that the option has no effect), `--ozone-platform=wayland` from Electron 16, and `--enable-features=UseOzonePlatform --ozone-platform=wayland` before that. Electron 12 or later is required. Defaults to `false`.
    */
   readonly useWaylandFlags?: boolean
+
+  /**
+   * Which of the runtime, the SDK and the base app the build installs when they are missing and updates when they are installed: `"all"`, or a list of `"runtime"`, `"sdk"` and `"base"`. A ref that is left out is neither installed nor updated: the build uses it as it is installed on the build machine, for the user or system-wide, and fails before it installs or builds anything if it is not installed. Set `[]` to build with the refs that are already installed, for example in an image that has them, without network access, or where the build user cannot update them. Defaults to `"all"`.
+   */
+  readonly installOrUpdateRefs?: Array<"runtime" | "sdk" | "base"> | "all" | null
+
+  /**
+   * *Advanced only* Additional arguments for the tools that build the bundle, by tool. Nothing is added unless it is set.
+   *
+   * A build in an unprivileged container, which has neither FUSE nor user namespaces for bubblewrap, needs `{ flatpakBuilder: ["--disable-rofiles-fuse"], buildExport: ["--disable-sandbox"] }`.
+   */
+  readonly additionalArgs?: FlatpakAdditionalArgs | null
+}
+
+/**
+ * Additional arguments for the tools that build a flatpak bundle.
+ */
+export interface FlatpakAdditionalArgs {
+  /**
+   * Passed to `flatpak-builder`, on both of its invocations (the one that builds and the one that finishes the app).
+   *
+   * Example: `["--disable-rofiles-fuse"]`, which is required where FUSE is not available, typically in unprivileged containers.
+   */
+  readonly flatpakBuilder?: Array<string> | null
+
+  /**
+   * Passed to `flatpak build-export`.
+   *
+   * Example: `["--disable-sandbox"]`, which runs the icon validator without its sandbox and is required where bubblewrap cannot create namespaces, typically in unprivileged containers.
+   */
+  readonly buildExport?: Array<string> | null
+
+  /**
+   * Passed to `flatpak build-bundle`.
+   *
+   * Example: `["--runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo"]`
+   */
+  readonly buildBundle?: Array<string> | null
 }

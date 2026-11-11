@@ -1,74 +1,245 @@
-import { sanitizeFileName } from "app-builder-lib/out/util/sanitizeFileName"
-import { InvalidConfigurationError, log, isEmptyOrSpaces } from "builder-util"
-import { getBinFromUrl } from "app-builder-lib/out/binDownload"
-import { Arch, getArchSuffix, SquirrelWindowsOptions, Target } from "app-builder-lib"
-import { WinPackager } from "app-builder-lib/out/winPackager"
+import { Arch, getArchSuffix, SquirrelWindowsOptions, Target, WinPackager } from "app-builder-lib"
+import { forceCodeSigningError, forceCodeSigningOverrideHint, getRceditBundle, waitForPackWork, withToolsetLock, WineVmManager } from "app-builder-lib/internal"
+import { InvalidConfigurationError, isEmptyOrSpaces, log, escapeForXml, prepareFixedNameWrite } from "builder-util"
+import { sanitizeFileName } from "builder-util/internal"
+import * as fs from "fs"
+import * as os from "os"
 import * as path from "path"
-import { convertVersion, SquirrelBuilder, SquirrelOptions } from "./squirrelPack"
+import { getSquirrelToolsetPath, getWixToolsetPath } from "./toolset.js"
+import { InstallerOptions, convertVersion, copySquirrelExe, createWindowsInstaller } from "./windowsInstaller.js"
 
 export default class SquirrelWindowsTarget extends Target {
-  //tslint:disable-next-line:no-object-literal-type-assertion
-  readonly options: SquirrelWindowsOptions = { ...this.packager.platformSpecificBuildOptions, ...this.packager.config.squirrelWindows } as SquirrelWindowsOptions
+  readonly options: SquirrelWindowsOptions
 
-  constructor(private readonly packager: WinPackager, readonly outDir: string) {
+  isAsyncSupported = false
+
+  constructor(
+    private readonly packager: WinPackager,
+    readonly outDir: string
+  ) {
     super("squirrel")
+    this.options = packager.getOptionsForTarget<SquirrelWindowsOptions>("squirrelWindows")
+  }
+
+  /**
+   * Squirrel.Windows builds the MSI (`msi: true`) inside `--releasify`, around the Setup.exe it has just written, before electron-builder
+   * signs that Setup.exe: the installer the MSI carries is unsigned. That warns, and fails under forceCodeSigning.
+   */
+  checkMsiSigning(): void {
+    if (this.options.msi !== true) {
+      return
+    }
+    const problem =
+      "squirrelWindows.msi is true, and the MSI that Squirrel.Windows builds embeds Setup.exe before electron-builder signs it, so the installer inside the MSI is unsigned"
+    const remedy = "For a signed MSI, remove msi: true and add the msi target (win.target: msi), which electron-builder builds from the signed app."
+    if (this.packager.forceCodeSigning) {
+      throw forceCodeSigningError(`forceCodeSigning is enabled, but ${problem}. ${remedy} Or pass ${forceCodeSigningOverrideHint(this.packager)} to build it as it is.`)
+    }
+    log.once("squirrel-msi-unsigned-setup", this.packager).warn({ reason: problem }, `the Squirrel.Windows MSI embeds an unsigned Setup.exe. ${remedy}`)
+  }
+
+  private async prepareSignedVendorDirectory(): Promise<string> {
+    const tmpVendorDirectory = await this.packager.tempDirManager.createTempDir({ prefix: "squirrel-windows-vendor" })
+
+    // The vendor toolset comes from the maintained squirrel.windows bundle. Pin a version or supply a
+    // custom/local bundle (e.g. for air-gapped builds) via `toolsets.squirrel` (a ToolsetCustom object).
+    const squirrelToolset = await getSquirrelToolsetPath(this.packager.config.toolsets?.squirrel, this.packager.buildResourcesDir)
+    await fs.promises.cp(path.join(squirrelToolset, "electron-winstaller", "vendor"), tmpVendorDirectory, { recursive: true })
+
+    // Both Squirrel.exe and Squirrel-Mono.exe shell out to rcedit.exe (via setPEVersionInfoAndIcon)
+    // during --releasify to stamp version info and the app icon into Setup.exe, so rcedit must live in
+    // the vendor dir on every host — on non-Windows it runs under wine alongside the other Win32 vendor
+    // exes (Setup.exe, StubExecutable.exe, …). The bundle omits rcedit, so resolve it from the
+    // win-codesign toolset, which already versions and caches it across platforms.
+    //
+    // getRceditBundle honors the user's `toolsets.winCodeSign` selection, so users retain a bypass if a
+    // newer toolset regresses: `"0.0.0"` falls back to the legacy winCodeSign-2.6.0 rcedit, a custom
+    // toolset object uses their own rcedit, and the default (unset/"latest") pulls rcedit-windows-2_0_0.
+    const rcedit = await getRceditBundle(this.packager.config.toolsets?.winCodeSign, this.packager.buildResourcesDir)
+    // Pick rcedit by host arch (x64 for x64/arm64, x86 only for ia32). On non-Windows it runs under wine:
+    // the 32-bit build fails on arm64 macOS even under Rosetta (which translates x64, not x86), so the x64
+    // build is required there.
+    const rceditExe = os.arch() === "ia32" ? rcedit.x86 : rcedit.x64
+    await fs.promises.copyFile(rceditExe, path.join(tmpVendorDirectory, "rcedit.exe"))
+
+    // When building an MSI, Squirrel's createMsiPackage runs candle.exe/light.exe from the vendor dir and
+    // reads template.wxs there. The bundle ships neither, so merge the shared WiX toolset (the same
+    // candle/light electron-builder's MSI target uses) into the vendor dir, plus the Squirrel MSI template
+    // (authored against the v4 namespace this transitional WiX 4 requires).
+    if (this.options.msi) {
+      const wixToolset = await getWixToolsetPath()
+      await fs.promises.cp(wixToolset, tmpVendorDirectory, { recursive: true })
+      await fs.promises.copyFile(path.resolve(import.meta.dirname, "..", "template.wxs"), path.join(tmpVendorDirectory, "template.wxs"))
+    }
+
+    // Squirrel.exe is the core updater binary the bundle always ships; a missing one means a broken
+    // vendor toolset. Fail loudly rather than skipping signing — skipping would produce a broken
+    // installer and bypass the forceCodeSigning enforcement inside signIf (its awaited promise rejects
+    // when the file can't be signed and forceCodeSigning is set).
+    const files = await fs.promises.readdir(tmpVendorDirectory)
+    if (!files.includes("Squirrel.exe")) {
+      throw new Error(`Squirrel.exe not found in vendor directory: ${tmpVendorDirectory}`)
+    }
+    const squirrelExePath = path.join(tmpVendorDirectory, "Squirrel.exe")
+    log.debug({ file: squirrelExePath }, "signing vendor executable")
+    await this.packager.signIf(squirrelExePath)
+    return tmpVendorDirectory
+  }
+
+  private assertShellSafePath(filePath: string, description: string): void {
+    if (/[\r\n\0`$;&|<>]/.test(filePath)) {
+      throw new InvalidConfigurationError(`${description} contains unsafe shell characters: ${filePath}`)
+    }
+  }
+
+  private async ensurePathInside(baseDir: string, targetPath: string, description: string): Promise<string> {
+    const resolvedBaseDir = path.resolve(baseDir)
+    const resolvedTargetPath = path.resolve(targetPath)
+
+    let canonicalBaseDir = resolvedBaseDir
+    let canonicalTargetPath = resolvedTargetPath
+
+    try {
+      canonicalBaseDir = await fs.promises.realpath(resolvedBaseDir)
+    } catch {
+      canonicalBaseDir = resolvedBaseDir
+    }
+
+    try {
+      canonicalTargetPath = await fs.promises.realpath(resolvedTargetPath)
+    } catch {
+      // Target may not exist yet; resolve the parent to handle symlinks/junctions consistently
+      try {
+        const resolvedTargetParent = path.dirname(resolvedTargetPath)
+        const canonicalTargetParent = await fs.promises.realpath(resolvedTargetParent)
+        const relativeFromResolvedParent = path.relative(resolvedTargetParent, resolvedTargetPath)
+        if (
+          isEmptyOrSpaces(relativeFromResolvedParent) ||
+          path.isAbsolute(relativeFromResolvedParent) ||
+          relativeFromResolvedParent.split(path.sep).includes("..") ||
+          /[\0\r\n]/.test(relativeFromResolvedParent)
+        ) {
+          throw new InvalidConfigurationError(`${description} contains invalid path segments`)
+        }
+        canonicalTargetPath = path.resolve(canonicalTargetParent, relativeFromResolvedParent)
+      } catch (e: unknown) {
+        // Only fall back for filesystem errors (target parent not found, permission, etc.).
+        // Validation errors must propagate so callers get an actionable message.
+        if (e instanceof InvalidConfigurationError) {
+          throw e
+        }
+        canonicalTargetPath = resolvedTargetPath
+      }
+    }
+
+    const relativePath = path.relative(canonicalBaseDir, canonicalTargetPath)
+    if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+      throw new InvalidConfigurationError(`${description} must be inside ${canonicalBaseDir}`)
+    }
+    this.assertShellSafePath(canonicalTargetPath, description)
+    return canonicalTargetPath
+  }
+
+  private async generateStubExecutableExe(appOutDir: string, vendorDir: string) {
+    if (!path.isAbsolute(appOutDir) || !path.isAbsolute(vendorDir)) {
+      throw new InvalidConfigurationError("appOutDir and vendorDir must be absolute paths")
+    }
+
+    const files = await fs.promises.readdir(appOutDir, { withFileTypes: true })
+    const appExe = files.find(f => f.name === `${this.exeName}.exe`)
+    if (!appExe) {
+      throw new Error(`App executable not found in app directory: ${appOutDir}`)
+    }
+
+    const filePath = await this.ensurePathInside(appOutDir, path.join(appOutDir, appExe.name), "App executable path")
+    // a symlink at the name, from the copied app files, is replaced rather than resolved onto another file of the app
+    await prepareFixedNameWrite(appOutDir, path.join(appOutDir, `${this.exeName}_ExecutionStub.exe`), "Squirrel execution stub")
+    const stubExePath = await this.ensurePathInside(appOutDir, path.join(appOutDir, `${this.exeName}_ExecutionStub.exe`), "Stub executable path")
+    const stubExecutableSource = await this.ensurePathInside(vendorDir, path.join(vendorDir, "StubExecutable.exe"), "Stub executable source")
+    const writeZipToSetupExe = await this.ensurePathInside(vendorDir, path.join(vendorDir, "WriteZipToSetup.exe"), "WriteZipToSetup executable")
+
+    await fs.promises.copyFile(stubExecutableSource, stubExePath)
+    const wineVm = new WineVmManager(this.packager.config.toolsets?.wine, this.packager.buildResourcesDir)
+    await wineVm.exec(writeZipToSetupExe, ["--copy-stub-resources", filePath, stubExePath])
+    await this.packager.signIf(stubExePath)
+    log.debug({ file: filePath }, "signing app executable")
+    await this.packager.signIf(filePath)
   }
 
   async build(appOutDir: string, arch: Arch) {
+    this.checkMsiSigning()
     const packager = this.packager
     const version = packager.appInfo.version
     const sanitizedName = sanitizeFileName(this.appName)
 
-    // tslint:disable-next-line:no-invalid-template-strings
     const setupFile = packager.expandArtifactNamePattern(this.options, "exe", arch, "${productName} Setup ${version}.${ext}")
-    const packageFile = `${sanitizedName}-${convertVersion(version)}-full.nupkg`
-
     const installerOutDir = path.join(this.outDir, `squirrel-windows${getArchSuffix(arch)}`)
     const artifactPath = path.join(installerOutDir, setupFile)
+    const msiArtifactPath = path.join(installerOutDir, packager.expandArtifactNamePattern(this.options, "msi", arch, "${productName} Setup ${version}.${ext}"))
 
-    await packager.info.callArtifactBuildStarted({
+    await packager.emitArtifactBuildStarted({
       targetPresentableName: "Squirrel.Windows",
       file: artifactPath,
       arch,
     })
+    const distOptions = await this.computeEffectiveDistOptions(appOutDir, installerOutDir, setupFile)
+    // The stub, the re-signed app exe and Squirrel.exe are written into appOutDir, which the other targets of this pack read: wait for
+    // their queued work (zip/7z), and write here rather than in the queue so the sync targets built after this one see the final appOutDir.
+    await waitForPackWork(packager, appOutDir, arch)
+    await this.generateStubExecutableExe(appOutDir, distOptions.vendorDirectory)
+    await copySquirrelExe(appOutDir, distOptions.vendorDirectory)
 
-    if (arch === Arch.ia32) {
-      log.warn("For windows consider only distributing 64-bit or use nsis target, see https://github.com/electron-userland/electron-builder/issues/359#issuecomment-214851130")
-    }
+    this.buildQueueManager.add(async () => {
+      await withToolsetLock(() => createWindowsInstaller(distOptions))
 
-    const distOptions = await this.computeEffectiveDistOptions()
-    const squirrelBuilder = new SquirrelBuilder(distOptions, installerOutDir, packager)
-    await squirrelBuilder.buildInstaller({ setupFile, packageFile }, appOutDir, this.outDir, arch)
+      await packager.signAndEditResources(artifactPath, arch, installerOutDir)
 
-    await packager.info.callArtifactBuildCompleted({
-      file: artifactPath,
-      target: this,
-      arch,
-      safeArtifactName: `${sanitizedName}-Setup-${version}${getArchSuffix(arch)}.exe`,
-      packager: this.packager,
-    })
+      if (this.options.msi) {
+        await packager.signIf(msiArtifactPath)
+      }
 
-    const packagePrefix = `${this.appName}-${convertVersion(version)}-`
-    packager.info.dispatchArtifactCreated({
-      file: path.join(installerOutDir, `${packagePrefix}full.nupkg`),
-      target: this,
-      arch,
-      packager,
-    })
-    if (distOptions.remoteReleases != null) {
-      packager.info.dispatchArtifactCreated({
-        file: path.join(installerOutDir, `${packagePrefix}delta.nupkg`),
+      const safeArtifactName = (ext: string) => `${sanitizedName}-Setup-${version}${getArchSuffix(arch)}.${ext}`
+
+      await packager.emitArtifactBuildCompleted({
+        file: artifactPath,
+        target: this,
+        arch,
+        safeArtifactName: safeArtifactName("exe"),
+        packager: this.packager,
+      })
+
+      if (this.options.msi) {
+        await packager.emitArtifactCreated({
+          file: msiArtifactPath,
+          target: this,
+          arch,
+          safeArtifactName: safeArtifactName("msi"),
+          packager: this.packager,
+        })
+      }
+
+      const packagePrefix = `${this.appName}-${convertVersion(version)}-`
+      await packager.emitArtifactCreated({
+        file: path.join(installerOutDir, `${packagePrefix}full.nupkg`),
         target: this,
         arch,
         packager,
       })
-    }
+      if (distOptions.remoteReleases != null) {
+        await packager.emitArtifactCreated({
+          file: path.join(installerOutDir, `${packagePrefix}delta.nupkg`),
+          target: this,
+          arch,
+          packager,
+        })
+      }
 
-    packager.info.dispatchArtifactCreated({
-      file: path.join(installerOutDir, "RELEASES"),
-      target: this,
-      arch,
-      packager,
+      await packager.emitArtifactCreated({
+        file: path.join(installerOutDir, "RELEASES"),
+        target: this,
+        arch,
+        packager,
+      })
     })
   }
 
@@ -76,82 +247,133 @@ export default class SquirrelWindowsTarget extends Target {
     return this.options.name || this.packager.appInfo.name
   }
 
-  async computeEffectiveDistOptions(): Promise<SquirrelOptions> {
+  private get exeName() {
+    const name = this.packager.appInfo.productFilename || this.options.name || this.packager.appInfo.productName
+    return sanitizeFileName(name)
+  }
+
+  private select7zipArch(vendorDirectory: string, platform: NodeJS.Platform = process.platform, hostArch: string = os.arch()) {
+    // https://github.com/electron/windows-installer/blob/main/script/select-7z-arch.js
+    // Even if we're cross-compiling for a different arch like arm64,
+    // we still need to use the 7-Zip executable for the host arch.
+    // On macOS and Linux, Squirrel runs 7z.exe under Wine, which (like rcedit above) needs the x64 build:
+    // Wine on Apple Silicon only runs x64 code through Rosetta, and the other vendor exes already need an
+    // x86-capable Wine on arm64 Linux, so a native arm64 7-Zip is only picked on arm64 Windows.
+    // When arch-specific variants aren't present (vendor bundle ships a pre-selected 7z.exe),
+    // skip the copy — the bundle's 7z.exe is already correct.
+    const resolvedArch = platform === "win32" ? hostArch : "x64"
+    const archExe = path.join(vendorDirectory, `7z-${resolvedArch}.exe`)
+    const archDll = path.join(vendorDirectory, `7z-${resolvedArch}.dll`)
+    if (fs.existsSync(archExe)) {
+      fs.copyFileSync(archExe, path.join(vendorDirectory, "7z.exe"))
+    }
+    if (fs.existsSync(archDll)) {
+      fs.copyFileSync(archDll, path.join(vendorDirectory, "7z.dll"))
+    }
+  }
+
+  private async createNuspecTemplateWithProjectUrl() {
+    const templatePath = path.resolve(import.meta.dirname, "..", "template.nuspectemplate")
+    const projectUrl = await this.packager.appInfo.computePackageUrl()
+    if (projectUrl != null) {
+      const nuspecTemplate = await this.packager.tempDirManager.getTempFile({ prefix: "template", suffix: ".nuspectemplate" })
+      let templateContent = await fs.promises.readFile(templatePath, "utf8")
+      templateContent = addProjectUrl(templateContent, projectUrl)
+      await fs.promises.writeFile(nuspecTemplate, templateContent)
+      return nuspecTemplate
+    }
+    return templatePath
+  }
+
+  async computeEffectiveDistOptions(appDirectory: string, outputDirectory: string, setupFile: string): Promise<InstallerOptions> {
     const packager = this.packager
     let iconUrl = this.options.iconUrl
     if (iconUrl == null) {
-      const info = await packager.info.repositoryInfo
+      const info = await packager.repositoryInfo
       if (info != null) {
-        iconUrl = `https://github.com/${info.user}/${info.project}/blob/master/${packager.info.relativeBuildResourcesDirname}/icon.ico?raw=true`
+        iconUrl = `https://github.com/${info.user}/${info.project}/blob/master/${packager.relativeBuildResourcesDirname}/icon.ico?raw=true`
       }
 
       if (iconUrl == null) {
-        throw new InvalidConfigurationError(
-          "squirrelWindows.iconUrl is not specified, please see https://www.electron.build/configuration/squirrel-windows#SquirrelWindowsOptions-iconUrl"
-        )
+        throw new InvalidConfigurationError("squirrelWindows.iconUrl is not specified, please see https://www.electron.build/docs/squirrel-windows#iconurl")
       }
     }
 
-    checkConflictingOptions(this.options)
-
+    normalizeSquirrelOptions(this.options)
     const appInfo = packager.appInfo
-    const projectUrl = await appInfo.computePackageUrl()
-    const appName = this.appName
-    const options: SquirrelOptions = {
-      name: appName,
-      productName: this.options.name || appInfo.productName,
-      appId: this.options.useAppIdAsId ? appInfo.id : appName,
-      version: appInfo.version,
-      description: appInfo.description,
-      // better to explicitly set to empty string, to avoid any nugget errors
-      authors: appInfo.companyName || "",
-      iconUrl,
-      extraMetadataSpecs: projectUrl == null ? null : `\n    <projectUrl>${projectUrl}</projectUrl>`,
-      copyright: appInfo.copyright,
-      packageCompressionLevel: parseInt((process.env.ELECTRON_BUILDER_COMPRESSION_LEVEL || packager.compression === "store" ? 0 : 9) as any, 10),
-      vendorPath: await getBinFromUrl("Squirrel.Windows", "1.9.0", "zJHk4CMATM7jHJ2ojRH1n3LkOnaIezDk5FAzJmlSEQSiEdRuB4GGLCegLDtsRCakfHIVfKh3ysJHLjynPkXwhQ=="),
-      ...(this.options as any),
-    }
 
-    if (isEmptyOrSpaces(options.description)) {
-      options.description = options.productName
-    }
+    const description = isEmptyOrSpaces(appInfo.description) ? this.options.name || appInfo.productName : appInfo.description
 
-    if (options.remoteToken == null) {
-      options.remoteToken = process.env.GH_TOKEN || process.env.GITHUB_TOKEN
-    }
-
-    if (!("loadingGif" in options)) {
-      const resourceList = await packager.resourceList
-      if (resourceList.includes("install-spinner.gif")) {
-        options.loadingGif = path.join(packager.buildResourcesDir, "install-spinner.gif")
-      }
-    }
-
+    let remoteReleases: string | undefined
     if (this.options.remoteReleases === true) {
-      const info = await packager.info.repositoryInfo
+      const info = await packager.repositoryInfo
       if (info == null) {
         log.warn("remoteReleases set to true, but cannot get repository info")
       } else {
-        options.remoteReleases = `https://github.com/${info.user}/${info.project}`
-        log.info({ remoteReleases: options.remoteReleases }, `remoteReleases is set`)
+        remoteReleases = `https://github.com/${info.user}/${info.project}`
+        log.info({ remoteReleases }, `remoteReleases is set`)
       }
+    } else if (typeof this.options.remoteReleases === "string" && !isEmptyOrSpaces(this.options.remoteReleases)) {
+      remoteReleases = this.options.remoteReleases
     }
 
-    return options
+    let loadingGif: string
+    if (this.options.loadingGif) {
+      loadingGif = path.resolve(packager.projectDir, this.options.loadingGif)
+    } else {
+      // User-supplied buildResources gif wins; otherwise fall back to the bundled default spinner —
+      // parity with electron-winstaller, which always supplied resources/install-spinner.gif when none
+      // was configured (a fresh-install progress animation; never omitted).
+      loadingGif = (await packager.getResource(undefined, "install-spinner.gif")) ?? path.resolve(import.meta.dirname, "..", "install-spinner.gif")
+    }
+
+    const vendorDirectory = await this.prepareSignedVendorDirectory()
+    this.select7zipArch(vendorDirectory)
+
+    return {
+      appDirectory,
+      outputDirectory,
+      vendorDirectory,
+      name: this.options.useAppIdAsId ? appInfo.id : this.appName,
+      title: appInfo.productName || appInfo.name,
+      version: appInfo.version,
+      description,
+      exe: `${this.exeName}.exe`,
+      authors: appInfo.companyName || "",
+      nuspecTemplate: await this.createNuspecTemplateWithProjectUrl(),
+      iconUrl,
+      copyright: appInfo.copyright,
+      msi: this.options.msi,
+      fixUpPaths: true,
+      setupExe: setupFile,
+      setupMsi: this.options.msi ? setupFile.replace(/\.exe$/i, ".msi") : undefined,
+      loadingGif,
+      remoteReleases,
+      remoteToken: firstNonBlank(this.options.remoteToken, process.env.GH_TOKEN, process.env.GITHUB_TOKEN),
+      createTempDir: opts => this.packager.tempDirManager.createTempDir(opts),
+      externalLinks: await packager.getExternalLinkPolicy(),
+    }
   }
 }
 
-function checkConflictingOptions(options: any) {
+/** @internal */
+export function addProjectUrl(template: string, projectUrl: string): string {
+  const searchString = "<copyright><%- copyright %></copyright>"
+  return template.replace(searchString, `${searchString}\n    <projectUrl>${escapeForXml(projectUrl)}</projectUrl>`)
+}
+
+// `remoteToken: ""` (or whitespace) in the config counts as unset: fall through to the environment
+// instead of shadowing GH_TOKEN/GITHUB_TOKEN with a value SyncReleases would drop anyway.
+function firstNonBlank(...values: Array<string | null | undefined>): string | undefined {
+  const value = values.find(it => !isEmptyOrSpaces(it))
+  return value == null ? undefined : value.trim()
+}
+
+function normalizeSquirrelOptions(options: any) {
   for (const name of ["outputDirectory", "appDirectory", "exe", "fixUpPaths", "usePackageJson", "extraFileSpecs", "extraMetadataSpecs", "skipUpdateIcon", "setupExe"]) {
     if (name in options) {
       throw new InvalidConfigurationError(`Option ${name} is ignored, do not specify it.`)
     }
-  }
-
-  if ("noMsi" in options) {
-    log.warn(`noMsi is deprecated, please specify as "msi": true if you want to create an MSI installer`)
-    options.msi = !options.noMsi
   }
 
   const msi = options.msi

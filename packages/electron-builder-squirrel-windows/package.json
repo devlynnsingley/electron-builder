@@ -1,7 +1,20 @@
 {
   "name": "electron-builder-squirrel-windows",
-  "version": "22.11.10",
-  "main": "out/SquirrelWindowsTarget.js",
+  "version": "27.0.0-alpha.14",
+  "type": "module",
+  "main": "./dist/SquirrelWindowsTarget.js",
+  "exports": {
+    ".": {
+      "types": "./dist/SquirrelWindowsTarget.d.ts",
+      "import": "./dist/SquirrelWindowsTarget.js",
+      "require": "./dist/SquirrelWindowsTarget.js"
+    },
+    "./internal": {
+      "types": "./dist/indexInternal.d.ts",
+      "import": "./dist/indexInternal.js",
+      "require": "./dist/indexInternal.js"
+    }
+  },
   "author": "Vladimir Krivosheev",
   "license": "MIT",
   "repository": {
@@ -12,20 +25,21 @@
   "bugs": "https://github.com/electron-userland/electron-builder/issues",
   "homepage": "https://github.com/electron-userland/electron-builder",
   "files": [
-    "out"
+    "dist",
+    "template.nuspectemplate",
+    "template.wxs",
+    "install-spinner.gif"
   ],
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "build": "tsc --build tsconfig.build.json --force",
+    "watch": "tsc --build tsconfig.build.json --watch"
+  },
   "dependencies": {
     "app-builder-lib": "workspace:*",
-    "archiver": "^5.3.0",
-    "builder-util": "workspace:*",
-    "fs-extra": "^10.0.0"
+    "builder-util": "workspace:*"
   },
-  "devDependencies": {
-    "@types/archiver": "5.1.1",
-    "@types/fs-extra": "9.0.12"
-  },
-  "optionalDependencies": {
-    "7zip-bin": "~5.1.1"
-  },
-  "types": "./out/SquirrelWindowsTarget.d.ts"
+  "types": "./dist/SquirrelWindowsTarget.d.ts"
 }

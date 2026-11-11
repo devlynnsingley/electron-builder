@@ -1,5 +1,5 @@
-import { TargetSpecificOptions } from "../core"
-import { CommonWindowsInstallerConfiguration } from "./CommonWindowsInstallerConfiguration"
+import { TargetSpecificOptions } from "../core.js"
+import { CommonWindowsInstallerConfiguration } from "./CommonWindowsInstallerConfiguration.js"
 
 export interface MsiOptions extends CommonWindowsInstallerConfiguration, TargetSpecificOptions {
   /**
@@ -23,4 +23,9 @@ export interface MsiOptions extends CommonWindowsInstallerConfiguration, TargetS
    * Any additional arguments to be passed to the WiX installer compiler, such as `["-ext", "WixUtilExtension"]`
    */
   readonly additionalWixArgs?: Array<string> | null
+
+  /**
+   * Any additional arguments to be passed to the light.ext, such as `["-cultures:ja-jp"]`
+   */
+  readonly additionalLightArgs?: Array<string> | null
 }

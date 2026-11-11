@@ -1,0 +1,249 @@
+---
+title: "macOS"
+---
+
+{!./partials/_upgrading-from-v26.md!}
+
+The top-level [mac](configuration.md) key contains a set of options instructing electron-builder on how it should build macOS targets. These options are applicable to any macOS target.
+
+## macOS Target Overview
+
+electron-builder supports several macOS distribution formats. Choose based on your distribution channel:
+
+| Target | Best For | Signed? | Notarized? |
+|---|---|---|---|
+| `dmg` | Standard consumer distribution | Yes | Yes |
+| `zip` | Update servers (electron-updater), minimal package | Yes | Yes |
+| `pkg` | System-level installs, kernel extensions, launch daemons | Yes | Yes |
+| `mas` | Mac App Store distribution | Yes (Mac App Distribution) | No (MAS handles it) |
+| `mas-dev` | Local testing of MAS builds | Yes (Apple Development / Mac Developer) | No |
+| `7z`, `tar.*` | Archive formats, custom CDN distribution | Optional | Optional |
+| `dir` | Development/debugging — unpacked app | No | No |
+
+The default targets are `zip` and `dmg` (both are required for Squirrel.Mac auto-update).
+
+## Bundle ID
+
+The `appId` property sets the [CFBundleIdentifier](https://developer.apple.com/documentation/bundleresources/information_property_list/cfbundleidentifier) for your macOS app. This is a critical identifier — set it explicitly:
+
+```yaml
+appId: "com.mycompany.myapp"
+```
+
+- Use reverse-DNS format: `com.yourcompany.appname`
+- Must be unique in the Mac App Store if you intend to submit there
+- Changing it after first release will break existing user data paths (NSUserDefaults, sandboxed containers, etc.)
+
+## Architecture Support
+
+electron-builder supports building for multiple CPU architectures:
+
+| Architecture | CLI Flag | Description |
+|---|---|---|
+| `x64` | `--x64` | Intel 64-bit (traditional Mac) |
+| `arm64` | `--arm64` | Apple Silicon (M1, M2, M3, M4) |
+| `universal` | `--universal` | Fat binary containing both x64 and arm64 |
+
+### Universal Binaries
+
+A universal binary runs natively on both Intel and Apple Silicon Macs with no performance penalty:
+
+```yaml
+mac:
+  target:
+    - target: dmg
+      arch: universal
+```
+
+**Universal binary options:**
+
+- `mergeASARs` — merge x64 and arm64 ASAR archives into a single universal ASAR (`true` by default). Disable only if you have architecture-specific native modules that cannot be fat-binary merged.
+- `singleArchFiles` — glob pattern for files that may exist in only one of the two per-arch ASAR archives (e.g., pre-built native binaries distributed only for one arch). Matching files in `app.asar.unpacked` are copied as-is instead of being merged with `lipo`.
+- `x64ArchFiles` — glob pattern for single-arch Mach-O files that are identical in the x64 and arm64 builds (e.g., the same x64 binary shipped in both). These are copied as-is instead of being merged with `lipo`; any other such file fails the build. Binaries that are already universal in both builds need no pattern.
+
+In v27 these options live under `mac.universal` (a pass-through to [`@electron/universal`](https://github.com/electron/universal)) and only take effect when the target arch is `universal`:
+
+```yaml
+mac:
+  universal:
+    mergeASARs: true
+    singleArchFiles: "**/*.node"   # keep native modules as separate arch files
+```
+
+### Recommended: Build Per-Arch on Correct Hardware
+
+While cross-compilation is possible, the most reliable approach is to build `arm64` on Apple Silicon and `x64` on Intel (or use a matrix in CI). Universal builds work best when both arches are produced natively and then merged.
+
+## Code Signing
+
+macOS apps must be signed to avoid Gatekeeper warnings. See [Code Signing](features/code-signing/code-signing.md) for full setup.
+
+:::note[v27: signing options moved under mac.sign]
+In v27 every macOS signing option (`identity`, `entitlements`, `hardenedRuntime`, `type`, `provisioningProfile`, `binaries`, `requirements`, `timestamp`, …) lives inside a single `mac.sign` object (`sign.identity`, `sign.hardenedRuntime`, …); `signIgnore` is now `sign.ignore`. `electron-builder migrate-schema` rewrites the old flat keys automatically. The same structure applies to `mas` and `masDev`. See [v27 Breaking Changes → macOS signing](./migration/v27-config-changes.md#macos-signing-macsign).
+:::
+
+### Certificate Identity
+
+Use `mac.sign.identity` to specify the signing certificate by name:
+
+```yaml
+mac:
+  sign:
+    identity: "Developer ID Application: My Company (TEAM1234AB)"
+```
+
+Or use environment variables — the recommended approach for CI:
+
+```bash
+export CSC_LINK=/path/to/certificate.p12
+export CSC_KEY_PASSWORD=yourpassword
+```
+
+Set `mac.sign.identity: null` (or `mac.sign: null`) to skip signing entirely. Set `mac.sign.identity: "-"` to use an ad-hoc signature (app will only run on the machine that built it).
+
+:::warning[Ad-hoc signing and Hardened Runtime]
+If you disable code signing, you should also disable Hardened Runtime (`mac.sign.hardenedRuntime: false`), as the combination of no signing and enabled Hardened Runtime may prevent the app from launching.
+:::
+
+### Hardened Runtime
+
+`mac.sign.hardenedRuntime` is required for notarization on macOS 10.15+. It restricts what the app can do — you may need entitlements to allow capabilities. The default is `true` for standard `darwin` builds and `false` for Mac App Store builds (`mas` / `mas-dev`).
+
+## Entitlements
+
+**You usually do not need to write an entitlements file at all.** The defaults are already minimal and correct for a stock Electron app:
+
+| File being signed | Default entitlements |
+|---|---|
+| The app bundle | `com.apple.security.cs.allow-jit` |
+| Renderer / GPU helpers | `com.apple.security.cs.allow-jit` |
+| Plugin helper | `allow-jit`, `allow-unsigned-executable-memory`, `disable-library-validation` |
+| Frameworks, native modules, unpacked binaries | `allow-jit` plus osx-sign's Chromium-derived `device.*` / `personal-information.*` entitlements (`default.darwin.plist`) |
+
+Nested binaries do **not** inherit the app's entitlements. They are handed to [`@electron/osx-sign`](https://github.com/electron/osx-sign), which picks a per-file default modelled on Chromium's own entitlements: the looser exceptions go only to the plugin helper that actually needs them, and every other nested file (frameworks, `.node` modules, executables in `app.asar.unpacked`) receives `default.darwin.plist` — `allow-jit` plus `com.apple.security.device.{audio-input,bluetooth,camera,print,usb}` and `com.apple.security.personal-information.{location,photos-library}`. Outside the plugin helper, none of these defaults grant `disable-library-validation` or `allow-unsigned-executable-memory`.
+
+:::warning[Changed in v27]
+Earlier versions applied a single entitlements file to the app **and** every nested binary, granting `com.apple.security.cs.allow-unsigned-executable-memory` and `com.apple.security.cs.disable-library-validation` to every process. Modern Electron does not need either in the main process, and both materially weaken the Hardened Runtime, so they are no longer granted by default. If your app depends on them, add them to your own `build/entitlements.mac.plist` (and `build/entitlements.mac.inherit.plist` for nested binaries) — see [Loading third-party or unsigned binaries](#loading-third-party-or-unsigned-binaries) below.
+:::
+
+### Supplying your own entitlements
+
+Create `build/entitlements.mac.plist` to override the app-level defaults:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Required for JIT compilation (e.g., V8 in Electron) -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <!-- Add only the capabilities your app actually uses, e.g.: -->
+  <!-- <key>com.apple.security.device.camera</key> -->
+  <!-- <true/> -->
+</dict>
+</plist>
+```
+
+Your file **replaces** the default rather than extending it, so remember to keep `com.apple.security.cs.allow-jit`.
+
+A custom `build/entitlements.mac.plist` applies to the app bundle only — nested binaries keep the per-file defaults described above and do not pick up your custom keys. The inherit plist is for entitlements a *nested process* needs for itself — for example `disable-library-validation` on a sidecar executable in `app.asar.unpacked` that loads third-party libraries of its own, or on a helper process that loads native modules. In that case add `build/entitlements.mac.inherit.plist` (or set `mac.sign.entitlementsInherit`). Doing so applies one plist to every nested binary and gives up the per-file defaults, so prefer leaving it absent unless you need it.
+
+### Loading third-party or unsigned binaries
+
+`com.apple.security.cs.disable-library-validation` turns off macOS library validation for the whole process. Grant it only when your app loads a framework, plugin, or native module signed by a **different** Team ID (or not signed at all) — for example a sidecar binary downloaded at runtime, or one excluded from signing via `mac.sign.ignore`.
+
+Library validation is enforced by the process that loads the code, based on that process's own entitlements; what the library itself was signed with does not matter. A native module loaded by the main process therefore needs the key in `build/entitlements.mac.plist`; one loaded by a helper process (a `utilityProcess`, or a renderer with `nodeIntegration`) needs it in `build/entitlements.mac.inherit.plist` as well. The post-sign check below is skipped when the app entitlements grant it, because the main process is the usual loader.
+
+After signing, electron-builder inspects the Mach-O libraries and bundles in `app.asar.unpacked` and `Contents/PlugIns` (which electron-builder never re-signs) and warns if any of them carry a foreign or missing signature while the entitlement is absent, so you find out at build time rather than from a launch crash. Executables (such as a bundled `ffmpeg`) are spawned rather than loaded, so they are not subject to library validation and are not flagged.
+
+Ad-hoc builds (`mac.sign.identity: "-"`) are handled automatically: an ad-hoc signature carries no Team ID, so electron-builder applies a built-in ad-hoc entitlements file that includes `disable-library-validation` for the app and its nested binaries.
+
+electron-builder auto-detects `build/entitlements.mac.plist` and `build/entitlements.mac.inherit.plist` when present. To point at custom paths, set them under `mac.sign`:
+
+```yaml
+mac:
+  sign:
+    entitlements: build/entitlements.mac.plist
+    entitlementsInherit: build/entitlements.mac.inherit.plist
+```
+
+Common entitlements for Electron apps:
+
+| Entitlement | When Needed |
+|---|---|
+| `com.apple.security.cs.allow-jit` | Always — V8 requires JIT (granted by default) |
+| `com.apple.security.cs.allow-unsigned-executable-memory` | Legacy Electron only — not needed by modern V8/Electron and weakens the Hardened Runtime |
+| `com.apple.security.cs.disable-library-validation` | Loading frameworks/native modules signed by another team, or unsigned |
+| `com.apple.security.network.client` | Outgoing network connections (sandboxed apps) |
+| `com.apple.security.network.server` | Listening for connections (sandboxed apps) |
+| `com.apple.security.files.user-selected.read-write` | Open/save panels (sandboxed apps) |
+| `com.apple.security.device.camera` | Camera access |
+| `com.apple.security.device.microphone` | Microphone access |
+| `com.apple.security.app-sandbox` | Required for Mac App Store — see [MAS](mas.md) |
+
+:::info[Entitlements and Notarization]
+Notarization requires Hardened Runtime + appropriate entitlements. See [Notarization](features/code-signing/notarization.md) for the complete notarization workflow.
+:::
+
+## Info.plist Customization
+
+Inject arbitrary `Info.plist` keys using `extendInfo`:
+
+```yaml
+mac:
+  extendInfo:
+    NSMicrophoneUsageDescription: "This app uses the microphone for..."
+    NSCameraUsageDescription: "This app uses the camera for..."
+    LSMultipleInstancesProhibited: true
+    CFBundleURLTypes:
+      - CFBundleURLSchemes:
+          - myapp
+        CFBundleURLName: "com.mycompany.myapp"
+```
+
+For every target except `mas` and `mas-dev`, electron-builder adds App Transport Security entries that electron-updater's local update proxy needs: `NSAllowsLocalNetworking` and plain-HTTP exceptions for `localhost` and `127.0.0.1`. Electron's default `Info.plist` already enables `NSAllowsArbitraryLoads`; electron-builder keeps whatever value you set in `extendInfo` (and adds it as `true` if it is missing). To turn it off, set it to `false` (setting it to `null` does not remove the key, it is set to `true` again):
+
+```yaml
+mac:
+  extendInfo:
+    NSAppTransportSecurity:
+      NSAllowsArbitraryLoads: false
+```
+
+## Helper Bundle IDs
+
+Electron spawns several helper processes, each with its own bundle ID. electron-builder sets these automatically based on your `appId`, but you can override them:
+
+| Option | Default | Process |
+|---|---|---|
+| `helperBundleId` | `${appId}.helper` | Generic helper |
+| `helperRendererBundleId` | `${appId}.helper.Renderer` | Renderer process |
+| `helperPluginBundleId` | `${appId}.helper.Plugin` | Plugin helper |
+| `helperGPUBundleId` | `${appId}.helper.GPU` | GPU process |
+| `helperEHBundleId` | `${appId}.helper.EH` | Exception handler |
+| `helperNPBundleId` | `${appId}.helper.NP` | NP helper |
+
+You only need to override these if you have a specific naming requirement (e.g., for provisioning profiles that enumerate each helper ID explicitly).
+
+## Other Common Options
+
+**Dark mode:** Set `darkModeSupport: true` if your app supports the system dark mode. This adds the `NSRequiresAquaSystemAppearance: false` key to `Info.plist`.
+
+**Minimum system version:** `minimumSystemVersion` sets the `LSMinimumSystemVersion` in `Info.plist`. Electron itself has a minimum macOS version requirement — don't set this lower than Electron's requirement.
+
+**Signing additional binaries:** Use `mac.sign.binaries` to list paths to additional native binaries within your app bundle that need to be signed (e.g., embedded CLIs, helper tools).
+
+```yaml
+mac:
+  sign:
+    binaries:
+      - Contents/MacOS/my-native-helper
+      - Contents/Frameworks/MyFramework.framework/Versions/A/MyFramework
+```
+
+**Product / executable name validation:** As of v27, electron-builder rejects a `productName` or `executableName` that would require filename sanitization (so the generated `<Name> Helper.app` bundles stay consistent with `CFBundleName` and Electron's helper discovery). If a build fails with an "is not a valid macOS app bundle name" error, choose a name that needs no sanitization.
+
+## Configuration
+
+{!./app-builder-lib.Interface.MacConfiguration.md!}

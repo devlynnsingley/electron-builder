@@ -1,0 +1,83 @@
+name: Docker Deployment
+
+on:
+  # release:
+  #   types: [published]
+  # a new version of the private package docker, from the Release workflow (pr-release.yml) on master, which also pushes
+  # its tag docker@<version>. There is no tag trigger: the Docker Hub secrets are in the `release` environment, whose
+  # branch policy a run on a tag does not pass, so pushing a docker@ tag starts nothing
+  workflow_call:
+    # environment secrets of `release` (the deploy job): the caller has to pass them by name, or they are empty in a
+    # reusable workflow; required makes a caller that does not pass them fail
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LATEST_IMAGE_NODE_MAJOR_VERSION: 24
+
+jobs:
+  run-docker-build:
+    uses: $/.github/workflows/docker-build.yml
+
+  deploy:
+    name: Build and Push Docker
+    needs: run-docker-build
+    runs-on: ubuntu-24.04
+    # DOCKERHUB_USERNAME and DOCKERHUB_TOKEN; the environment allows master, release/* and changeset-release/* only, so
+    # a manual run (workflow_dispatch) has to be on one of them
+    environment: release
+    strategy:
+      # each Node.js version is pushed by its own job: a failed one must not cancel the others in the middle of their
+      # pushes. Re-run the failed jobs while the image artifacts are kept (a day, docker-build.yml)
+      fail-fast: false
+      matrix:
+        nodeMajorVersion: [
+          14, 16, 18, 20, 22, 24
+        ]
+    steps:
+      - name: Cleanup runner
+        uses: $/.github/actions/cleanup-runner
+
+      - name: Download images artifact - node${{ matrix.nodeMajorVersion }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: electron-builder-all-${{ matrix.nodeMajorVersion }}
+          path: ${{ runner.temp }}
+
+      - name: Load all images
+        run: docker image load --input "$RUNNER_TEMP/electron-builder-all-$NODE_MAJOR_VERSION.tar"
+        env:
+          NODE_MAJOR_VERSION: ${{ matrix.nodeMajorVersion }}
+
+      - name: Tag LTS (${{ env.LATEST_IMAGE_NODE_MAJOR_VERSION }}) images for electron-builder latest/wine/wine-chrome/wine-mono
+        if: ${{ matrix.nodeMajorVersion == env.LATEST_IMAGE_NODE_MAJOR_VERSION }}
+        run: |
+          docker image tag "electronuserland/builder:$LATEST_IMAGE_NODE_MAJOR_VERSION" electronuserland/builder:latest
+          docker image tag "electronuserland/builder:$LATEST_IMAGE_NODE_MAJOR_VERSION-wine" electronuserland/builder:wine
+          docker image tag "electronuserland/builder:$LATEST_IMAGE_NODE_MAJOR_VERSION-wine-mono" electronuserland/builder:wine-mono
+          docker image tag "electronuserland/builder:$LATEST_IMAGE_NODE_MAJOR_VERSION-wine-chrome" electronuserland/builder:wine-chrome
+
+      - name: List all images and tags
+        run: docker image ls -a
+
+      - name: Login to DockerHub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push all Docker images (workflow_dispatch test)
+        if: github.event_name == 'workflow_dispatch'
+        run: echo "TESTING step logic. (this would normally trigger docker push)"
+
+      - name: Push all Docker images
+        if: github.event_name != 'workflow_dispatch'
+        run: docker image push --all-tags electronuserland/builder
+

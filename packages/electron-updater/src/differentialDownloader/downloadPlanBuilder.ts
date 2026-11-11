@@ -1,5 +1,6 @@
-import { BlockMap, BlockMapFile } from "builder-util-runtime/out/blockMapApi"
-import { Logger } from "../main"
+import { BlockMap } from "builder-util-runtime"
+import { BlockMapFile } from "builder-util-runtime/internal"
+import { Logger } from "../types.js"
 
 export enum OperationKind {
   COPY,
@@ -25,7 +26,7 @@ export function computeOperations(oldBlockMap: BlockMap, newBlockMap: BlockMap, 
   let lastOperation: Operation | null = null
 
   // for now only one file is supported in block map
-  const blockMapFile = newBlockMap.files[0]
+  const blockMapFile: { name: string; offset: number } = newBlockMap.files[0]
   const operations: Array<Operation> = []
   const name = blockMapFile.name
   const oldEntry = nameToOldBlocks.get(name)
@@ -41,7 +42,7 @@ export function computeOperations(oldBlockMap: BlockMap, newBlockMap: BlockMap, 
 
   let newOffset = blockMapFile.offset
   for (let i = 0; i < newFile.checksums.length; newOffset += newFile.sizes[i], i++) {
-    const blockSize = newFile.sizes[i]
+    const blockSize: number = newFile.sizes[i]
     const checksum = newFile.checksums[i]
     let oldOffset = checksumToOldOffset.get(checksum)
     if (oldOffset != null && checksumToOldSize.get(checksum) !== blockSize) {
@@ -87,7 +88,72 @@ export function computeOperations(oldBlockMap: BlockMap, newBlockMap: BlockMap, 
   return operations
 }
 
-const isValidateOperationRange = process.env.DIFFERENTIAL_DOWNLOAD_PLAN_BUILDER_VALIDATE_RANGES === "true"
+/**
+ * COPY gaps shorter than this many bytes between two DOWNLOAD operations are downloaded through instead
+ * of being copied from the old file, so that `DOWNLOAD, COPY(gap), DOWNLOAD` becomes one DOWNLOAD range.
+ *
+ * Why 8 KiB: on hosts that serve one range per request (GitHub, S3 and friends — see
+ * `isUseMultipleRangeRequest`) every extra DOWNLOAD range costs a full sequential HTTP round trip plus
+ * ~1–1.5 KB of request/response headers, and on multipart hosts ~120 B of part framing plus a share of the
+ * request; re-downloading a few KiB of data that the old file already has is cheaper than that, and a
+ * plan with fewer, longer ranges also copies less from the old file (one `createReadStream` per COPY).
+ * With small content-defined blocks (1–2 KiB in a stored asar region) alternating one-block gaps are common.
+ */
+export const DOWNLOAD_GAP_COALESCE_THRESHOLD = 8 * 1024
+
+/**
+ * The threshold on hosts that answer one request with several ranges (`multipart/byteranges`): there an
+ * extra range only costs its ~120 B of part framing, so downloading through a gap pays off only below that.
+ */
+export const MULTIPART_DOWNLOAD_GAP_COALESCE_THRESHOLD = 256
+
+/** The gap threshold for a host, from the same `isUseMultipleRangeRequest` decision the downloader takes. */
+export function downloadGapCoalesceThreshold(isUseMultipleRangeRequest: boolean | undefined): number {
+  return isUseMultipleRangeRequest ? MULTIPART_DOWNLOAD_GAP_COALESCE_THRESHOLD : DOWNLOAD_GAP_COALESCE_THRESHOLD
+}
+
+/**
+ * Post-pass over a plan produced by {@link computeOperations}: merges every `DOWNLOAD, COPY…, DOWNLOAD`
+ * run whose COPY operations total fewer than `maxGap` bytes into a single DOWNLOAD covering the whole
+ * span of the new file. Operations are in new-file order and their lengths sum to the new file size, so
+ * the merged DOWNLOAD `[first.start, last.end)` has exactly the length of the operations it replaces and
+ * the total-size invariant checked by `DifferentialDownloader` is preserved. COPY-only plans and gaps of
+ * `maxGap` bytes or more are returned unchanged (the same objects, not copies).
+ */
+export function coalesceDownloadGaps(operations: Array<Operation>, maxGap: number = DOWNLOAD_GAP_COALESCE_THRESHOLD): Array<Operation> {
+  if (maxGap <= 0) {
+    return operations
+  }
+  const result: Array<Operation> = []
+  // index in `result` of the last DOWNLOAD, and the number of bytes copied since it (-1 = none / too far)
+  let lastDownloadIndex = -1
+  let gapSinceLastDownload = 0
+  for (const operation of operations) {
+    const length = operation.end - operation.start
+    if (operation.kind === OperationKind.COPY) {
+      if (lastDownloadIndex >= 0) {
+        gapSinceLastDownload += length
+      }
+      result.push(operation)
+      continue
+    }
+
+    const lastDownload = lastDownloadIndex >= 0 ? result[lastDownloadIndex] : null
+    // the gap must be small AND the operations must really be contiguous in the new file (defensive: a
+    // plan that is not in new-file order would otherwise be silently corrupted)
+    if (lastDownload != null && gapSinceLastDownload < maxGap && lastDownload.end + gapSinceLastDownload === operation.start) {
+      result.length = lastDownloadIndex + 1
+      result[lastDownloadIndex] = { kind: OperationKind.DOWNLOAD, start: lastDownload.start, end: operation.end }
+    } else {
+      result.push(operation)
+      lastDownloadIndex = result.length - 1
+    }
+    gapSinceLastDownload = 0
+  }
+  return result
+}
+
+const isValidateOperationRange = process.env["DIFFERENTIAL_DOWNLOAD_PLAN_BUILDER_VALIDATE_RANGES"] === "true"
 
 function validateAndAdd(operation: Operation, operations: Array<Operation>, checksum: string, index: number): void {
   if (isValidateOperationRange && operations.length !== 0) {
@@ -104,7 +170,6 @@ function validateAndAdd(operation: Operation, operations: Array<Operation>, chec
   operations.push(operation)
 }
 
-// eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 function buildChecksumMap(file: BlockMapFile, fileOffset: number, logger: Logger) {
   const checksumToOffset = new Map<string, number>()
   const checksumToSize = new Map<string, number>()

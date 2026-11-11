@@ -1,5 +1,1299 @@
 # electron-publish
 
+## 27.0.0-alpha.14
+### Patch Changes
+
+- Feat: binary, range-fetchable `.blockmap` format, chosen from `electronUpdaterCompatibility` (default raised to `>=7`). The block map published next to NSIS installers and macOS update zips is read by the electron-updater already installed in the users' apps, so its format follows the declared range: a range of electron-updater 7 and later (the new default) writes the binary map, a range that includes earlier versions writes the gzipped JSON map, with a once-per-build warning. The new `blockmap` option, `"v2" | "v3" | "latest"`, overrides the choice: `"v2"` is the JSON map (format version 2), `"v3"` the binary map (failing the build when the range includes electron-updater before 7), `"latest"` the newest format the range allows. The build also fails when the app's own electron-updater dependency is outside `electronUpdaterCompatibility`, e.g. electron-updater 6 with the default `>=7`: upgrade it, or set `electronUpdaterCompatibility: ">=6"` to keep the JSON map. _[`#10312`](https://github.com/electron-userland/electron-builder/pull/10312) [`c983462`](https://github.com/electron-userland/electron-builder/commit/c98346245aed022560e58bc7d435a6f9d04f5a78)_
+
+  The binary map is uncompressed with fixed-size tables (header, content-defined super-groups of groups, content-defined groups of blocks, 10-byte per-block records, with 8-byte hashes at every level). electron-updater fetches the header and super-group table with one `Range` request, matches super-groups against its cached previous map, fetches only the group entries of the super-groups that changed, matches those groups and fetches only the records of the groups that changed, verifies every hash, then runs the existing block-level plan and download pipeline. If that range fetch fails, it downloads the new map with a plain GET and stays differential. Because the map cost grows with the change rather than with the installer, the stored `app.asar` region (`nsis.differentialPackage: "store-asar"`, ideally with `asar.contentAlignment`) uses 512 B / 1 KiB / 2 KiB blocks and a block boundary at every packed file, and the 7z header of a differential-aware package is stored as is (`-mhc=off`) and chunked into its own small blocks, so a changed CRC no longer re-downloads the trailing block of the package (5–30 KB on every update). Builds that write the JSON map keep packages and block maps byte-for-byte as before. electron-updater tells the formats apart by the file's first bytes, so there is no extra artifact and `latest.yml` is unchanged. Installs still on electron-updater 6 download the first release with a binary map in full once; the update brings an updater that reads it. A format change between two releases costs the same one-time full download, logged once at `info`. Block maps embedded in an artifact (AppImage, NSIS web installer packages) stay JSON. A binary `.blockmap` is uploaded to S3 as `application/octet-stream`.
+
+  electron-updater additionally downloads through COPY gaps smaller than 8 KiB between two changed ranges on single-range hosts such as GitHub and S3 (one request per range there makes re-downloading a few KiB cheaper than an extra request), only up to 256 B on hosts that serve `multipart/byteranges`, and caps `multipart/byteranges` requests at 200 ranges (Apache's `MaxRanges` default; larger `Range` headers exceed common 8 KB header limits).
+- Fix: point the docs links in Bitbucket, Keygen, R2, Spaces and Squirrel.Windows configuration errors at existing sections _[`#10462`](https://github.com/electron-userland/electron-builder/pull/10462) [`4152802`](https://github.com/electron-userland/electron-builder/commit/41528020456f5483bad2ed8d640e9e53c5193ed4)_
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`c983462`](https://github.com/electron-userland/electron-builder/commit/c98346245aed022560e58bc7d435a6f9d04f5a78)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.13`
+- `builder-util@27.0.0-alpha.14`
+
+</details>
+
+## 27.0.0-alpha.13
+### Patch Changes
+
+- Fix: secrets in logs and error messages (passwords, tokens and keys in redacted command lines, environments and request options) are shown as a fingerprint keyed with a random secret of the process, derived with scrypt: the same value has the same fingerprint within a run, but a fingerprint cannot be checked against guessed values offline. A value whose fingerprint cannot be computed is shown as `<redacted>`. _[`#10441`](https://github.com/electron-userland/electron-builder/pull/10441) [`955cd00`](https://github.com/electron-userland/electron-builder/commit/955cd00bd32f4dff0fd5f120b5c7bdad92ea1d7f)_
+- Docs: split the v27 breaking-changes page into config, build, runtime and developer pages, point the migration links in build and updater messages at the page each change moved to, and add links to the v27 messages that had none _[`#10421`](https://github.com/electron-userland/electron-builder/pull/10421) [`b5e144d`](https://github.com/electron-userland/electron-builder/commit/b5e144dfeea1e0e8eaa13aec151457227ee4d7d5)_
+- Electron-builder starts the host programs it uses only from an absolute path, never by looking up a name on `PATH`: PowerShell, Wine, Mono (Squirrel.Windows on macOS and Linux), `prlctl`, `productbuild`, `pkgbuild`, `codesign`, `hdiutil`, `tiffutil`, `sips`, `actool`, `zip`, `notarytool` (passed to `@electron/notarize` as `notarytoolPath`, located with `/usr/bin/xcrun` by default), `lzip`, `snapcraft`, `flatpak` and `flatpak-builder`. Each comes from its default install locations or from the new `toolsets.executables` map, whose entries are `file://` URIs, or lists of them, that replace the defaults for that program. Child processes started without an explicit environment get no credential variables on Windows either, and `snapcraft upload` gets the store credentials but no other secret. The NSIS installer starts `tasklist` and `taskkill` from `$SYSDIR` (and passes the force flag in per-machine mode), the AppImage launcher runs the dialog tool it checked by its absolute path, and electron-updater on macOS starts `/usr/sbin/sysctl` and `/usr/bin/uname`. _[`#10430`](https://github.com/electron-userland/electron-builder/pull/10430) [`b98e1f2`](https://github.com/electron-userland/electron-builder/commit/b98e1f2910edaa14b554e603d3ff509c8b04ccf2)_
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`ed05bd0`](https://github.com/electron-userland/electron-builder/commit/ed05bd0f734dd3b898b9c43c81abd56c08d242ef) [`6393d7a`](https://github.com/electron-userland/electron-builder/commit/6393d7ae75d15da5147691b135c5bcc7aa520f35) [`5028cb3`](https://github.com/electron-userland/electron-builder/commit/5028cb37a21b8bdd6d9447e858eacfb8e3834004) [`2d97c85`](https://github.com/electron-userland/electron-builder/commit/2d97c85e3e3e63aade6497923d3012ce0569e414) [`955cd00`](https://github.com/electron-userland/electron-builder/commit/955cd00bd32f4dff0fd5f120b5c7bdad92ea1d7f) [`674e18d`](https://github.com/electron-userland/electron-builder/commit/674e18dd3e6d2720c46b42ce309cac83ae760e14) [`2d97c85`](https://github.com/electron-userland/electron-builder/commit/2d97c85e3e3e63aade6497923d3012ce0569e414) [`674e18d`](https://github.com/electron-userland/electron-builder/commit/674e18dd3e6d2720c46b42ce309cac83ae760e14) [`ed05bd0`](https://github.com/electron-userland/electron-builder/commit/ed05bd0f734dd3b898b9c43c81abd56c08d242ef) [`ed05bd0`](https://github.com/electron-userland/electron-builder/commit/ed05bd0f734dd3b898b9c43c81abd56c08d242ef) [`046f936`](https://github.com/electron-userland/electron-builder/commit/046f9365cf923a22dc1504297702b3625ed473fb) [`8366dc6`](https://github.com/electron-userland/electron-builder/commit/8366dc690ba5bc453c45f6ebbb8f8ad3561521df) [`b98e1f2`](https://github.com/electron-userland/electron-builder/commit/b98e1f2910edaa14b554e603d3ff509c8b04ccf2) [`a7f005c`](https://github.com/electron-userland/electron-builder/commit/a7f005ce837df409cc7cf9049e3eff74a2d5a503)
+
+</small>
+
+- `builder-util@27.0.0-alpha.13`
+- `builder-util-runtime@10.0.0-alpha.12`
+
+</details>
+
+## 27.0.0-alpha.12
+### Major Changes
+
+- Feat(s3)!: explicit AWS credential sources for S3 publishing via the new `awsCredentials` option (restores shared config / IAM Identity Center profiles, #10054) _[`#10257`](https://github.com/electron-userland/electron-builder/pull/10257) [`46be1f4`](https://github.com/electron-userland/electron-builder/commit/46be1f48e51a59b846ca76e631fc9e4e33348fb5)_
+
+  - `awsCredentials.source` is required to publish (no default, no implicit credentials).
+  - `awsCredentials.source: "env"` reads only `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, or the variable names given in `awsCredentials.env`.
+  - `awsCredentials.source: "profile"` with `profile` (plus optional `credentialsFile` / `configFile`) reads a named profile from the shared config and credentials files: static keys, IAM Identity Center (SSO), `credential_process` and assume-role. The AWS SDK providers are loaded lazily, only for non-static profiles, and are given explicit paths. Assume-role hops use an explicitly configured STS client (named profile's region, no configured endpoint URLs). `credential_source` and web identity (`web_identity_token_file`) are rejected anywhere in the chain, before the SDK is loaded.
+  - `awsCredentials.source: "sso-role-chain"` with `profile` resolves an assume-role profile whose `source_profile` chain (up to 5 hops, no cycles) starts at an IAM Identity Center (SSO) profile: the SSO profile is resolved from the configured files, then STS AssumeRole is called per hop with explicit region, endpoint and credentials (never `AWS_REGION`, `AWS_PROFILE` or `AWS_ENDPOINT_URL*`). `credential_source`, `mfa_serial`, web identity and `credential_process` are rejected in the chain. `source: "profile"` keeps rejecting SSO-sourced role chains and points to this source.
+  - Resolved credentials are reused for every file of a publish instead of being resolved again per upload.
+
+  BREAKING CHANGE: S3 publishing fails with an InvalidConfigurationError unless `awsCredentials.source` is set (add `{ "source": "env" }` to keep using `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`). `AWS_PROFILE`, `AWS_SDK_LOAD_CONFIG`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE` and an implicit `~/.aws/credentials` are no longer read. Missing credentials now fail with a clear error instead of an unsigned or env-fallback signature. For dotted bucket names without `region`, the region is looked up only when publishing. `awsCredentials` is never written to `app-update.yml`.
+
+### Patch Changes
+
+- Fix(deps): bump the @aws-sdk credential providers to drop the vulnerable fast-xml-parser 5.2.5, and reject `aws login` (`login_session`) profiles for `awsCredentials.source: "profile"` _[`#10394`](https://github.com/electron-userland/electron-builder/pull/10394) [`e021179`](https://github.com/electron-userland/electron-builder/commit/e0211790a42c88a968e65352256b78bddb8054c7)_
+- Fix: cancel GitHub upload retry delays _[`#10138`](https://github.com/electron-userland/electron-builder/pull/10138) [`3910c94`](https://github.com/electron-userland/electron-builder/commit/3910c945cf9a4610072d2a9a4a01ad0131dd67de)_
+- Fix(publish): detect aborted S3 responses via `close` instead of the deprecated `aborted` event, and report non-http(s) or unparseable S3 endpoints as configuration errors _[`#10349`](https://github.com/electron-userland/electron-builder/pull/10349) [`9e0137e`](https://github.com/electron-userland/electron-builder/commit/9e0137e41597720f2ba4b473b066e56e41bcf5de)_
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`45d3bc4`](https://github.com/electron-userland/electron-builder/commit/45d3bc431b5274b38b6b50b0b299d9ae6575469b) [`f8a6719`](https://github.com/electron-userland/electron-builder/commit/f8a6719bded7b02881f7b88778f1645a53321825) [`08d4a10`](https://github.com/electron-userland/electron-builder/commit/08d4a10765028f9a36c88aefcae4cbdc421dd358) [`538aef4`](https://github.com/electron-userland/electron-builder/commit/538aef405d68940cb1322147ab050c24eb581342) [`8b71ed8`](https://github.com/electron-userland/electron-builder/commit/8b71ed87224beed7c0674fdd312d54047095d965) [`0b508ab`](https://github.com/electron-userland/electron-builder/commit/0b508abc19243c7309931c693f7b91bc66d62fb9) [`370d18c`](https://github.com/electron-userland/electron-builder/commit/370d18cb25e18b204d9ddbaf010879f8939cbeef) [`b1460cc`](https://github.com/electron-userland/electron-builder/commit/b1460cc01adb394db3cffd1ba4b547b4181c562d) [`46be1f4`](https://github.com/electron-userland/electron-builder/commit/46be1f48e51a59b846ca76e631fc9e4e33348fb5) [`60e3708`](https://github.com/electron-userland/electron-builder/commit/60e3708955724138009f157cf0ad3f80a36ddeae) [`f8a6719`](https://github.com/electron-userland/electron-builder/commit/f8a6719bded7b02881f7b88778f1645a53321825)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.11`
+- `builder-util@27.0.0-alpha.12`
+
+</details>
+
+## 27.0.0-alpha.11
+### Patch Changes
+
+- Fix: encode GitLab publisher package path segments _[`#10140`](https://github.com/electron-userland/electron-builder/pull/10140) [`4b6e63f`](https://github.com/electron-userland/electron-builder/commit/4b6e63f3490a50806839fa44fb790612cf5da1a2)_
+- Fix: reject aborted S3 upload responses _[`#10145`](https://github.com/electron-userland/electron-builder/pull/10145) [`80c9c3f`](https://github.com/electron-userland/electron-builder/commit/80c9c3fdf4a332a00df2f2a4ad75428a24136c93)_
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`68aa2ff`](https://github.com/electron-userland/electron-builder/commit/68aa2ff1d5bc713819cd98bfb34c890fbe03a93a) [`ea41d9a`](https://github.com/electron-userland/electron-builder/commit/ea41d9af10840fbb56d60ff701e1282a0e16a6fb) [`2fdbcae`](https://github.com/electron-userland/electron-builder/commit/2fdbcae5b136c486d3afa3e564d032b5a79dae05) [`8854be3`](https://github.com/electron-userland/electron-builder/commit/8854be3dda9bc3f51a71ad44b51961b946a8c99e) [`5cbbc8d`](https://github.com/electron-userland/electron-builder/commit/5cbbc8de8e0fb585cfa97e80644e8a29ab7d8ff4) [`8f55928`](https://github.com/electron-userland/electron-builder/commit/8f5592839b6b2752754c19b8b7190ec86f55ef94) [`08e8044`](https://github.com/electron-userland/electron-builder/commit/08e80443d3470f2d6bf5a0075e54f4e906079c9b) [`434f6e9`](https://github.com/electron-userland/electron-builder/commit/434f6e98b017c14176be9aaf06891f09624c88fc)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.10`
+- `builder-util@27.0.0-alpha.11`
+
+</details>
+
+## 27.0.0-alpha.10
+
+### Patch Changes
+
+- Fix: encode Bitbucket delete filenames _[`#10150`](https://github.com/electron-userland/electron-builder/pull/10150) [`2f6d7d1`](https://github.com/electron-userland/electron-builder/commit/2f6d7d1c4bd8965909cf2e2fabbed95dc7c78d80) [@OskarEichler](https://github.com/OskarEichler)_
+- Chore: replace ESLint and Prettier with oxlint and oxfmt _[`#10240`](https://github.com/electron-userland/electron-builder/pull/10240) [`a578e53`](https://github.com/electron-userland/electron-builder/commit/a578e53441ede7f6fb3e9d69292dc135ef37ed17) [@claude](https://github.com/apps/claude)_
+- Fix: encode GitHub upload artifact names _[`#10139`](https://github.com/electron-userland/electron-builder/pull/10139) [`871e622`](https://github.com/electron-userland/electron-builder/commit/871e622e56f8fc77682eb17bba37341ac9f31188) [@OskarEichler](https://github.com/OskarEichler)_
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`6e84132`](https://github.com/electron-userland/electron-builder/commit/6e841322856c4d3aca91ae0783aa38f61fe21a40) [`ec9135d`](https://github.com/electron-userland/electron-builder/commit/ec9135d0626879479ffa4235006f06b14375cc43) [`4bc95cc`](https://github.com/electron-userland/electron-builder/commit/4bc95cce39b2862e798365dc4687443e64f001a1) [`7619d08`](https://github.com/electron-userland/electron-builder/commit/7619d08a1c02049b0dd40e043346e5263c0a3e50) [`ec9135d`](https://github.com/electron-userland/electron-builder/commit/ec9135d0626879479ffa4235006f06b14375cc43) [`ec9135d`](https://github.com/electron-userland/electron-builder/commit/ec9135d0626879479ffa4235006f06b14375cc43) [`a578e53`](https://github.com/electron-userland/electron-builder/commit/a578e53441ede7f6fb3e9d69292dc135ef37ed17)
+
+</small>
+
+- `builder-util@27.0.0-alpha.10`
+- `builder-util-runtime@10.0.0-alpha.9`
+
+</details>
+
+## 27.0.0-alpha.9
+
+### Minor Changes
+
+- Feat: v27 upgrade guardrails: make every breaking change self-announcing _[`#10182`](https://github.com/electron-userland/electron-builder/pull/10182) [`318f6fb`](https://github.com/electron-userland/electron-builder/commit/318f6fb93f9a6f92231320aa876db9e66bd78b6a) [@mmaietta](https://github.com/mmaietta)_
+
+### Patch Changes
+
+- Fix: normalize Snap Store channels _[`#10155`](https://github.com/electron-userland/electron-builder/pull/10155) [`ce9ee68`](https://github.com/electron-userland/electron-builder/commit/ce9ee68da690305e326e22927126327da6644392) [@OskarEichler](https://github.com/OskarEichler)_
+- Chore(deps): update form-data to 4.0.6 _[`#9973`](https://github.com/electron-userland/electron-builder/pull/9973) [`b370bdb`](https://github.com/electron-userland/electron-builder/commit/b370bdb621eeb78a25fc6a9aefa3088f1ebe3077) [@renovate](https://github.com/apps/renovate)_
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`d45536f`](https://github.com/electron-userland/electron-builder/commit/d45536f74e63e5c19dd4a590238521f6315812f5) [`6ab9a8c`](https://github.com/electron-userland/electron-builder/commit/6ab9a8c5fbed759e0c9e26064208c422c612b200)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.8`
+- `builder-util@27.0.0-alpha.9`
+
+</details>
+
+## 27.0.0-alpha.8
+
+### Patch Changes
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`cf39086`](https://github.com/electron-userland/electron-builder/commit/cf39086fbb71e34d1fef0359a026697153e6ee3b)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.7`
+- `builder-util@27.0.0-alpha.8`
+
+</details>
+
+## 27.0.0-alpha.7
+
+### Patch Changes
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`b87a0b7`](https://github.com/electron-userland/electron-builder/commit/b87a0b7a533eef1711e600864f2540dc163176d7)
+
+</small>
+
+- `builder-util@27.0.0-alpha.7`
+- `builder-util-runtime@10.0.0-alpha.6`
+
+</details>
+
+## 27.0.0-alpha.6
+
+### Minor Changes
+
+- Fix(publish): authenticate Bitbucket Cloud uploads with access tokens (Bearer auth) _[`#10023`](https://github.com/electron-userland/electron-builder/pull/10023) [`6d55fad`](https://github.com/electron-userland/electron-builder/commit/6d55fadaa7bdd94fdcc323f638ed54b774f86f3a) [@mmaietta](https://github.com/mmaietta)_
+
+  Bitbucket Cloud is deprecating app passwords (https://www.atlassian.com/blog/bitbucket/bitbucket-cloud-transitions-to-api-tokens). The Bitbucket publisher now selects the auth scheme by whether a username is set: with a username it sends HTTP Basic auth (Bitbucket username + app password, or Atlassian account email + API token); without a username it sends the token as a repository/project/workspace access token via `Authorization: Bearer`. Previously a token was always sent as Basic auth using the repo owner as the username, so access tokens could not be used.
+
+- Feat: add Cloudflare R2 publish provider _[`#9773`](https://github.com/electron-userland/electron-builder/pull/9773) [`a086ef3`](https://github.com/electron-userland/electron-builder/commit/a086ef37855406d0abe418ca1beeca605608b510) [@kyletaylored](https://github.com/kyletaylored)_
+
+### Patch Changes
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`a086ef3`](https://github.com/electron-userland/electron-builder/commit/a086ef37855406d0abe418ca1beeca605608b510) [`65f0403`](https://github.com/electron-userland/electron-builder/commit/65f04035f722199c7bbd5360f7ecbf2bf352a645) [`2c10f1f`](https://github.com/electron-userland/electron-builder/commit/2c10f1fe9c409379208aa5c0a5bc102689fb5cb6)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.5`
+- `builder-util@27.0.0-alpha.6`
+
+</details>
+
+## 27.0.0-alpha.5
+
+### Patch Changes
+
+- Chore(refactor): reducing duplicate code and extracting helper functions _[`#9947`](https://github.com/electron-userland/electron-builder/pull/9947) [`8f3d9fa`](https://github.com/electron-userland/electron-builder/commit/8f3d9fa442aae342c1c5d2a4448a687de1aff8df) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`2669c2a`](https://github.com/electron-userland/electron-builder/commit/2669c2a7c7e9b6c3d8f7789362ffa5d7aac3fbf6) [`8f3d9fa`](https://github.com/electron-userland/electron-builder/commit/8f3d9fa442aae342c1c5d2a4448a687de1aff8df)
+
+</small>
+
+- `builder-util@27.0.0-alpha.5`
+- `builder-util-runtime@10.0.0-alpha.4`
+
+</details>
+
+## 27.0.0-alpha.4
+
+### Patch Changes
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`deafee9`](https://github.com/electron-userland/electron-builder/commit/deafee9fe5f7bccbf52e73cd0c6085e767f921ce)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.3`
+- `builder-util@27.0.0-alpha.4`
+
+</details>
+
+## 27.0.0-alpha.3
+
+### Patch Changes
+
+- Fix: declare the missing `electron-publish` dependency on `electron-builder`, and switch type-checking to `nodenext` module resolution so the compiler models Node's real ESM loader _[`#9885`](https://github.com/electron-userland/electron-builder/pull/9885) [`96e47b5`](https://github.com/electron-userland/electron-builder/commit/96e47b5b89b76c719b1c06cfdd62a9a17376484e) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`ef61dd5`](https://github.com/electron-userland/electron-builder/commit/ef61dd5f47ab0b203e76c506394bf4bc1ee9bf00) [`594cfa1`](https://github.com/electron-userland/electron-builder/commit/594cfa1ded3ab4bcb46eac1720b9f9930ed1fbb5) [`96e47b5`](https://github.com/electron-userland/electron-builder/commit/96e47b5b89b76c719b1c06cfdd62a9a17376484e)
+
+</small>
+
+- `builder-util@27.0.0-alpha.3`
+- `builder-util-runtime@10.0.0-alpha.2`
+
+</details>
+
+## 27.0.0-alpha.2
+
+### Patch Changes
+
+- Fix: resolve runtime ESM/CJS interop for namespace imports of CJS-only packages (`sax`, `which`, `mime`) _[`#9884`](https://github.com/electron-userland/electron-builder/pull/9884) [`7674e60`](https://github.com/electron-userland/electron-builder/commit/7674e6092645df5c7ae0a31530446efe449cd3d6) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`7674e60`](https://github.com/electron-userland/electron-builder/commit/7674e6092645df5c7ae0a31530446efe449cd3d6)
+
+</small>
+
+- `builder-util-runtime@10.0.0-alpha.1`
+- `builder-util@27.0.0-alpha.2`
+
+</details>
+
+## 27.0.0-alpha.0
+
+### Major Changes
+
+- Chore(refactor): remove deprecated `snap` config property and all remaining deprecated APIs. Hard-deletes 14 deprecated features accumulated across the codebase. No migration shims remain. (BREAKING) _[`#9873`](https://github.com/electron-userland/electron-builder/pull/9873) [`9d755c6`](https://github.com/electron-userland/electron-builder/commit/9d755c68f845d169c9b68963c9711d2e75b4800b) [@mmaietta](https://github.com/mmaietta)_
+- Feat!: migrate to native ESM, require Node.js >=22.12.0, remove electron-compile _[`#9544`](https://github.com/electron-userland/electron-builder/pull/9544) [`a5121de`](https://github.com/electron-userland/electron-builder/commit/a5121de49582eaa8870d4c05e6ae55eff160a592) [@mmaietta](https://github.com/mmaietta)_
+
+### Patch Changes
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`f8feadb`](https://github.com/electron-userland/electron-builder/commit/f8feadb0c39934565197d69248274fd62173a94e) [`e59504d`](https://github.com/electron-userland/electron-builder/commit/e59504d122c245c08f70218badce057655c1c022) [`02a8042`](https://github.com/electron-userland/electron-builder/commit/02a80426840cda286840f25d28f1ecfce99885db) [`9d755c6`](https://github.com/electron-userland/electron-builder/commit/9d755c68f845d169c9b68963c9711d2e75b4800b) [`a5121de`](https://github.com/electron-userland/electron-builder/commit/a5121de49582eaa8870d4c05e6ae55eff160a592)
+
+</small>
+
+- `builder-util@27.0.0-alpha.0`
+- `builder-util-runtime@10.0.0-alpha.0`
+
+</details>
+
+## 26.15.3
+
+### Patch Changes
+
+- Fix(publish): set x-amz-content-sha256: UNSIGNED-PAYLOAD before SigV4 signing so S3 accepts streaming PutObject uploads _[`#9863`](https://github.com/electron-userland/electron-builder/pull/9863) [`818a89f`](https://github.com/electron-userland/electron-builder/commit/818a89f4c3087ed53498d781bf0bb1ca4807d03d) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`35bfdeb`](https://github.com/electron-userland/electron-builder/commit/35bfdebe47f412c3bf14bc5d1b9d833bfa1ec7d4)
+
+</small>
+
+- `builder-util@26.15.3`
+
+</details>
+
+## 26.15.1
+
+### Patch Changes
+
+- Chore: `ci:validate` lint fixes, `ci:test:fetch-cache` simplification, and code cleanup _[`#9840`](https://github.com/electron-userland/electron-builder/pull/9840) [`588ff48`](https://github.com/electron-userland/electron-builder/commit/588ff4854e9c0efa13539fed14b2711a708c8c7a) [@mmaietta](https://github.com/mmaietta)_
+
+## 26.15.0
+
+### Patch Changes
+
+- Fix: holistic field detection for sha256 hash redaction _[`#9834`](https://github.com/electron-userland/electron-builder/pull/9834) [`22a7532`](https://github.com/electron-userland/electron-builder/commit/22a7532bd01b9fb42cff7c58d599c7ad683569fe) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`198c10c`](https://github.com/electron-userland/electron-builder/commit/198c10c9693d1244bac80cb11af6b75ad363e5a0) [`01b8ba9`](https://github.com/electron-userland/electron-builder/commit/01b8ba979d1db44543e18d07b4ad94953deb10ea) [`22a7532`](https://github.com/electron-userland/electron-builder/commit/22a7532bd01b9fb42cff7c58d599c7ad683569fe)
+
+</small>
+
+- `builder-util-runtime@9.7.0`
+- `builder-util@26.15.0`
+
+</details>
+
+## 26.14.0
+
+### Patch Changes
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`0e67339`](https://github.com/electron-userland/electron-builder/commit/0e67339e0177e4bacf57845356d27020918803b3)
+
+</small>
+
+- `builder-util@26.14.0`
+
+</details>
+
+## 26.13.0
+
+### Minor Changes
+
+- Feat: migrate app-builder-bin functions to pure JS (`certificate-info`, `ksuid`, `get-bucket-location`, `publish-s3`) _[`#9733`](https://github.com/electron-userland/electron-builder/pull/9733) [`1bc92ff`](https://github.com/electron-userland/electron-builder/commit/1bc92ff4b21003536dfe161fb679b6a76713cd38) [@mmaietta](https://github.com/mmaietta)_
+
+### Patch Changes
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`1bc92ff`](https://github.com/electron-userland/electron-builder/commit/1bc92ff4b21003536dfe161fb679b6a76713cd38) [`59efef1`](https://github.com/electron-userland/electron-builder/commit/59efef1a8b81ed1ead4e8004043726d2b49cf81f)
+
+</small>
+
+- `builder-util@26.13.0`
+- `builder-util-runtime@9.6.3`
+
+</details>
+
+## 26.12.1
+
+### Patch Changes
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`d6a5aee`](https://github.com/electron-userland/electron-builder/commit/d6a5aee821138449dc0c082606da6a1bf5ba0798) [`4866737`](https://github.com/electron-userland/electron-builder/commit/4866737e4fe1f0cca210d318b9ce440f8e978a63)
+
+</small>
+
+- `builder-util-runtime@9.6.2`
+- `builder-util@26.12.1`
+
+</details>
+
+## 26.12.0
+
+### Minor Changes
+
+- Feat: adding support for core24 snapcraft and refactoring support to a new config property `snapcraft` to maintain backward compatibility _[`#9517`](https://github.com/electron-userland/electron-builder/pull/9517) [`059fffd`](https://github.com/electron-userland/electron-builder/commit/059fffd5b9aabd72e9a8b592b9b7cef4a9e063ef) [@mmaietta](https://github.com/mmaietta)_
+
+### Patch Changes
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`059fffd`](https://github.com/electron-userland/electron-builder/commit/059fffd5b9aabd72e9a8b592b9b7cef4a9e063ef) [`bfd1c1b`](https://github.com/electron-userland/electron-builder/commit/bfd1c1bb23b985b3fc44bcb4bb028fa0496d4638) [`2181fd0`](https://github.com/electron-userland/electron-builder/commit/2181fd02850101002fd82e463b9e0ed93d44fc7b)
+
+</small>
+
+- `builder-util@26.12.0`
+
+</details>
+
+## 26.11.1
+
+### Patch Changes
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`b8c6a15`](https://github.com/electron-userland/electron-builder/commit/b8c6a1545b61d3c285f28d39100e9c7ff4e4192f)
+
+</small>
+
+- `builder-util@26.11.1`
+
+</details>
+
+## 26.11.0
+
+### Patch Changes
+
+- Chore(docs): documentation updates and docusaurus migration _[`#9744`](https://github.com/electron-userland/electron-builder/pull/9744) [`d846315`](https://github.com/electron-userland/electron-builder/commit/d84631587d816a1aa0bff57680bab0f865d7a84f) [@mmaietta](https://github.com/mmaietta)_
+- Fix: prevent double progress bar from displaying _[`#9743`](https://github.com/electron-userland/electron-builder/pull/9743) [`2583fd1`](https://github.com/electron-userland/electron-builder/commit/2583fd17b1ef6d752b00df7302294dc13d3dfb9d) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`d846315`](https://github.com/electron-userland/electron-builder/commit/d84631587d816a1aa0bff57680bab0f865d7a84f) [`56d8331`](https://github.com/electron-userland/electron-builder/commit/56d83314596803e4c3973b3c2a4eb2b838eb0edf) [`8a98647`](https://github.com/electron-userland/electron-builder/commit/8a98647f79c19fff7e7f5347d0a1ff80db18520e)
+
+</small>
+
+- `builder-util-runtime@9.6.1`
+- `builder-util@26.11.0`
+
+</details>
+
+## 26.10.0
+
+### Patch Changes
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`5be28a6`](https://github.com/electron-userland/electron-builder/commit/5be28a61de2aa1f344651a506044b2e897832660) [`c82bec1`](https://github.com/electron-userland/electron-builder/commit/c82bec161d07b1df8adc5cd80a495c4ff0829373)
+
+</small>
+
+- `builder-util@26.10.0`
+
+</details>
+
+## 26.9.0
+
+### Minor Changes
+
+- Feat: pass release notes to GitHub/GitLab release body via `releaseBody` and `releaseName` options _[`#9581`](https://github.com/electron-userland/electron-builder/pull/9581) [`b7df0bc`](https://github.com/electron-userland/electron-builder/commit/b7df0bcef5790814fd6df187346dcec625dc681e) [@asamofal](https://github.com/asamofal)_
+
+### Patch Changes
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`b7df0bc`](https://github.com/electron-userland/electron-builder/commit/b7df0bcef5790814fd6df187346dcec625dc681e)
+
+</small>
+
+- `builder-util-runtime@9.6.0`
+- `builder-util@26.9.0`
+
+</details>
+
+## 26.8.1
+
+### Patch Changes
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`4edd695`](https://github.com/electron-userland/electron-builder/commit/4edd6950454d369ef8994e5a1ad64f1d0c7b7643)
+
+</small>
+
+- `builder-util@26.8.1`
+
+</details>
+
+## 26.8.0
+
+### Patch Changes
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`cd7c0d9`](https://github.com/electron-userland/electron-builder/commit/cd7c0d9a73cf63e2125ef5873bd0c2f392c211dc) [`9ba36f9`](https://github.com/electron-userland/electron-builder/commit/9ba36f98791bc8d2393297dbca1133d03be6260a)
+
+</small>
+
+- `builder-util@26.8.0`
+
+</details>
+
+## 26.6.0
+
+### Patch Changes
+
+- Chore(deps): updating electron/rebuild, tar, and form-data to latest releases _[`#9528`](https://github.com/electron-userland/electron-builder/pull/9528) [`e46b407`](https://github.com/electron-userland/electron-builder/commit/e46b4074edf8c74849738d2dafcdb106da47e27c) [@mmaietta](https://github.com/mmaietta)_
+
+## 26.4.1
+
+### Patch Changes
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`97e5503`](https://github.com/electron-userland/electron-builder/commit/97e5503cecfcdfd9dddf1c4b321d52b5d5a94f83)
+
+</small>
+
+- `builder-util@26.4.1`
+
+</details>
+
+## 26.3.4
+
+### Patch Changes
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`2faee4d`](https://github.com/electron-userland/electron-builder/commit/2faee4d941d16c6f52d6c793c709a77ccfb79d0a) [`da1d768`](https://github.com/electron-userland/electron-builder/commit/da1d7687c6d2d2db8e319e371ba001c946bf130c)
+
+</small>
+
+- `builder-util@26.3.4`
+
+</details>
+
+## 26.3.1
+
+### Patch Changes
+
+<details><summary>Updated 1 dependency</summary>
+
+<small>
+
+[`ec0a851`](https://github.com/electron-userland/electron-builder/commit/ec0a85179b4508c372667f55e395d8b27c58a046)
+
+</small>
+
+- `builder-util@26.3.1`
+
+</details>
+
+## 26.3.0
+
+### Patch Changes
+
+- Chore: bumping version packages of all packages to trigger Trusted Signing provedance release _[`#9362`](https://github.com/electron-userland/electron-builder/pull/9362) [`030269b`](https://github.com/electron-userland/electron-builder/commit/030269bca94b5e3621dbf8883976e1f85a1524f0) [@mmaietta](https://github.com/mmaietta)_
+
+<details><summary>Updated 2 dependencies</summary>
+
+<small>
+
+[`030269b`](https://github.com/electron-userland/electron-builder/commit/030269bca94b5e3621dbf8883976e1f85a1524f0)
+
+</small>
+
+- `builder-util@26.3.0`
+- `builder-util-runtime@9.5.1`
+
+</details>
+
+## 26.1.0
+
+### Minor Changes
+
+- [#9209](https://github.com/electron-userland/electron-builder/pull/9209) [`6fd391d9e8390c00c8b0674d8ac3a5b7b6f0f19f`](https://github.com/electron-userland/electron-builder/commit/6fd391d9e8390c00c8b0674d8ac3a5b7b6f0f19f) Thanks [@daihere1993](https://github.com/daihere1993)! - feat: Support gitlab publisher
+
+### Patch Changes
+
+- Updated dependencies [[`6fd391d9e8390c00c8b0674d8ac3a5b7b6f0f19f`](https://github.com/electron-userland/electron-builder/commit/6fd391d9e8390c00c8b0674d8ac3a5b7b6f0f19f)]:
+  - builder-util-runtime@9.5.0
+  - builder-util@26.1.0
+
+## 26.0.20
+
+### Patch Changes
+
+- [#9216](https://github.com/electron-userland/electron-builder/pull/9216) [`44b28997`](https://github.com/electron-userland/electron-builder/commit/44b28997f15314730d1bb69303a47dc26f7950d1) Thanks [@taylorhadden](https://github.com/taylorhadden)! - feat(github): Add `tagNamePrefix` option and deprecate `vPrefixedTagName`
+
+- Updated dependencies [[`44b28997`](https://github.com/electron-userland/electron-builder/commit/44b28997f15314730d1bb69303a47dc26f7950d1), [`7c7fd6ca`](https://github.com/electron-userland/electron-builder/commit/7c7fd6ca240eda72048835f754adac92c4ab4e8c), [`c54a0609`](https://github.com/electron-userland/electron-builder/commit/c54a0609753a11d032f87e727eccbab1f6836081)]:
+  - builder-util-runtime@9.4.0
+  - builder-util@26.0.20
+
+## 26.0.19
+
+### Patch Changes
+
+- Updated dependencies [[`1a6ea016`](https://github.com/electron-userland/electron-builder/commit/1a6ea016b7793c75e7586e0e14d5f26d3535c292), [`35f5f6e5`](https://github.com/electron-userland/electron-builder/commit/35f5f6e55762ffc377fcd5587a8cea8753184d50)]:
+  - builder-util-runtime@9.3.3
+  - builder-util@26.0.19
+
+## 26.0.17
+
+### Patch Changes
+
+- Updated dependencies [[`a6be444c`](https://github.com/electron-userland/electron-builder/commit/a6be444c90e59bbe92c53e94d7a5070f1399651f), [`3128991a`](https://github.com/electron-userland/electron-builder/commit/3128991a1b0057e9a98903ff379022954da28135)]:
+  - builder-util@26.0.17
+
+## 26.0.16
+
+### Patch Changes
+
+- Updated dependencies [[`b62737d8`](https://github.com/electron-userland/electron-builder/commit/b62737d8c4528c04c78a490cc4dca8cdadbeaaac)]:
+  - builder-util@26.0.16
+
+## 26.0.13
+
+### Patch Changes
+
+- Updated dependencies [[`106640dd`](https://github.com/electron-userland/electron-builder/commit/106640dd42a3db08bfbe3a3a32fe333e93ba5c10), [`a2f7f735`](https://github.com/electron-userland/electron-builder/commit/a2f7f7350be2379c4917417c92ece5a6ab241708)]:
+  - builder-util@26.0.13
+  - builder-util-runtime@9.3.2
+
+## 26.0.11
+
+### Patch Changes
+
+- Updated dependencies [[`53a81939`](https://github.com/electron-userland/electron-builder/commit/53a81939b8c46061027ab36d8f9114c35b250a7e)]:
+  - builder-util@26.0.11
+
+## 26.0.7
+
+### Patch Changes
+
+- Updated dependencies [[`c12f86f2`](https://github.com/electron-userland/electron-builder/commit/c12f86f2e254809e70d1f60d89cf9b7264278083)]:
+  - builder-util@26.0.7
+
+## 26.0.4
+
+### Patch Changes
+
+- Updated dependencies [[`8b059ad3`](https://github.com/electron-userland/electron-builder/commit/8b059ad3baad440acb0994b2c52f22ea0f1d987f)]:
+  - builder-util@26.0.4
+
+## 26.0.1
+
+### Patch Changes
+
+- [#8815](https://github.com/electron-userland/electron-builder/pull/8815) [`8e7811d1`](https://github.com/electron-userland/electron-builder/commit/8e7811d18de3acb39ce9253cf2cd9afa4e23f99c) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: "organize imports" + change `ObjectMap` => `Record` for non-external properties (i.e. things that don't get processed for `scheme.json`)
+
+- Updated dependencies [[`8e7811d1`](https://github.com/electron-userland/electron-builder/commit/8e7811d18de3acb39ce9253cf2cd9afa4e23f99c), [`07429661`](https://github.com/electron-userland/electron-builder/commit/07429661c0da2248cec5b92eb03390ae19266328), [`62997b08`](https://github.com/electron-userland/electron-builder/commit/62997b087065650d263581fa17a2c0531039fcd9)]:
+  - builder-util@26.0.1
+  - builder-util-runtime@9.3.1
+
+## 26.0.0
+
+### Minor Changes
+
+- [#8741](https://github.com/electron-userland/electron-builder/pull/8741) [`eacbbf59`](https://github.com/electron-userland/electron-builder/commit/eacbbf593f6ea01a92ffb41d8d28ee5e4e480ea1) Thanks [@0xlau](https://github.com/0xlau)! - Add `forcePathStyle` option to S3Options
+
+- [#8711](https://github.com/electron-userland/electron-builder/pull/8711) [`6f0fb8e4`](https://github.com/electron-userland/electron-builder/commit/6f0fb8e44f035bcd6ff0d6f234b38c20fde066af) Thanks [@hrueger](https://github.com/hrueger)! - Add `host` property to support self-hosted Keygen instances
+
+### Patch Changes
+
+- [#8596](https://github.com/electron-userland/electron-builder/pull/8596) [`e0b0e351`](https://github.com/electron-userland/electron-builder/commit/e0b0e351baecc29e08d9f7d90f4699150b229416) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: refactor files for publishing to electron-publish
+
+- [#8631](https://github.com/electron-userland/electron-builder/pull/8631) [`dcd91a1f`](https://github.com/electron-userland/electron-builder/commit/dcd91a1f79be5bde7bb418b0eaa83d03f11d41fe) Thanks [@olivereisenhut](https://github.com/olivereisenhut)! - fix: Remove path from published binaries
+
+- Updated dependencies [[`f4d40f91`](https://github.com/electron-userland/electron-builder/commit/f4d40f91f1511fc55cbef7c9e7edfddaf6ab67bc), [`e0b0e351`](https://github.com/electron-userland/electron-builder/commit/e0b0e351baecc29e08d9f7d90f4699150b229416), [`eacbbf59`](https://github.com/electron-userland/electron-builder/commit/eacbbf593f6ea01a92ffb41d8d28ee5e4e480ea1), [`6f0fb8e4`](https://github.com/electron-userland/electron-builder/commit/6f0fb8e44f035bcd6ff0d6f234b38c20fde066af), [`6a6bed46`](https://github.com/electron-userland/electron-builder/commit/6a6bed46c428b45105ada071a9cb89b5d4f93d9e), [`3eab7143`](https://github.com/electron-userland/electron-builder/commit/3eab7143d74262caace81ea05e97617d07daf336), [`a5558e33`](https://github.com/electron-userland/electron-builder/commit/a5558e3380fdde4806c4c29694d4fe70fd11423a), [`d4ea0d99`](https://github.com/electron-userland/electron-builder/commit/d4ea0d998d0fb3ea3a75ca8d39a69a2f3c710962), [`b8185d48`](https://github.com/electron-userland/electron-builder/commit/b8185d48a75e65932196700e28bf71613dd141b4)]:
+  - builder-util@26.0.0
+  - builder-util-runtime@9.3.0
+
+## 26.0.0-alpha.10
+
+### Patch Changes
+
+- Updated dependencies [[`a5558e33`](https://github.com/electron-userland/electron-builder/commit/a5558e3380fdde4806c4c29694d4fe70fd11423a)]:
+  - builder-util@26.0.0-alpha.10
+
+## 26.0.0-alpha.8
+
+### Minor Changes
+
+- [#8741](https://github.com/electron-userland/electron-builder/pull/8741) [`eacbbf59`](https://github.com/electron-userland/electron-builder/commit/eacbbf593f6ea01a92ffb41d8d28ee5e4e480ea1) Thanks [@0xlau](https://github.com/0xlau)! - Add `forcePathStyle` option to S3Options
+
+- [#8711](https://github.com/electron-userland/electron-builder/pull/8711) [`6f0fb8e4`](https://github.com/electron-userland/electron-builder/commit/6f0fb8e44f035bcd6ff0d6f234b38c20fde066af) Thanks [@hrueger](https://github.com/hrueger)! - Add `host` property to support self-hosted Keygen instances
+
+### Patch Changes
+
+- Updated dependencies [[`eacbbf59`](https://github.com/electron-userland/electron-builder/commit/eacbbf593f6ea01a92ffb41d8d28ee5e4e480ea1), [`6f0fb8e4`](https://github.com/electron-userland/electron-builder/commit/6f0fb8e44f035bcd6ff0d6f234b38c20fde066af)]:
+  - builder-util@26.0.0-alpha.8
+  - builder-util-runtime@9.3.0-alpha.0
+
+## 26.0.0-alpha.7
+
+### Patch Changes
+
+- Updated dependencies [[`f4d40f91`](https://github.com/electron-userland/electron-builder/commit/f4d40f91f1511fc55cbef7c9e7edfddaf6ab67bc), [`6a6bed46`](https://github.com/electron-userland/electron-builder/commit/6a6bed46c428b45105ada071a9cb89b5d4f93d9e)]:
+  - builder-util@26.0.0-alpha.7
+
+## 26.0.0-alpha.4
+
+### Patch Changes
+
+- [#8631](https://github.com/electron-userland/electron-builder/pull/8631) [`dcd91a1f`](https://github.com/electron-userland/electron-builder/commit/dcd91a1f79be5bde7bb418b0eaa83d03f11d41fe) Thanks [@olivereisenhut](https://github.com/olivereisenhut)! - fix: Remove path from published binaries
+
+## 26.0.0-alpha.3
+
+### Patch Changes
+
+- [#8596](https://github.com/electron-userland/electron-builder/pull/8596) [`e0b0e351`](https://github.com/electron-userland/electron-builder/commit/e0b0e351baecc29e08d9f7d90f4699150b229416) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: refactor files for publishing to electron-publish
+
+- Updated dependencies [[`e0b0e351`](https://github.com/electron-userland/electron-builder/commit/e0b0e351baecc29e08d9f7d90f4699150b229416), [`d4ea0d99`](https://github.com/electron-userland/electron-builder/commit/d4ea0d998d0fb3ea3a75ca8d39a69a2f3c710962)]:
+  - builder-util@26.0.0-alpha.3
+
+## 26.0.0-alpha.1
+
+### Patch Changes
+
+- Updated dependencies [[`3eab7143`](https://github.com/electron-userland/electron-builder/commit/3eab7143d74262caace81ea05e97617d07daf336)]:
+  - builder-util@26.0.0-alpha.1
+
+## 26.0.0-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`b8185d48`](https://github.com/electron-userland/electron-builder/commit/b8185d48a75e65932196700e28bf71613dd141b4)]:
+  - builder-util@26.0.0-alpha.0
+
+## 25.1.7
+
+### Patch Changes
+
+- [#8545](https://github.com/electron-userland/electron-builder/pull/8545) [`fc3a78e4e61f916058fca9b15fc16f076c3fabd1`](https://github.com/electron-userland/electron-builder/commit/fc3a78e4e61f916058fca9b15fc16f076c3fabd1) Thanks [@mmaietta](https://github.com/mmaietta)! - chore(deps): update devDependencies, including typescript
+
+- Updated dependencies [[`fc3a78e4e61f916058fca9b15fc16f076c3fabd1`](https://github.com/electron-userland/electron-builder/commit/fc3a78e4e61f916058fca9b15fc16f076c3fabd1)]:
+  - builder-util@25.1.7
+  - builder-util-runtime@9.2.10
+
+## 25.1.6
+
+### Patch Changes
+
+- Updated dependencies [[`097eeced`](https://github.com/electron-userland/electron-builder/commit/097eeced3c82a3f19d7b80f2a23f1f7749b8af92)]:
+  - builder-util@25.1.6
+
+## 25.1.5
+
+### Patch Changes
+
+- Updated dependencies [[`d1cb6bdb`](https://github.com/electron-userland/electron-builder/commit/d1cb6bdbf8111156bb16839f501bdd9e6d477338)]:
+  - builder-util@25.1.5
+  - builder-util-runtime@9.2.9
+
+## 25.1.4
+
+### Patch Changes
+
+- Updated dependencies [[`4cacee4d`](https://github.com/electron-userland/electron-builder/commit/4cacee4d63ebfc9aacf156bd8b7faa80be1325dc), [`9ab4ff92`](https://github.com/electron-userland/electron-builder/commit/9ab4ff92c0ab441a9ca422f87fbed2f3544dde5e)]:
+  - builder-util@25.1.4
+
+## 25.1.3
+
+### Patch Changes
+
+- [#8491](https://github.com/electron-userland/electron-builder/pull/8491) [`178a3c40`](https://github.com/electron-userland/electron-builder/commit/178a3c40f35fa9e91a2e4942f61423effa1289e4) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: migrating to typedoc and updating/improving type+interface definitions
+
+- Updated dependencies [[`178a3c40`](https://github.com/electron-userland/electron-builder/commit/178a3c40f35fa9e91a2e4942f61423effa1289e4), [`5e21509a`](https://github.com/electron-userland/electron-builder/commit/5e21509a3f40d1a21f6f9ec9bf1d9d72c7149a21)]:
+  - builder-util@25.1.3
+  - builder-util-runtime@9.2.8
+
+## 25.1.2
+
+### Patch Changes
+
+- [#8486](https://github.com/electron-userland/electron-builder/pull/8486) [`d56cd274`](https://github.com/electron-userland/electron-builder/commit/d56cd274b9d0fedb71889293164a15e51f7cc744) Thanks [@mmaietta](https://github.com/mmaietta)! - fix(deploy): redeploy all packages to sync semver ranges
+
+- Updated dependencies [[`d56cd274`](https://github.com/electron-userland/electron-builder/commit/d56cd274b9d0fedb71889293164a15e51f7cc744)]:
+  - builder-util@25.1.2
+  - builder-util-runtime@9.2.7
+
+## 25.1.0
+
+### Patch Changes
+
+- Updated dependencies [[`27a8a60c`](https://github.com/electron-userland/electron-builder/commit/27a8a60c86adeaf792bbd0c33f3de23400ded2d4)]:
+  - builder-util@25.1.0
+
+## 25.0.6
+
+### Patch Changes
+
+- Updated dependencies [[`be625e06`](https://github.com/electron-userland/electron-builder/commit/be625e06273e56de09ed3298209858043fcd1151)]:
+  - builder-util@25.0.6
+  - builder-util-runtime@9.2.6
+
+## 25.0.3
+
+### Patch Changes
+
+- Updated dependencies [[`553c737b`](https://github.com/electron-userland/electron-builder/commit/553c737b2cf1ad835690f7db3c1907ae88944d15)]:
+  - builder-util@25.0.3
+
+## 25.0.2
+
+### Patch Changes
+
+- Updated dependencies [[`54c1059b`](https://github.com/electron-userland/electron-builder/commit/54c1059b961f7c2a493d26b7e6ef674911069cad)]:
+  - builder-util@25.0.2
+
+## 25.0.1
+
+### Patch Changes
+
+- Updated dependencies [[`089dd639`](https://github.com/electron-userland/electron-builder/commit/089dd6396c9638910967c1968d9b8056acd952a9)]:
+  - builder-util@25.0.1
+
+## 25.0.0
+
+### Minor Changes
+
+- [#8173](https://github.com/electron-userland/electron-builder/pull/8173) [`3ae3589a`](https://github.com/electron-userland/electron-builder/commit/3ae3589a63c2d915b8456d9dc81a965a1366c73b) Thanks [@AndrewEQ](https://github.com/AndrewEQ)! - feat: Support for a separate Github publish token to the auto-update token
+
+### Patch Changes
+
+- [#8304](https://github.com/electron-userland/electron-builder/pull/8304) [`1ac86c9e`](https://github.com/electron-userland/electron-builder/commit/1ac86c9ea277a89611d415eb7f2ef70441b0eb28) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: update pnpm to 9.4.0
+
+- [#8135](https://github.com/electron-userland/electron-builder/pull/8135) [`c2392de7`](https://github.com/electron-userland/electron-builder/commit/c2392de71a8f7abc092a00452eac63dd24b34e88) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: unstable hdiutil retry mechanism
+
+- [#8110](https://github.com/electron-userland/electron-builder/pull/8110) [`fa7982f1`](https://github.com/electron-userland/electron-builder/commit/fa7982f19feddcb9479ff83af8db1974aea1f8d6) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: entering alpha release stage
+
+- Updated dependencies [[`503da26f`](https://github.com/electron-userland/electron-builder/commit/503da26f1ef71bff19bd173bdce4052c48ddc5cc), [`3d4cc7ae`](https://github.com/electron-userland/electron-builder/commit/3d4cc7ae01c4f6154d6ea59726578b1ff99b9daf), [`1ac86c9e`](https://github.com/electron-userland/electron-builder/commit/1ac86c9ea277a89611d415eb7f2ef70441b0eb28), [`c2392de7`](https://github.com/electron-userland/electron-builder/commit/c2392de71a8f7abc092a00452eac63dd24b34e88), [`ad668ae1`](https://github.com/electron-userland/electron-builder/commit/ad668ae14ef60fb91dd74aa71562f2fd68fbaa48), [`445911a7`](https://github.com/electron-userland/electron-builder/commit/445911a75f9efd6fe61e586ebed6a210d0efcd41), [`140e2f0e`](https://github.com/electron-userland/electron-builder/commit/140e2f0eb0df79c2a46e35024e96d0563355fc89), [`db1894d7`](https://github.com/electron-userland/electron-builder/commit/db1894d78a0bbf8377a787a25dddc17af22a4667), [`a999da48`](https://github.com/electron-userland/electron-builder/commit/a999da48480b5024d97c3028a655bb33b00fc3bc), [`88bbbdbe`](https://github.com/electron-userland/electron-builder/commit/88bbbdbe81936df1701f26138170e0f337c4f0d4), [`fa7982f1`](https://github.com/electron-userland/electron-builder/commit/fa7982f19feddcb9479ff83af8db1974aea1f8d6)]:
+  - builder-util@25.0.0
+  - builder-util-runtime@9.2.5
+
+## 25.0.0-alpha.13
+
+### Patch Changes
+
+- Updated dependencies [[`db1894d7`](https://github.com/electron-userland/electron-builder/commit/db1894d78a0bbf8377a787a25dddc17af22a4667)]:
+  - builder-util@25.0.0-alpha.13
+
+## 25.0.0-alpha.12
+
+### Patch Changes
+
+- [#8304](https://github.com/electron-userland/electron-builder/pull/8304) [`1ac86c9e`](https://github.com/electron-userland/electron-builder/commit/1ac86c9ea277a89611d415eb7f2ef70441b0eb28) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: update pnpm to 9.4.0
+
+- Updated dependencies [[`1ac86c9e`](https://github.com/electron-userland/electron-builder/commit/1ac86c9ea277a89611d415eb7f2ef70441b0eb28), [`ad668ae1`](https://github.com/electron-userland/electron-builder/commit/ad668ae14ef60fb91dd74aa71562f2fd68fbaa48)]:
+  - builder-util@25.0.0-alpha.12
+  - builder-util-runtime@9.2.5-alpha.4
+
+## 25.0.0-alpha.10
+
+### Patch Changes
+
+- Updated dependencies [[`140e2f0e`](https://github.com/electron-userland/electron-builder/commit/140e2f0eb0df79c2a46e35024e96d0563355fc89), [`88bbbdbe`](https://github.com/electron-userland/electron-builder/commit/88bbbdbe81936df1701f26138170e0f337c4f0d4)]:
+  - builder-util-runtime@9.2.5-alpha.3
+  - builder-util@25.0.0-alpha.10
+
+## 25.0.0-alpha.9
+
+### Patch Changes
+
+- Updated dependencies [[`503da26f`](https://github.com/electron-userland/electron-builder/commit/503da26f1ef71bff19bd173bdce4052c48ddc5cc)]:
+  - builder-util@25.0.0-alpha.9
+
+## 25.0.0-alpha.7
+
+### Minor Changes
+
+- [#8173](https://github.com/electron-userland/electron-builder/pull/8173) [`3ae3589a`](https://github.com/electron-userland/electron-builder/commit/3ae3589a63c2d915b8456d9dc81a965a1366c73b) Thanks [@AndrewEQ](https://github.com/AndrewEQ)! - feat: Support for a separate Github publish token to the auto-update token
+
+## 25.0.0-alpha.6
+
+### Patch Changes
+
+- Updated dependencies [[`a999da48`](https://github.com/electron-userland/electron-builder/commit/a999da48480b5024d97c3028a655bb33b00fc3bc)]:
+  - builder-util@25.0.0-alpha.6
+
+## 25.0.0-alpha.4
+
+### Patch Changes
+
+- [#8135](https://github.com/electron-userland/electron-builder/pull/8135) [`c2392de7`](https://github.com/electron-userland/electron-builder/commit/c2392de71a8f7abc092a00452eac63dd24b34e88) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: unstable hdiutil retry mechanism
+
+- Updated dependencies [[`c2392de7`](https://github.com/electron-userland/electron-builder/commit/c2392de71a8f7abc092a00452eac63dd24b34e88)]:
+  - builder-util@25.0.0-alpha.4
+
+## 25.0.0-alpha.3
+
+### Patch Changes
+
+- Updated dependencies [[`445911a7`](https://github.com/electron-userland/electron-builder/commit/445911a75f9efd6fe61e586ebed6a210d0efcd41)]:
+  - builder-util-runtime@9.2.5-alpha.2
+  - builder-util@25.0.0-alpha.3
+
+## 25.0.0-alpha.1
+
+### Patch Changes
+
+- Updated dependencies [[`3d4cc7ae`](https://github.com/electron-userland/electron-builder/commit/3d4cc7ae01c4f6154d6ea59726578b1ff99b9daf)]:
+  - builder-util-runtime@9.2.5-alpha.1
+  - builder-util@25.0.0-alpha.1
+
+## 24.13.4-alpha.0
+
+### Patch Changes
+
+- [#8110](https://github.com/electron-userland/electron-builder/pull/8110) [`fa7982f1`](https://github.com/electron-userland/electron-builder/commit/fa7982f19feddcb9479ff83af8db1974aea1f8d6) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: entering alpha release stage
+
+- Updated dependencies [[`fa7982f1`](https://github.com/electron-userland/electron-builder/commit/fa7982f19feddcb9479ff83af8db1974aea1f8d6)]:
+  - builder-util@24.13.4-alpha.0
+  - builder-util-runtime@9.2.5-alpha.0
+
+## 24.13.1
+
+### Patch Changes
+
+- [#8057](https://github.com/electron-userland/electron-builder/pull/8057) [`ccbb80de`](https://github.com/electron-userland/electron-builder/commit/ccbb80dea4b6146ea2d2186193a1f307096e4d1e) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: upgrading connected dependencies (typescript requires higher eslint version)
+
+- Updated dependencies [[`ccbb80de`](https://github.com/electron-userland/electron-builder/commit/ccbb80dea4b6146ea2d2186193a1f307096e4d1e)]:
+  - builder-util@24.13.1
+  - builder-util-runtime@9.2.4
+
+## 24.13.0
+
+### Patch Changes
+
+- [#8010](https://github.com/electron-userland/electron-builder/pull/8010) [`f5340b73`](https://github.com/electron-userland/electron-builder/commit/f5340b732dc0a303743a2a924750e9861e3a345f) Thanks [@mmaietta](https://github.com/mmaietta)! - fix: use CI_COMMIT_TAG instead of CI_BUILD_TAG for Gitlab CI
+
+## 24.9.4
+
+### Patch Changes
+
+- Updated dependencies [[`e4d6be81`](https://github.com/electron-userland/electron-builder/commit/e4d6be81d80ce9de0c95288d4418bbb80f7902af)]:
+  - builder-util@24.9.4
+
+## 24.8.1
+
+### Patch Changes
+
+- Updated dependencies [[`db424e8e`](https://github.com/electron-userland/electron-builder/commit/db424e8e876e6ac1985668bf78bd52a02824dd7f), [`1af7447e`](https://github.com/electron-userland/electron-builder/commit/1af7447edf47303de03ca2924727c78118161c60), [`db424e8e`](https://github.com/electron-userland/electron-builder/commit/db424e8e876e6ac1985668bf78bd52a02824dd7f)]:
+  - builder-util-runtime@9.2.3
+  - builder-util@24.8.1
+
+## 24.8.0
+
+### Patch Changes
+
+- Updated dependencies [[`549d07b0`](https://github.com/electron-userland/electron-builder/commit/549d07b0a04b8686cf4998dc102edad390ddd09a)]:
+  - builder-util-runtime@9.2.2
+  - builder-util@24.8.0
+
+## 24.5.0
+
+### Patch Changes
+
+- Updated dependencies [[`4dce3718`](https://github.com/electron-userland/electron-builder/commit/4dce3718abd75b8d0e29f37f6ba0ee1e76353c65)]:
+  - builder-util@24.5.0
+
+## 24.4.0
+
+### Patch Changes
+
+- [#7568](https://github.com/electron-userland/electron-builder/pull/7568) [`c9d20db9`](https://github.com/electron-userland/electron-builder/commit/c9d20db964cce991dab137ec0105d40d8eacd95c) Thanks [@t3chguy](https://github.com/t3chguy)! - Fix missing @types dependencies for output d.ts files
+
+- Updated dependencies [[`c9d20db9`](https://github.com/electron-userland/electron-builder/commit/c9d20db964cce991dab137ec0105d40d8eacd95c)]:
+  - builder-util@24.4.0
+
+## 24.3.0
+
+### Patch Changes
+
+- Updated dependencies [[`dab3aeba`](https://github.com/electron-userland/electron-builder/commit/dab3aeba2240ead4300c8fdb35e3d9c16b04a23d), [`0db9c66f`](https://github.com/electron-userland/electron-builder/commit/0db9c66f0fff9a482d34aeaafaf11f542b786bf8)]:
+  - builder-util-runtime@9.2.1
+  - builder-util@24.3.0
+
+## 24.1.2
+
+### Patch Changes
+
+- [#7508](https://github.com/electron-userland/electron-builder/pull/7508) [`d4c90b67`](https://github.com/electron-userland/electron-builder/commit/d4c90b676aa22c745de4129f98453b97f264805c) Thanks [@NoahAndrews](https://github.com/NoahAndrews)! - Removed DefinitelyTyped dependencies from production dependencies list
+
+- Updated dependencies [[`d4c90b67`](https://github.com/electron-userland/electron-builder/commit/d4c90b676aa22c745de4129f98453b97f264805c)]:
+  - builder-util@24.1.2
+
+## 24.1.0
+
+### Patch Changes
+
+- Updated dependencies [[`1342f872`](https://github.com/electron-userland/electron-builder/commit/1342f872f98229cf6c31069253fcf0f435bfd9df)]:
+  - builder-util@24.1.0
+
+## 24.0.0
+
+### Patch Changes
+
+- [#7306](https://github.com/electron-userland/electron-builder/pull/7306) [`01c67910`](https://github.com/electron-userland/electron-builder/commit/01c679107435c6afd0b2de8c44d3f140d20c5577) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: Update dependencies per audit/outdated
+
+- [#7213](https://github.com/electron-userland/electron-builder/pull/7213) [`17863671`](https://github.com/electron-userland/electron-builder/commit/1786367194272dff90e63d0a43f3ad5c3cc151f0) Thanks [@mmaietta](https://github.com/mmaietta)! - chore(deps): Updating dependencies and fixing `pnpm audit` with dependency overrides
+
+- [#7231](https://github.com/electron-userland/electron-builder/pull/7231) [`c21e3b37`](https://github.com/electron-userland/electron-builder/commit/c21e3b37e0dd064c12dbd38065a548441d7c5a9e) Thanks [@laprasdrum](https://github.com/laprasdrum)! - fix: get CI tag in GitHub Actions
+
+- Updated dependencies [[`cc1ddabd`](https://github.com/electron-userland/electron-builder/commit/cc1ddabd45f239ee06fde9b2d1534467908791fa), [`93930cf0`](https://github.com/electron-userland/electron-builder/commit/93930cf0b04b60896835e1d9feeab20722cd1b98), [`01c67910`](https://github.com/electron-userland/electron-builder/commit/01c679107435c6afd0b2de8c44d3f140d20c5577), [`4d3fdfcf`](https://github.com/electron-userland/electron-builder/commit/4d3fdfcfe5c6b75cdb8fa8e89f6169c986949bcb), [`17863671`](https://github.com/electron-userland/electron-builder/commit/1786367194272dff90e63d0a43f3ad5c3cc151f0), [`53327d51`](https://github.com/electron-userland/electron-builder/commit/53327d51101b83641ece9f497577c3ac93d3e91d)]:
+  - builder-util-runtime@9.2.0
+  - builder-util@24.0.0
+
+## 24.0.0-alpha.13
+
+### Patch Changes
+
+- Updated dependencies [[`4d3fdfcf`](https://github.com/electron-userland/electron-builder/commit/4d3fdfcfe5c6b75cdb8fa8e89f6169c986949bcb)]:
+  - builder-util@24.0.0-alpha.13
+
+## 24.0.0-alpha.11
+
+### Patch Changes
+
+- Updated dependencies [[`93930cf0`](https://github.com/electron-userland/electron-builder/commit/93930cf0b04b60896835e1d9feeab20722cd1b98)]:
+  - builder-util-runtime@9.2.0-alpha.3
+  - builder-util@24.0.0-alpha.11
+
+## 24.0.0-alpha.8
+
+### Patch Changes
+
+- Updated dependencies [[`cc1ddabd`](https://github.com/electron-userland/electron-builder/commit/cc1ddabd45f239ee06fde9b2d1534467908791fa)]:
+  - builder-util-runtime@9.2.0-alpha.2
+  - builder-util@24.0.0-alpha.8
+
+## 24.0.0-alpha.6
+
+### Patch Changes
+
+- [#7306](https://github.com/electron-userland/electron-builder/pull/7306) [`01c67910`](https://github.com/electron-userland/electron-builder/commit/01c679107435c6afd0b2de8c44d3f140d20c5577) Thanks [@mmaietta](https://github.com/mmaietta)! - chore: Update dependencies per audit/outdated
+
+- Updated dependencies [[`01c67910`](https://github.com/electron-userland/electron-builder/commit/01c679107435c6afd0b2de8c44d3f140d20c5577)]:
+  - builder-util-runtime@9.1.2-alpha.1
+  - builder-util@24.0.0-alpha.6
+
+## 24.0.0-alpha.4
+
+### Patch Changes
+
+- [#7231](https://github.com/electron-userland/electron-builder/pull/7231) [`c21e3b37`](https://github.com/electron-userland/electron-builder/commit/c21e3b37e0dd064c12dbd38065a548441d7c5a9e) Thanks [@laprasdrum](https://github.com/laprasdrum)! - fix: get CI tag in GitHub Actions
+
+## 24.0.0-alpha.3
+
+### Patch Changes
+
+- [#7213](https://github.com/electron-userland/electron-builder/pull/7213) [`17863671`](https://github.com/electron-userland/electron-builder/commit/1786367194272dff90e63d0a43f3ad5c3cc151f0) Thanks [@mmaietta](https://github.com/mmaietta)! - chore(deps): Updating dependencies and fixing `pnpm audit` with dependency overrides
+
+- Updated dependencies [[`17863671`](https://github.com/electron-userland/electron-builder/commit/1786367194272dff90e63d0a43f3ad5c3cc151f0)]:
+  - builder-util@24.0.0-alpha.3
+
+## 24.0.0-alpha.2
+
+### Patch Changes
+
+- Updated dependencies [[`53327d51`](https://github.com/electron-userland/electron-builder/commit/53327d51101b83641ece9f497577c3ac93d3e91d)]:
+  - builder-util-runtime@9.1.2-alpha.0
+  - builder-util@24.0.0-alpha.2
+
+## 23.6.0
+
+### Patch Changes
+
+- Updated dependencies [[`4583273e`](https://github.com/electron-userland/electron-builder/commit/4583273ebe5cabfd1c14f647dc9edb7bff3c3bf3)]:
+  - builder-util@23.6.0
+
+## 23.5.0
+
+### Patch Changes
+
+- Updated dependencies [[`1023a93e`](https://github.com/electron-userland/electron-builder/commit/1023a93e92eaa26bf33b52edda5b22e56ed1ec18), [`8166267d`](https://github.com/electron-userland/electron-builder/commit/8166267d487cd26b154e28cf60d89102a487a353)]:
+  - builder-util-runtime@9.1.1
+  - builder-util@23.5.0
+
+## 23.4.0
+
+### Minor Changes
+
+- [#7028](https://github.com/electron-userland/electron-builder/pull/7028) [`e7179b57`](https://github.com/electron-userland/electron-builder/commit/e7179b57bdba192acfdb439c03099e6629e98f6a) Thanks [@mmaietta](https://github.com/mmaietta)! - feat: Adding timeout to publisher config for api requests and uploads
+
+### Patch Changes
+
+- Updated dependencies [[`e7179b57`](https://github.com/electron-userland/electron-builder/commit/e7179b57bdba192acfdb439c03099e6629e98f6a)]:
+  - builder-util-runtime@9.1.0
+  - builder-util@23.4.0
+
+## 23.3.3
+
+### Patch Changes
+
+- Updated dependencies [[`98d3a636`](https://github.com/electron-userland/electron-builder/commit/98d3a6361d500e85e443ee292529c27f0b4a0b59)]:
+  - builder-util@23.3.3
+
+## 23.3.0
+
+### Patch Changes
+
+- [#6958](https://github.com/electron-userland/electron-builder/pull/6958) [`8ffd9d42`](https://github.com/electron-userland/electron-builder/commit/8ffd9d42d89634be76fd4554f659f2b2512f2081) Thanks [@CCInc](https://github.com/CCInc)! - fix: prevent infinite error looping of overwriteArtifact during github artifact uploads
+
+- Updated dependencies [[`adeaa347`](https://github.com/electron-userland/electron-builder/commit/adeaa347c03b8947b0812ecef23398c0822646bb)]:
+  - builder-util-runtime@9.0.3
+  - builder-util@23.3.0
+
+## 23.0.9
+
+### Patch Changes
+
+- [#6840](https://github.com/electron-userland/electron-builder/pull/6840) [`e9ba7500`](https://github.com/electron-userland/electron-builder/commit/e9ba75005dda39f03c04e37a5d46a1bbe634c189) Thanks [@adelphes](https://github.com/adelphes)! - fix: set github release name to match the app version
+
+- Updated dependencies [[`9dc13ba2`](https://github.com/electron-userland/electron-builder/commit/9dc13ba2c1e7a852d3f743833f1bde17b62f1806), [`d3452b04`](https://github.com/electron-userland/electron-builder/commit/d3452b0427cb45035f6ed7f1266691db4accd5c4)]:
+  - builder-util@23.0.9
+
+## 23.0.8
+
+### Patch Changes
+
+- Updated dependencies [[`7af4c226`](https://github.com/electron-userland/electron-builder/commit/7af4c226af9f7759092cbd9d2c63d85e0c54ad43)]:
+  - builder-util-runtime@9.0.2
+  - builder-util@23.0.8
+
+## 23.0.6
+
+### Patch Changes
+
+- [`9a7ed436`](https://github.com/electron-userland/electron-builder/commit/9a7ed4360618e540810337c5f02d99cd2a9b8441) - chore: updating dependency tree
+
+- Updated dependencies [[`9a7ed436`](https://github.com/electron-userland/electron-builder/commit/9a7ed4360618e540810337c5f02d99cd2a9b8441)]:
+  - builder-util@23.0.6
+  - builder-util-runtime@9.0.1
+
+## 23.0.2
+
+### Patch Changes
+
+- Updated dependencies [[`5ffbe1e2`](https://github.com/electron-userland/electron-builder/commit/5ffbe1e2994b95aaccdc36d05a876db2cb5b28a3)]:
+  - builder-util@23.0.2
+
+## 23.0.0
+
+### Major Changes
+
+- [#6556](https://github.com/electron-userland/electron-builder/pull/6556) [`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222) Thanks [@mmaietta](https://github.com/mmaietta)! - Breaking changes
+  Removing Bintray support since it was sunset. Ref: https://jfrog.com/blog/into-the-sunset-bintray-jcenter-gocenter-and-chartcenter/
+  Fail-fast for windows signature verification failures. Adding `-LiteralPath` to update file path to disregard injected wildcards
+  Force strip path separators for backslashes on Windows during update process
+  Force authentication for local mac squirrel update server
+
+  Fixes:
+  fix(nsis): Adding --INPUTCHARSET to makensis. (#4898 #6232 #6259)
+
+  Adding additional details to error console logging
+
+### Patch Changes
+
+- [#6563](https://github.com/electron-userland/electron-builder/pull/6563) [`39da9edd`](https://github.com/electron-userland/electron-builder/commit/39da9edd2df5c147ef2d868f022484a8b2e0466a) Thanks [@baparham](https://github.com/baparham)! - fix(electron-publish): handle plain text description from github api HTTP_ERROR_422 to resolve socket hang ups
+
+- Updated dependencies [[`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222), [`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222)]:
+  - builder-util@23.0.0
+  - builder-util-runtime@9.0.0
+
+## 23.0.0-alpha.1
+
+### Patch Changes
+
+- [#6563](https://github.com/electron-userland/electron-builder/pull/6563) [`39da9edd`](https://github.com/electron-userland/electron-builder/commit/39da9edd2df5c147ef2d868f022484a8b2e0466a) Thanks [@baparham](https://github.com/baparham)! - fix(electron-publish): handle plain text description from github api HTTP_ERROR_422 to resolve socket hang ups
+
+## 23.0.0-alpha.0
+
+### Major Changes
+
+- [#6556](https://github.com/electron-userland/electron-builder/pull/6556) [`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222) Thanks [@mmaietta](https://github.com/mmaietta)! - Breaking changes
+  Removing Bintray support since it was sunset. Ref: https://jfrog.com/blog/into-the-sunset-bintray-jcenter-gocenter-and-chartcenter/
+  Fail-fast for windows signature verification failures. Adding `-LiteralPath` to update file path to disregard injected wildcards
+  Force strip path separators for backslashes on Windows during update process
+  Force authentication for local mac squirrel update server
+
+  Fixes:
+  fix(nsis): Adding --INPUTCHARSET to makensis. (#4898 #6232 #6259)
+
+  Adding additional details to error console logging
+
+### Patch Changes
+
+- Updated dependencies [[`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222), [`a138a86f`](https://github.com/electron-userland/electron-builder/commit/a138a86fb7b59098f5dac0c0a6b59c034eb9b222)]:
+  - builder-util@23.0.0-alpha.0
+  - builder-util-runtime@9.0.0-alpha.0
+
+## 22.14.13
+
+### Patch Changes
+
+- Updated dependencies [[`f7b38698`](https://github.com/electron-userland/electron-builder/commit/f7b386986ec30f7e4cd3e3f68e078a773940a51c)]:
+  - builder-util@22.14.13
+
+## 22.14.12
+
+### Patch Changes
+
+- [#6516](https://github.com/electron-userland/electron-builder/pull/6516) [`344bb232`](https://github.com/electron-userland/electron-builder/commit/344bb232d71e608b881a04fc98dca0858e42ddfc) Thanks [@robertpatrick](https://github.com/robertpatrick)! - fix: Explicitly set the protocol to https on the request objects to allow publishing to work from behind a proxy server when the https_proxy environment variable is set.
+
+## 22.14.7
+
+### Patch Changes
+
+- Updated dependencies [[`04a84352`](https://github.com/electron-userland/electron-builder/commit/04a84352b2b3fbb3c54533a8428bfd103df0af21)]:
+  - builder-util@22.14.7
+
+## 22.14.6
+
+### Patch Changes
+
+- Updated dependencies [[`66ca625f`](https://github.com/electron-userland/electron-builder/commit/66ca625f892329fd7bedf52fddc6659ec83b7cd3)]:
+  - builder-util-runtime@8.9.2
+  - builder-util@22.14.6
+
+## 22.14.5
+
+### Patch Changes
+
+- Updated dependencies [[`54ee4e72`](https://github.com/electron-userland/electron-builder/commit/54ee4e72c5db859b9a00104179786567a0e977ff)]:
+  - builder-util-runtime@8.9.1
+  - builder-util@22.14.5
+
+## 22.14.0
+
+### Minor Changes
+
+- [#6228](https://github.com/electron-userland/electron-builder/pull/6228) [`a9453216`](https://github.com/electron-userland/electron-builder/commit/a94532164709a545c0f6551fdc336dbc5377bda8) Thanks [@mmaietta](https://github.com/mmaietta)! - feat: adding Bitbucket publisher and autoupdater
+
+### Patch Changes
+
+- Updated dependencies [[`a9453216`](https://github.com/electron-userland/electron-builder/commit/a94532164709a545c0f6551fdc336dbc5377bda8)]:
+  - builder-util-runtime@8.9.0
+  - builder-util@22.14.0
+
+## 22.13.1
+
+### Patch Changes
+
+- Updated dependencies [[`7f933d00`](https://github.com/electron-userland/electron-builder/commit/7f933d0004a0a5f808a2a1c71dca7362cab2728e)]:
+  - builder-util-runtime@8.8.1
+  - builder-util@22.13.1
+
+## 22.13.0
+
+### Minor Changes
+
+- [#6167](https://github.com/electron-userland/electron-builder/pull/6167) [`f45110cb`](https://github.com/electron-userland/electron-builder/commit/f45110cbf66572d5748d21fc24dc26cabd06f35f) Thanks [@mmaietta](https://github.com/mmaietta)! - feat: Adding Keygen as an official publisher/updater for electron-builder (#6167)
+
+### Patch Changes
+
+- Updated dependencies [[`f45110cb`](https://github.com/electron-userland/electron-builder/commit/f45110cbf66572d5748d21fc24dc26cabd06f35f)]:
+  - builder-util@22.13.0
+  - builder-util-runtime@8.8.0
+
+## 22.12.1
+
+### Patch Changes
+
+- Updated dependencies [6c945bd5]
+  - builder-util@22.12.1
+
+## 22.11.11
+
+### Patch Changes
+
+- a4eae34f: Synchronizing CLI and package.json versions. Updating auto-publish values + changeset generation to be more frictionless
+- Updated dependencies [a4eae34f]
+  - builder-util@22.11.11
+  - builder-util-runtime@8.7.10
+
 ## 22.11.10
 
 ### Patch Changes

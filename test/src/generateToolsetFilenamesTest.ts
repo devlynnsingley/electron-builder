@@ -1,0 +1,454 @@
+import * as fs from "fs"
+import * as path from "path"
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest"
+import { generateTests } from "../vitest-scripts/generate-tests"
+import { GENERATED_TESTS_DIR } from "../vitest-scripts/runtime-tests/generate-toolset-tests-shared"
+import { latestToolsetVersion, NSIS_VERSIONS, WINE_VERSIONS, WIN_CODE_SIGN_VERSIONS, WIX_VERSIONS } from "../vitest-scripts/runtime-tests/generate-toolset-versions"
+import { detectFilePlatforms, getAllTestFiles, isE2eTestFile, platformAllowed } from "../vitest-scripts/vitest-config/file-discovery"
+import { resolveCachedMs, shardPlanMismatchError } from "../vitest-scripts/vitest-config/shard-builder"
+import type { FileStats } from "../vitest-scripts/vitest-config/cache"
+import { getTestFilesOverride, parseSmartCacheSource, type SupportedPlatforms } from "../vitest-scripts/vitest-config/smart-config"
+
+// Collect all generated test filenames recursively (`*Test.ts` and `*.e2e.ts`)
+function collectGeneratedFiles(dir: string): string[] {
+  const results: string[] = []
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name)
+    if (entry.isDirectory()) {
+      results.push(...collectGeneratedFiles(full))
+    } else if (entry.name.endsWith("Test.ts") || isE2eTestFile(entry.name)) {
+      results.push(full.split(path.sep).join("/"))
+    }
+  }
+  return results
+}
+
+describe("Generated toolset test filenames", () => {
+  beforeAll(() => {
+    generateTests()
+  })
+
+  it("files for ifWindows suites have .win. marker", () => {
+    const files = collectGeneratedFiles(GENERATED_TESTS_DIR)
+    const winOnlySuites = ["portable", "msi", "msiWrapped", "squirrelWindows", "appx", "differentialWin"]
+    for (const suite of winOnlySuites) {
+      const suiteFiles = files.filter(f => f.includes(`/${suite}/`))
+      expect(suiteFiles.length, `${suite} should have generated files`).toBeGreaterThan(0)
+      for (const f of suiteFiles) {
+        expect(f, `${suite} file must contain .win.`).toContain(".win.")
+      }
+    }
+  })
+
+  it("files for ifLinux suites have .linux. marker", () => {
+    const files = collectGeneratedFiles(GENERATED_TESTS_DIR)
+    const linuxOnlySuites = ["blackboxLinux", "differentialLinux"]
+    for (const suite of linuxOnlySuites) {
+      const suiteFiles = files.filter(f => f.includes(`/${suite}/`))
+      expect(suiteFiles.length, `${suite} should have generated files`).toBeGreaterThan(0)
+      for (const f of suiteFiles) {
+        expect(f, `${suite} file must contain .linux.`).toContain(".linux.")
+      }
+    }
+  })
+
+  it("cross-platform suites have no platform marker", () => {
+    const files = collectGeneratedFiles(GENERATED_TESTS_DIR)
+    // No platform marker → discovered everywhere. winPackager/assistedInstaller use ifWindowsOrWine
+    // (native on Windows, via Wine on Linux); linuxPackager/wineToolset/nsisWine use ifNotWindows.
+    const universalSuites = [
+      "linuxPackager",
+      "winPackager",
+      "blackboxWin",
+      "blackboxWebWinUpdate",
+      "blackboxWebWinNextLaunch",
+      "blackboxWebWinRejected",
+      "wineToolset",
+      "assistedInstaller",
+      "nsisWine",
+    ]
+    for (const suite of universalSuites) {
+      const suiteFiles = files.filter(f => f.includes(`/${suite}/`))
+      expect(suiteFiles.length, `${suite} should have generated files`).toBeGreaterThan(0)
+      for (const f of suiteFiles) {
+        expect(f, `${suite} file must not contain .win.`).not.toContain(".win.")
+        expect(f, `${suite} file must not contain .linux.`).not.toContain(".linux.")
+        expect(f, `${suite} file must not contain .mac.`).not.toContain(".mac.")
+      }
+    }
+  })
+
+  it("wineToolset suite generates one file per wine version", () => {
+    const files = collectGeneratedFiles(GENERATED_TESTS_DIR)
+    const wineFiles = files.filter(f => f.includes("/wineToolset/"))
+    expect(wineFiles.length).toBe(2)
+    expect(wineFiles.some(f => f.includes("wine-0.0.0"))).toBe(true)
+    expect(wineFiles.some(f => f.includes("wine-1.0.1"))).toBe(true)
+  })
+
+  it("nsisWine suite generates one file per wine version", () => {
+    const files = collectGeneratedFiles(GENERATED_TESTS_DIR)
+    const nsisWineFiles = files.filter(f => f.includes("/nsisWine/"))
+    expect(nsisWineFiles.length).toBe(2)
+    expect(nsisWineFiles.some(f => f.includes("wine-0.0.0"))).toBe(true)
+    expect(nsisWineFiles.some(f => f.includes("wine-1.0.1"))).toBe(true)
+  })
+
+  // One test per file (the sharder packs whole files), built with the newest winCodeSign; the update cycle once per NSIS version.
+  // Each file needs a hand-written snapshot (test/snapshots/generated/blackboxWebWin*/, see resolveSnapshotPath in run-vitest.ts):
+  // CI doesn't write missing snapshots, and the tests run on Windows only.
+  it("blackboxWebWin suites generate one file per test and toolset combination, each with a snapshot", () => {
+    const files = collectGeneratedFiles(GENERATED_TESTS_DIR).filter(f => path.basename(f).startsWith("blackboxWebWin"))
+    // the version lists are typed to allow custom toolsets (objects), but hold version strings
+    const versions = (list: ReadonlyArray<unknown>) => list.filter((it): it is string => typeof it === "string")
+    const wcs = latestToolsetVersion(versions(WIN_CODE_SIGN_VERSIONS))
+    const nsis = latestToolsetVersion(versions(NSIS_VERSIONS))
+    const expected = versions(WINE_VERSIONS).flatMap(wine => [
+      `blackboxWebWinNextLaunch__wcs-${wcs}__nsis-${nsis}__wine-${wine}__e2e.ts`,
+      `blackboxWebWinRejected__wcs-${wcs}__nsis-${nsis}__wine-${wine}__e2e.ts`,
+      ...versions(NSIS_VERSIONS).map(nsisVersion => `blackboxWebWinUpdate__wcs-${wcs}__nsis-${nsisVersion}__wine-${wine}__e2e.ts`),
+    ])
+    expect(files.map(f => path.basename(f)).sort()).toEqual(expected.sort())
+
+    const snapshotsDir = path.resolve(GENERATED_TESTS_DIR, "../../snapshots/generated")
+    for (const file of files) {
+      const suite = path.basename(path.dirname(file))
+      const snapshot = path.join(
+        snapshotsDir,
+        suite,
+        path
+          .basename(file)
+          .replace(/__wine-\d+(?:\.\d+)*/, "")
+          .replace(/\.ts$/, ".js.snap")
+      )
+      expect(fs.existsSync(snapshot), `hand-written snapshot of ${path.basename(file)}: ${snapshot}`).toBe(true)
+    }
+  })
+
+  // The msi suite runs once per WiX bundle, and msiWrapped once more with the legacy bundle. They run on Windows only and CI doesn't
+  // write missing snapshots, so each generated file needs a hand-written snapshot with an entry for every msiTestSuite test.
+  it("msi suites generate one file per WiX bundle, each with a snapshot entry for every test", () => {
+    const versions = (list: ReadonlyArray<unknown>) => list.filter((it): it is string => typeof it === "string")
+    const files = collectGeneratedFiles(GENERATED_TESTS_DIR)
+    const msiFiles = files.filter(f => f.includes("/msi/"))
+    expect(msiFiles.map(f => path.basename(f)).sort()).toEqual(versions(WIX_VERSIONS).map(wix => `msi__wix-${wix}.win.e2e.ts`))
+    const wcs = latestToolsetVersion(versions(WIN_CODE_SIGN_VERSIONS))
+    const nsis = latestToolsetVersion(versions(NSIS_VERSIONS))
+    const legacyWrappedFiles = files.filter(f => f.includes("/msiWrappedLegacyWix/"))
+    expect(legacyWrappedFiles.map(f => path.basename(f)).sort()).toEqual(
+      versions(WINE_VERSIONS).map(wine => `msiWrappedLegacyWix__wcs-${wcs}__nsis-${nsis}__wine-${wine}__wix-0.0.0.win.e2e.ts`)
+    )
+
+    const snapshotPath = (file: string) =>
+      path.join(
+        path.resolve(GENERATED_TESTS_DIR, "../../snapshots/generated"),
+        path.basename(path.dirname(file)),
+        path
+          .basename(file)
+          .replace(/__wine-\d+(?:\.\d+)*/, "")
+          .replace(/\.ts$/, ".js.snap")
+      )
+    // the tests msiTestSuite registers, without the skipped ones
+    const msiTests = [...fs.readFileSync(path.resolve(GENERATED_TESTS_DIR, "../windows/msiTestSuite.ts"), "utf8").matchAll(/^\s*test\("([^"]+)"/gm)].map(it => it[1])
+    expect(msiTests).toEqual(expect.arrayContaining(["msi", "arm64", "same file name in two directories"]))
+    for (const file of msiFiles) {
+      const snapshot = snapshotPath(file)
+      expect(fs.existsSync(snapshot), `hand-written snapshot of ${path.basename(file)}: ${snapshot}`).toBe(true)
+      const content = fs.readFileSync(snapshot, "utf8")
+      for (const name of msiTests) {
+        expect(content, `${path.basename(snapshot)} has an entry for "${name}"`).toContain(`exports[\`msi > ${name} 1\`]`)
+      }
+    }
+    for (const file of legacyWrappedFiles) {
+      expect(fs.existsSync(snapshotPath(file)), `hand-written snapshot of ${path.basename(file)}: ${snapshotPath(file)}`).toBe(true)
+    }
+  })
+
+  it("platformAllowed correctly filters ifWindows files on Linux", () => {
+    const files = collectGeneratedFiles(GENERATED_TESTS_DIR)
+    const winFiles = files.filter(f => f.includes(".win."))
+    expect(winFiles.length).toBeGreaterThan(0)
+    for (const f of winFiles) {
+      expect(platformAllowed(f, "linux"), `${f} must not be allowed on Linux`).toBe(false)
+      expect(platformAllowed(f, "darwin"), `${f} must not be allowed on macOS`).toBe(false)
+      expect(platformAllowed(f, "win32"), `${f} must be allowed on win32`).toBe(true)
+    }
+  })
+
+  it("platformAllowed correctly filters ifLinux files on Windows and macOS", () => {
+    const files = collectGeneratedFiles(GENERATED_TESTS_DIR)
+    const linuxFiles = files.filter(f => f.includes(".linux."))
+    expect(linuxFiles.length).toBeGreaterThan(0)
+    for (const f of linuxFiles) {
+      expect(platformAllowed(f, "win32"), `${f} must not be allowed on win32`).toBe(false)
+      expect(platformAllowed(f, "darwin"), `${f} must not be allowed on darwin`).toBe(false)
+      expect(platformAllowed(f, "linux"), `${f} must be allowed on linux`).toBe(true)
+    }
+  })
+
+  // A file whose only platform infix is absent but whose entire suite is runtime-gated
+  // (e.g. `describe.heavy.ifLinux(...)`) must be dropped from the other platforms' shard plans.
+  it("detectFilePlatforms gates a whole-file ifLinux suite to linux only", () => {
+    const platforms = detectFilePlatforms("test/src/updater/blackboxInstallTest.ts")
+    expect(platforms).not.toBeNull()
+    expect([...platforms!].sort()).toEqual(["linux"])
+  })
+
+  it("detectFilePlatforms gates a whole-file ifMac suite to darwin only", () => {
+    const platforms = detectFilePlatforms("test/src/mac/masTest.ts")
+    expect(platforms).not.toBeNull()
+    expect([...platforms!].sort()).toEqual(["darwin"])
+  })
+
+  // Union across top-level blocks: ifMac + ifNotWindows ⇒ runs on darwin and linux, skips win32.
+  it("detectFilePlatforms unions mixed gates and only excludes the common platform", () => {
+    const platforms = detectFilePlatforms("test/src/mac/macArchive.e2e.ts")
+    expect(platforms).not.toBeNull()
+    expect([...platforms!].sort()).toEqual(["darwin", "linux"])
+  })
+
+  // A file with even one ungated top-level block must stay on every platform (no silent drop).
+  it("detectFilePlatforms returns null when a top-level block is ungated", () => {
+    expect(detectFilePlatforms("test/src/updater/baseUpdaterUnitTest.ts")).toBeNull()
+    expect(detectFilePlatforms("test/src/BuildTest.ts")).toBeNull()
+  })
+
+  it("platformAllowed drops a runtime-gated ifLinux file from non-linux shard plans", () => {
+    const file = "test/src/updater/blackboxInstallTest.ts"
+    expect(platformAllowed(file, "linux")).toBe(true)
+    expect(platformAllowed(file, "darwin")).toBe(false)
+    expect(platformAllowed(file, "win32")).toBe(false)
+  })
+
+  it("all generated files end with Test.ts or e2e.ts (discoverable)", () => {
+    const files = collectGeneratedFiles(GENERATED_TESTS_DIR)
+    expect(files.length).toBeGreaterThan(0)
+    for (const f of files) {
+      expect(path.basename(f), `${f} must end with Test.ts, .e2e.ts or __e2e.ts`).toMatch(/(?:Test|\.e2e|__e2e)\.ts$/)
+    }
+  })
+
+  // Suites that build and inspect installers are emitted as `*.e2e.ts` (TEST_MODE=e2e); the platform suffix
+  // logic is unchanged, so `.win.e2e.ts` and `__e2e.ts` both occur.
+  it("installer-building suites are emitted as .e2e.ts files, app-directory suites as Test.ts files", () => {
+    const files = collectGeneratedFiles(GENERATED_TESTS_DIR)
+    const e2eSuites = [
+      "portable",
+      "assistedInstaller",
+      "msi",
+      "msiWrapped",
+      "squirrelWindows",
+      "appx",
+      "msix",
+      "differentialWin",
+      "blackboxWin",
+      "blackboxWebWinUpdate",
+      "blackboxWebWinNextLaunch",
+      "blackboxWebWinRejected",
+      "nsisWine",
+    ]
+    for (const suite of e2eSuites) {
+      const suiteFiles = files.filter(f => f.includes(`/${suite}/`))
+      expect(suiteFiles.length, `${suite} should have generated files`).toBeGreaterThan(0)
+      for (const f of suiteFiles) {
+        expect(isE2eTestFile(f), `${f} must be an e2e file (.e2e.ts / __e2e.ts)`).toBe(true)
+        expect(path.basename(f), `${suite} file must not end with Test.ts`).not.toMatch(/Test\.ts$/)
+      }
+    }
+    const unitSuites = ["winPackager", "winCodeSign", "wineToolset", "linuxPackager", "blackboxLinux", "differentialLinux"]
+    for (const suite of unitSuites) {
+      const suiteFiles = files.filter(f => f.includes(`/${suite}/`))
+      expect(suiteFiles.length, `${suite} should have generated files`).toBeGreaterThan(0)
+      for (const f of suiteFiles) {
+        expect(path.basename(f), `${suite} file must end with Test.ts`).toMatch(/Test\.ts$/)
+      }
+    }
+    expect(
+      files.some(f => f.endsWith(".win.e2e.ts")),
+      "a .win. gated e2e suite (portable)"
+    ).toBe(true)
+    expect(
+      files.some(f => f.endsWith("__e2e.ts")),
+      "an ungated e2e suite (nsisWine, assistedInstaller)"
+    ).toBe(true)
+    // the wine dimension is stripped from the snapshot path, so both wine variants share `<stem>__e2e.js.snap`
+    expect(files.some(f => f.endsWith("__wine-0.0.0__e2e.ts") && f.includes("/assistedInstaller/"))).toBe(true)
+  })
+
+  it("platformAllowed honours the .win. infix on .e2e.ts files", () => {
+    const winE2eFiles = collectGeneratedFiles(GENERATED_TESTS_DIR).filter(f => f.endsWith(".win.e2e.ts"))
+    expect(winE2eFiles.length).toBeGreaterThan(0)
+    for (const f of winE2eFiles) {
+      expect(platformAllowed(f, "linux"), `${f} must not be allowed on Linux`).toBe(false)
+      expect(platformAllowed(f, "darwin"), `${f} must not be allowed on macOS`).toBe(false)
+      expect(platformAllowed(f, "win32"), `${f} must be allowed on win32`).toBe(true)
+    }
+  })
+})
+
+describe("TEST_MODE file discovery", () => {
+  beforeAll(() => {
+    generateTests()
+  })
+
+  // Tests below stub TEST_FILES; the vitest config does not set `unstubEnvs`, so restore the real value explicitly.
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  // TEST_FILES forces inclusion regardless of mode, so the partition only holds without a real override (a blank
+  // TEST_FILES, as docker/run-tests.sh passes for an unset variable, is not one).
+  const withoutOverride = getTestFilesOverride() ? it.skip : it
+
+  for (const platform of ["linux", "darwin", "win32"] as SupportedPlatforms[]) {
+    withoutOverride(`unit and e2e are disjoint and partition all on ${platform}`, () => {
+      const all = getAllTestFiles(platform, "all")
+      const unit = getAllTestFiles(platform, "unit")
+      const e2e = getAllTestFiles(platform, "e2e")
+
+      expect(unit.length).toBeGreaterThan(0)
+      expect(e2e.length).toBeGreaterThan(0)
+      expect(unit.filter(f => e2e.includes(f))).toEqual([])
+      expect([...unit, ...e2e].sort()).toEqual([...all].sort())
+      for (const f of e2e) {
+        expect(isE2eTestFile(f), `${f} selected by TEST_MODE=e2e must be a .e2e.ts file`).toBe(true)
+      }
+      for (const f of unit) {
+        expect(isE2eTestFile(f), `${f} selected by TEST_MODE=unit must not be a .e2e.ts file`).toBe(false)
+      }
+    })
+  }
+
+  // docker/run-tests.sh forwards `-e TEST_FILES="${TEST_FILES:-}"`, so an unset variable reaches discovery as "". That must
+  // behave exactly like unset: `"".split(",")` → `[""]` would make every directory entry (helpers, .sh, dockerfiles) an
+  // "override match" and inflate the file universe (253 files / 14 shards on Linux instead of 201 / 11).
+  it('TEST_FILES="" (blank) is not an override and discovers the same files as unset', () => {
+    vi.stubEnv("TEST_FILES", undefined)
+    expect(getTestFilesOverride()).toBeUndefined()
+    const unset = getAllTestFiles("linux", "all")
+
+    for (const blank of ["", "   ", " , ,"]) {
+      vi.stubEnv("TEST_FILES", blank)
+      expect(getTestFilesOverride(), `TEST_FILES=${JSON.stringify(blank)}`).toBeUndefined()
+      expect(getAllTestFiles("linux", "all"), `TEST_FILES=${JSON.stringify(blank)}`).toEqual(unset)
+    }
+    expect(unset.some(f => f.endsWith("/helpers/packTester.ts") || f.endsWith(".sh"))).toBe(false)
+
+    vi.stubEnv("TEST_FILES", " snapHeavy , webInstaller ")
+    expect(getTestFilesOverride()).toEqual(["snapHeavy", "webInstaller"])
+  })
+
+  // flatpak.e2e.ts is in skippedTests: it only runs natively in the Test Flatpak job (TEST_FILES=flatpak), and its
+  // `describe.ifEnv` skip inside the docker shards would otherwise record a ~0 ms linux run that ties with the real one
+  // in merge-smart-cache.ts. TEST_FILES is an explicit request and must still select it there.
+  it("flatpak.e2e is excluded from default discovery but still selected by TEST_FILES=flatpak", () => {
+    vi.stubEnv("TEST_FILES", undefined)
+    expect(getAllTestFiles("linux", "all")).not.toContain("test/src/linux/flatpak.e2e.ts")
+    expect(getAllTestFiles("linux", "e2e")).not.toContain("test/src/linux/flatpak.e2e.ts")
+
+    vi.stubEnv("TEST_FILES", "flatpak")
+    expect(getAllTestFiles("linux", "all")).toContain("test/src/linux/flatpak.e2e.ts")
+  })
+
+  // The Linux e2e suites in skipPerOSTests.linux only do work in the "Test e2e Auto Updater Linux" images (and the Test
+  // Flatpak job), which select them by TEST_FILES. In the docker Linux shards they skip, so the shard plan must not
+  // budget them the e2e jobs' durations.
+  it("Linux e2e-only suites are excluded from default Linux discovery but still selected by TEST_FILES", () => {
+    const linuxE2eOnly = [
+      "test/src/updater/blackboxInstallTest.ts",
+      "test/src/updater/linux-pm/blackboxUpdateTest.ts",
+      "test/src/updater/linux-pm/blackboxUpdateLinuxNextLaunch.e2e.ts",
+      "test/src/updater/linux-pm/blackboxUpdateLinuxSignedManifest.e2e.ts",
+      "test/src/updater/linux-pm/blackboxUpdateLinuxKeyRotation.e2e.ts",
+      "test/src/generated/blackboxLinux/blackboxLinux__appimage-0.0.0.linux.Test.ts",
+    ]
+    for (const f of linuxE2eOnly) {
+      expect(fs.existsSync(f), `${f} must exist (renamed? update skipPerOSTests.linux and the CI e2e matrix)`).toBe(true)
+    }
+
+    vi.stubEnv("TEST_FILES", undefined)
+    const linux = getAllTestFiles("linux", "all")
+    expect(linux.filter(f => linuxE2eOnly.includes(f) || f.includes("blackboxLinux__appimage"))).toEqual([])
+    // its detectPackageManager unit tests run in the Linux shards
+    expect(linux).toContain("test/src/updater/linuxUpdaterTest.ts")
+    // the Linux skip list does not leak to other platforms: the mac split blackbox suites stay on macOS
+    expect(getAllTestFiles("darwin", "all")).toContain("test/src/updater/mac/blackboxUpdateKeyRotation.e2e.ts")
+
+    // the tokens the CI e2e matrix passes (test/src/updater/test-specific-platforms.sh, .github/workflows/test.yaml)
+    vi.stubEnv(
+      "TEST_FILES",
+      "blackboxInstallTest,blackboxUpdateTest,blackboxUpdateLinuxNextLaunch,blackboxUpdateLinuxSignedManifest,blackboxUpdateLinuxKeyRotation,blackboxLinux__appimage"
+    )
+    const selected = getAllTestFiles("linux", "all")
+    for (const f of linuxE2eOnly) {
+      expect(selected).toContain(f)
+    }
+  })
+
+  it("hand-written e2e files are discovered next to their unit-level siblings", () => {
+    const e2e = getAllTestFiles("linux", "e2e")
+    expect(e2e).toContain("test/src/windows/oneClickInstaller.e2e.ts")
+    expect(e2e).toContain("test/src/PublishManager.e2e.ts")
+    const unit = getAllTestFiles("linux", "unit")
+    expect(unit).toContain("test/src/windows/oneClickInstallerTest.ts")
+    expect(unit).toContain("test/src/PublishManagerTest.ts")
+  })
+})
+
+describe("resolveCachedMs", () => {
+  const statWith = (linux: { runs: number; avgMs: number }): FileStats => ({
+    platformRuns: {
+      win32: { runs: 0, fails: 0, avgMs: 0 },
+      darwin: { runs: 0, fails: 0, avgMs: 0 },
+      linux: { ...linux, fails: 0 },
+    },
+  })
+
+  it("keeps a genuine measured 0 ms (runs > 0) instead of treating it as unknown", () => {
+    expect(resolveCachedMs(statWith({ runs: 3, avgMs: 0 }), "linux")).toBe(0)
+  })
+
+  it("returns the measured avg when the platform has runs", () => {
+    expect(resolveCachedMs(statWith({ runs: 2, avgMs: 1234 }), "linux")).toBe(1234)
+  })
+
+  it("returns undefined when the platform has never run (runs === 0)", () => {
+    expect(resolveCachedMs(statWith({ runs: 0, avgMs: 0 }), "linux")).toBeUndefined()
+    expect(resolveCachedMs(statWith({ runs: 5, avgMs: 999 }), "win32")).toBeUndefined()
+  })
+
+  it("returns undefined for a missing stat or missing platformRuns", () => {
+    expect(resolveCachedMs(undefined, "linux")).toBeUndefined()
+    expect(resolveCachedMs({}, "linux")).toBeUndefined()
+  })
+})
+
+describe("parseSmartCacheSource", () => {
+  it("parses the planner's <artifact-name>@<run-id> source", () => {
+    expect(parseSmartCacheSource("vitest-smart-cache-release-v26@39493871782")).toEqual({ kind: "artifact", name: "vitest-smart-cache-release-v26", runId: 39493871782 })
+  })
+
+  it("parses 'none' (planner had no cache, so the shard must not restore one either)", () => {
+    expect(parseSmartCacheSource(" none ")).toEqual({ kind: "none" })
+  })
+
+  it("rejects malformed sources instead of silently falling back to another cache", () => {
+    expect(() => parseSmartCacheSource("vitest-smart-cache-master")).toThrow(/Invalid smart cache source/)
+    expect(() => parseSmartCacheSource("@123")).toThrow(/Invalid smart cache source/)
+    expect(() => parseSmartCacheSource("vitest-smart-cache-master@abc")).toThrow(/Invalid smart cache source/)
+    expect(() => parseSmartCacheSource('vitest-smart-cache-PR-""')).toThrow(/Invalid smart cache source/)
+  })
+})
+
+describe("shardPlanMismatchError", () => {
+  it("passes when the in-job shard count equals the matrix size, or no expectation is set", () => {
+    expect(shardPlanMismatchError(14, 14)).toBeNull()
+    expect(shardPlanMismatchError(null, 9)).toBeNull()
+  })
+
+  it("reports a mismatch (e.g. matrix of 14 vs in-job plan of 9) rather than clamping the shard index", () => {
+    const error = shardPlanMismatchError(14, 9, "vitest-smart-cache-master@39494064035")
+    expect(error).toMatch(/Shard plan mismatch: the CI matrix was planned with 14 shard\(s\) but this job computed 9/)
+    expect(error).toContain("vitest-smart-cache-master@39494064035")
+  })
+})

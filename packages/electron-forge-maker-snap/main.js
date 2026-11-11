@@ -1,13 +1,18 @@
-"use strict"
+import { ElectronBuilderForgeMaker, withLegacyForgeCall } from "app-builder-lib"
 
-Object.defineProperty(exports, "__esModule", {
-  value: true
-})
+class MakerSnap extends ElectronBuilderForgeMaker {
+  name = "snap"
+  defaultPlatforms = ["linux"]
 
-const buildForge = require("app-builder-lib").buildForge
-
-exports.isSupportedOnCurrentPlatform = () => Promise.resolve(true)
-
-exports.default = function (options) {
-  return buildForge(options, {linux: [`snap:${options.targetArch}`]})
+  getTarget(targetArch, config) {
+    return { linux: [`snap:${targetArch}`], config: { snapcraft: config } }
+  }
 }
+
+const Maker = withLegacyForgeCall(MakerSnap)
+
+export { Maker as MakerSnap }
+export default Maker
+
+// Electron Forge 5 checked this on the module
+export const isSupportedOnCurrentPlatform = () => Promise.resolve(true)

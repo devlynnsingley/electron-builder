@@ -1,4 +1,4 @@
-import { TargetSpecificOptions } from "../core"
+import { TargetSpecificOptions } from "../core.js"
 
 // noinspection SpellCheckingInspection
 export type BackgroundAlignment = "center" | "left" | "right" | "top" | "bottom" | "topleft" | "topright" | "bottomleft" | "bottomright"
@@ -58,12 +58,12 @@ export interface PkgOptions extends TargetSpecificOptions {
   readonly allowRootDirectory?: boolean | null
 
   /**
-   * The name of certificate to use when signing. Consider using environment variables [CSC_LINK or CSC_NAME](/code-signing) instead of specifying this option.
+   * The name of certificate to use when signing. Consider using environment variables [CSC_LINK or CSC_NAME](https://www.electron.build/docs/features/code-signing) instead of specifying this option.
    */
   readonly identity?: string | null
 
   /**
-   * The path to EULA license file. Defaults to `license.txt` or `eula.txt` (or uppercase variants). In addition to `txt, `rtf` and `html` supported (don't forget to use `target="_blank"` for links).
+   * The path to EULA license file. Defaults to `license.txt` or `eula.txt` (or uppercase variants). In addition to `txt`, `rtf` and `html` supported (don't forget to use `target="_blank"` for links).
    */
   readonly license?: string | null
 
@@ -78,7 +78,9 @@ export interface PkgOptions extends TargetSpecificOptions {
   readonly welcome?: string | null
 
   /**
-   * Identifies applications that must be closed before the package is installed.\n\nCorresponds to [must-close](https://developer.apple.com/library/archive/documentation/DeveloperTools/Reference/DistributionDefinitionRef/Chapters/Distribution_XML_Ref.html#//apple_ref/doc/uid/TP40005370-CH100-SW77)
+   * Identifies applications that must be closed before the package is installed.
+   *
+   * Corresponds to [must-close](https://developer.apple.com/library/archive/documentation/DeveloperTools/Reference/DistributionDefinitionRef/Chapters/Distribution_XML_Ref.html#//apple_ref/doc/uid/TP40005370-CH100-SW77).
    */
   readonly mustClose?: Array<string> | null
 
@@ -124,6 +126,12 @@ export interface PkgOptions extends TargetSpecificOptions {
    * @default upgrade
    */
   readonly overwriteAction?: "upgrade" | "update" | null
+
+  /**
+   * The extra component packages directory (relative to build resources directory) for MacOS product archive
+   * Autoscans directory for any `.pkg` files and adds to `productbuild` command as `--package-path` and `--package` accordingly
+   */
+  readonly extraPkgsDir?: string | null
 }
 
 /**

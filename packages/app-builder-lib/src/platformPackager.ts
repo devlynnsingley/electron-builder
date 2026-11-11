@@ -1,36 +1,92 @@
-import BluebirdPromise from "bluebird-lst"
-import { Arch, asArray, AsyncTaskManager, debug, DebugLogger, deepAssign, getArchSuffix, InvalidConfigurationError, isEmptyOrSpaces, log, isEnvTrue } from "builder-util"
-import { defaultArchFromString, getArtifactArchName } from "builder-util/out/arch"
-import { FileTransformer, statOrNull } from "builder-util/out/fs"
-import { orIfFileNotExist } from "builder-util/out/promise"
+import type { FuseConfig, FuseV1Config } from "@electron/fuses"
+import { dynamicImport } from "./util/dynamicImport.js"
+import { CONTENT_ALIGNMENT_WARN_THRESHOLD, validateContentAlignment } from "./asar/asarAlign.js"
+import {
+  Arch,
+  asArray,
+  AsyncTaskManager,
+  DebugLogger,
+  defaultArchFromString,
+  ExternalLinkPolicy,
+  FileTransformer,
+  getArchSuffix,
+  getArtifactArchName,
+  InvalidConfigurationError,
+  isEmptyOrSpaces,
+  loadUpdateSigningKeys,
+  log,
+  orIfFileNotExist,
+  parsePrivateKey,
+  sanitizeDirPath,
+  statOrNull,
+} from "builder-util"
+import { CancellationToken, deepAssign, MemoLazy, Nullish } from "builder-util-runtime"
+import type { KeyObject } from "crypto"
 import { readdir } from "fs/promises"
 import { Lazy } from "lazy-val"
 import { Minimatch } from "minimatch"
 import * as path from "path"
-import { AppInfo } from "./appInfo"
-import { checkFileInArchive } from "./asar/asarFileChecker"
-import { AsarPackager } from "./asar/asarUtil"
-import { computeData } from "./asar/integrity"
-import { copyFiles, FileMatcher, getFileMatchers, GetFileMatchersOptions, getMainFileMatchers, getNodeModuleFileMatcher } from "./fileMatcher"
-import { createTransformer, isElectronCompileUsed } from "./fileTransformer"
-import { Framework, isElectronBased } from "./Framework"
-import {
+import * as fs from "fs/promises"
+import type { TmpDir } from "temp-file"
+import type { Metadata } from "./options/metadata.js"
+// not re-exported from ./index.js, and a type-only import keeps the barrel-cycle guard below intact
+import type { UpdateManifestSigningOptions } from "./options/PlatformSpecificBuildOptions.js"
+import type { ArtifactBuildStarted, ArtifactCreated } from "./packagerApi.js"
+import { AppInfo } from "./appInfo.js"
+import { isSignResultSigned, SigningResult } from "./codeSign/signResult.js"
+import { FORCE_CODE_SIGNING_DOCS, forceCodeSigningOverrideHint } from "./codeSign/forceCodeSigning.js"
+import { BUILD_CHANGES_URL } from "./util/config/legacyOptions.js"
+import { checkFileInArchive } from "./asar/asarFileChecker.js"
+import { AsarPackager } from "./asar/asarUtil.js"
+import { AsarIntegrity, computeData } from "./asar/integrity.js"
+import { FuseOptionsV1 } from "./options/FuseOptionsV1.js"
+import { copyFiles, FileMatcher, getFileMatchers, GetFileMatchersOptions, getMainFileMatchers, getNodeModuleFileMatcher } from "./fileMatcher.js"
+import { createTransformer } from "./fileTransformer.js"
+import { Framework, isElectronBased } from "./Framework.js"
+import { Platform, SourceRepositoryInfo } from "./core.js"
+// Type-only barrel import: keeping these erased avoids a runtime cycle
+// (index.ts → linuxPackager.ts → platformPackager.ts) that breaks ESM class init.
+import type {
   AfterPackContext,
   AsarOptions,
   CompressionLevel,
   Configuration,
   ElectronPlatformName,
   FileAssociation,
+  LinuxPackager,
   Packager,
   PackagerOptions,
-  Platform,
   PlatformSpecificBuildOptions,
   Target,
   TargetSpecificOptions,
-} from "./index"
-import { executeAppBuilderAsJson } from "./util/appBuilder"
-import { computeFileSets, computeNodeModuleFileSets, copyAppFiles, ELECTRON_COMPILE_SHIM_FILENAME, transformFiles } from "./util/appFileCopier"
-import { expandMacro as doExpandMacro } from "./util/macroExpander"
+} from "./index.js"
+import type { PlatformType } from "./targets/mac/MacTargetHelper.js"
+import { computeFileSets, computeNodeModuleFileSets, copyAppFiles, transformFiles } from "./util/appFileCopier.js"
+import { verifyNativeBinaries } from "./util/nativeBinaryVerifier.js"
+import { getTrustedSourceRoots, resolveAllowExternalLinks } from "./util/trustedSourceRoots.js"
+import { convertIcon, IconFormat, IconInfo } from "./util/iconConverter.js"
+import { expandMacro as doExpandMacro } from "./util/macroExpander.js"
+import { AssetCatalogResult, generateAssetCatalogForIcon } from "./util/mac/macosIconComposer.js"
+
+export type DoPackOptions<DC extends PlatformSpecificBuildOptions> = {
+  outDir: string
+  appOutDir: string
+  platformName: ElectronPlatformName
+  // macOS-only: authoritative 3-way build flavor; `platformName` collapses mas/mas-dev to "mas".
+  platformType?: PlatformType
+  arch: Arch
+  platformSpecificBuildOptions: DC
+  targets: Array<Target>
+  options?: {
+    sign?: boolean
+    disableAsarIntegrity?: boolean
+    disableFuses?: boolean
+    // Universal slices set this: keep platform-mismatched node modules so both slices stay symmetric.
+    // Per-slice `cpu`/`os` filtering would leave packages in only one slice, which `@electron/universal`
+    // refuses to merge. Single-arch binaries are instead reconciled via `singleArchFiles` after both packs.
+    disableArchFilter?: boolean
+  }
+}
 
 export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> {
   get packagerOptions(): PackagerOptions {
@@ -49,7 +105,34 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     return this.info.config
   }
 
-  readonly platformSpecificBuildOptions: DC
+  protected readonly platformSpecificBuildOptions: DC
+
+  /** Platform-level build options (e.g. `config.mac`, `config.win`, `config.linux`). */
+  get platformOptions(): DC {
+    return this.platformSpecificBuildOptions
+  }
+
+  /**
+   * Merge platform-level options with target-specific config under `key`.
+   * Replaces the manual `deepAssign({}, packager.platformSpecificBuildOptions, config.X)` pattern.
+   */
+  getOptionsForTarget<T>(key: string): T {
+    return deepAssign({}, this.platformSpecificBuildOptions, (this.config as any)[key] ?? {}) as T
+  }
+
+  private externalLinkPolicy: Promise<ExternalLinkPolicy> | null = null
+
+  /**
+   * The resolved `fileOptions.allowExternalLinks` option: the platform-level value (`config.mac.fileOptions.allowExternalLinks`, ...) or the
+   * root one (see {@link resolveAllowExternalLinks}). Computed once; a listed path that does not exist fails the build.
+   */
+  getExternalLinkPolicy(): Promise<ExternalLinkPolicy> {
+    if (this.externalLinkPolicy == null) {
+      const { value, optionPath } = resolveAllowExternalLinks(this.config, this.platformSpecificBuildOptions, this.platform.buildConfigurationKey)
+      this.externalLinkPolicy = ExternalLinkPolicy.create(value, this.projectDir, optionPath)
+    }
+    return this.externalLinkPolicy
+  }
 
   get resourceList(): Promise<Array<string>> {
     return this._resourceList.value
@@ -57,9 +140,108 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
 
   private readonly _resourceList = new Lazy<Array<string>>(() => orIfFileNotExist(readdir(this.info.buildResourcesDir), []))
 
+  /**
+   * The effective `updateManifest` option: a platform-level value (`config.mac.updateManifest`, ...) shadows the
+   * root one, and so does `false` - the explicit opt-out - because `??` only falls through on null/undefined.
+   * A platform-level `null` therefore still falls back to the root rather than disabling signing.
+   *
+   * Note that `mas` / `masDev` are not consulted: `platformOptions` is `config[platform.buildConfigurationKey]`,
+   * which is `mac` for every macOS flavor. MAS builds produce no auto-update metadata, so the opt-out belongs on
+   * `mac` or at the root.
+   */
+  get updateManifestOptions(): UpdateManifestSigningOptions | false | null {
+    return this.platformOptions.updateManifest ?? this.config.updateManifest ?? null
+  }
+
+  /**
+   * Ed25519 private key(s) used to sign auto-update manifests; empty when signing is opted out of, or when
+   * nothing is configured. Single source of truth for both consumers - updateInfoBuilder (signing `latest*.yml`)
+   * and PublishManager (embedding the derived public keys in `app-update.yml`) - so the two can no longer
+   * disagree about whether signing is on or which keys are in play. Several keys mean every manifest is
+   * signed by each of them (dual-signing during key rotation); the first key is the one written to the
+   * legacy single `signature` field. MemoLazy rather than Lazy so a hook mutating `updateManifest`
+   * between packs re-resolves, while a normal build parses the PEMs once.
+   *
+   * Deliberately non-throwing: callers about to emit auto-update metadata go through
+   * {@link requireUpdateSigningKeys}, which enforces the requirement. Callers that only want the keys if they
+   * happen to exist - embedding a trust list for a publish target with `publishAutoUpdate: false` - read this.
+   */
+  readonly updateSigningKeys = new MemoLazy<UpdateManifestSigningOptions | false | null, Array<KeyObject>>(
+    () => this.updateManifestOptions,
+    // resolution is fully synchronous (env/readFileSync + createPrivateKey); MemoLazy just wants a promise
+    selected => {
+      // `false` must short-circuit before loadUpdateSigningKeys, or an ELECTRON_BUILDER_UPDATE_SIGN_KEY left in
+      // the CI environment would keep signing - and keep embedding a public key - despite the explicit opt-out.
+      if (selected === false) {
+        return Promise.resolve([])
+      }
+      // relative signingKeyFile paths are project-relative, like every other path in the configuration
+      const pems = loadUpdateSigningKeys(selected, this.projectDir)
+      if (pems.length === 0) {
+        return Promise.resolve([])
+      }
+      log.info({ platform: this.platform.name, keys: pems.length }, "signing update manifests with Ed25519 key(s)")
+      return Promise.resolve(pems.map(parsePrivateKey))
+    }
+  )
+
+  /**
+   * Resolves the signing keys for a build step that will emit auto-update metadata, enforcing that manifests are
+   * signed: an unsigned `latest*.yml` lets anyone who can write to the update feed point every install at an
+   * arbitrary installer.
+   *
+   * `required` is the publish gate - a build with a publish policy fails - and `forceCodeSigning` enforces it for every
+   * build, publishing or not (pull-request builds included). Any other build that merely writes a manifest (which
+   * includes any GitHub-hosted project, since the publish config is inferred from `repository`) gets an advisory
+   * warning instead, so local builds and external-signer pipelines keep working. `updateManifest: false` stays an
+   * explicit opt-out that only warns, also under `forceCodeSigning`. The warning is emitted at most once per packager;
+   * the throw stays re-derivable, since the call sites run per arch and per manifest task.
+   */
+  async requireUpdateSigningKeys(required: boolean): Promise<Array<KeyObject>> {
+    const optedOut = this.updateManifestOptions === false
+    const keys = optedOut ? [] : await this.updateSigningKeys.value
+    if (keys.length > 0) {
+      return keys
+    }
+
+    const forced = !required && this.forceCodeSigning
+    if (!optedOut && (required || forced)) {
+      throw new InvalidConfigurationError(
+        `auto-update manifests must be signed ${forced ? "because forceCodeSigning is enabled (also for builds that do not publish, including pull-request builds)" : "when publishing"}, ` +
+          `but no Ed25519 signing key was found for ${this.platform.name}. ` +
+          "Generate one with `electron-builder create-update-key`, then supply it via the ELECTRON_BUILDER_UPDATE_SIGN_KEY (base64-encoded PEM file) " +
+          "or ELECTRON_BUILDER_UPDATE_SIGN_KEY_FILE (path) environment variable, or via updateManifest.signingKey / " +
+          "updateManifest.signingKeyFile in the build configuration. To publish unsigned manifests anyway, opt out explicitly with `updateManifest: false`" +
+          (forced
+            ? `, or pass ${forceCodeSigningOverrideHint(this)} to build without forceCodeSigning. See ${FORCE_CODE_SIGNING_DOCS}`
+            : `. See ${BUILD_CHANGES_URL}#signed-update-manifests-are-required`)
+      )
+    }
+
+    log.once("unsigned-update-manifest", this).warn(
+      {
+        platform: this.platform.name,
+        reason: optedOut
+          ? `updateManifest is set to false${this.forceCodeSigning ? " (forceCodeSigning does not cover update manifests while updateManifest is false)" : ""}`
+          : "no Ed25519 signing key is configured",
+      },
+      "auto-update manifests will be unsigned: anyone who can overwrite latest*.yml on your update server can point installs at an arbitrary payload. " +
+        "Note that installs which already embed a public key reject unsigned manifests (ERR_UPDATER_MANIFEST_NOT_SIGNED). " +
+        (optedOut
+          ? "Remove `updateManifest: false` and provide a key with `electron-builder create-update-key` to enable signing. " +
+            "See https://www.electron.build/docs/features/signed-update-manifests"
+          : "Publishing this configuration will fail (and so will a build with forceCodeSigning) until you provide a key with `electron-builder create-update-key`, " +
+            `or opt out explicitly with \`updateManifest: false\`. See ${BUILD_CHANGES_URL}#signed-update-manifests-are-required`)
+    )
+    return keys
+  }
+
   readonly appInfo: AppInfo
 
-  protected constructor(readonly info: Packager, readonly platform: Platform) {
+  protected constructor(
+    protected readonly info: Packager,
+    readonly platform: Platform
+  ) {
     this.platformSpecificBuildOptions = PlatformPackager.normalizePlatformSpecificBuildOptions((this.config as any)[platform.buildConfigurationKey])
     this.appInfo = this.prepareAppInfo(info.appInfo)
   }
@@ -77,6 +259,90 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     return this.info.debugLogger
   }
 
+  get tempDirManager(): TmpDir {
+    return this.info.tempDirManager
+  }
+
+  addBuildFinalizeTask(task: () => Promise<void>): void {
+    this.info.addBuildFinalizeTask(task)
+  }
+
+  get metadata(): Metadata {
+    return this.info.metadata
+  }
+
+  get originalMetadata(): Metadata {
+    return this.info.originalMetadata
+  }
+
+  get framework(): Framework {
+    return this.info.framework
+  }
+
+  get cancellationToken(): CancellationToken {
+    return this.info.cancellationToken
+  }
+
+  get repositoryInfo(): Promise<SourceRepositoryInfo | null> {
+    return this.info.repositoryInfo
+  }
+
+  get relativeBuildResourcesDirname(): string {
+    return this.info.relativeBuildResourcesDirname
+  }
+
+  get stageDirPathCustomizer(): (target: Target, packager: PlatformPackager<any>, arch: Arch) => string {
+    return this.info.stageDirPathCustomizer
+  }
+
+  get areNodeModulesHandledExternally(): boolean {
+    return this.info.areNodeModulesHandledExternally
+  }
+
+  get isPrepackedAppAsar(): boolean {
+    return this.info.isPrepackedAppAsar
+  }
+
+  get appDir(): string {
+    return this.info.appDir
+  }
+
+  getWorkspaceRoot(): Promise<string> {
+    return this.info.getWorkspaceRoot()
+  }
+
+  get nodePackageName(): string {
+    return this.info.nodePackageName
+  }
+
+  getPackageManager(): Promise<import("./node-module-collector/index.js").PM> {
+    return this.info.getPackageManager()
+  }
+
+  emitArtifactBuildStarted(event: ArtifactBuildStarted, logFields?: any): Promise<void> {
+    return this.info.emitArtifactBuildStarted(event, logFields)
+  }
+
+  emitArtifactBuildCompleted(event: ArtifactCreated): Promise<void> {
+    return this.info.emitArtifactBuildCompleted(event)
+  }
+
+  emitArtifactCreated(event: ArtifactCreated): Promise<void> {
+    return this.info.emitArtifactCreated(event)
+  }
+
+  emitMsiProjectCreated(path: string): Promise<void> {
+    return this.info.emitMsiProjectCreated(path)
+  }
+
+  emitAppxManifestCreated(path: string): Promise<void> {
+    return this.info.emitAppxManifestCreated(path)
+  }
+
+  emitPkgDistributionCreated(path: string): Promise<void> {
+    return this.info.emitPkgDistributionCreated(path)
+  }
+
   abstract get defaultTarget(): Array<string>
 
   // eslint-disable-next-line
@@ -84,13 +350,13 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     return new AppInfo(this.info, null, this.platformSpecificBuildOptions)
   }
 
-  private static normalizePlatformSpecificBuildOptions(options: any | null | undefined): any {
+  private static normalizePlatformSpecificBuildOptions(options: any | Nullish): any {
     return options == null ? Object.create(null) : options
   }
 
   abstract createTargets(targets: Array<string>, mapper: (name: string, factory: (outDir: string) => Target) => void): void
 
-  protected getCscPassword(): string {
+  getCscPassword(): string {
     const password = this.doGetCscPassword()
     if (isEmptyOrSpaces(password)) {
       log.info({ reason: "CSC_KEY_PASSWORD is not defined" }, "empty password will be used for code signing")
@@ -100,44 +366,64 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     }
   }
 
-  protected getCscLink(extraEnvName?: string | null): string | null | undefined {
+  getCscLink(extraEnvName?: string | null): string | Nullish {
     // allow to specify as empty string
     const envValue = chooseNotNull(extraEnvName == null ? null : process.env[extraEnvName], process.env.CSC_LINK)
     return chooseNotNull(chooseNotNull(this.info.config.cscLink, this.platformSpecificBuildOptions.cscLink), envValue)
   }
 
-  protected doGetCscPassword(): string | null | undefined {
+  doGetCscPassword(): string | Nullish {
     // allow to specify as empty string
     return chooseNotNull(chooseNotNull(this.info.config.cscKeyPassword, this.platformSpecificBuildOptions.cscKeyPassword), process.env.CSC_KEY_PASSWORD)
   }
 
   protected computeAppOutDir(outDir: string, arch: Arch): string {
-    return (
+    // codeql[js/shell-command-constructed-from-input] - prepackaged and outDir are validated via sanitizeDirPath in the Packager constructor
+    return path.resolve(
       this.packagerOptions.prepackaged ||
-      path.join(
-        outDir,
-        `${this.platform.buildConfigurationKey}${getArchSuffix(arch, this.platformSpecificBuildOptions.defaultArch)}${this.platform === Platform.MAC ? "" : "-unpacked"}`
-      )
+        path.join(
+          outDir,
+          `${this.platform.buildConfigurationKey}${getArchSuffix(arch, this.platformSpecificBuildOptions.defaultArch)}${this.platform === Platform.MAC ? "" : "-unpacked"}`
+        )
     )
-  }
-
-  dispatchArtifactCreated(file: string, target: Target | null, arch: Arch | null, safeArtifactName?: string | null): Promise<void> {
-    return this.info.callArtifactBuildCompleted({
-      file,
-      safeArtifactName,
-      target,
-      arch,
-      packager: this,
-    })
   }
 
   async pack(outDir: string, arch: Arch, targets: Array<Target>, taskManager: AsyncTaskManager): Promise<any> {
     const appOutDir = this.computeAppOutDir(outDir, arch)
-    await this.doPack(outDir, appOutDir, this.platform.nodeName as ElectronPlatformName, arch, this.platformSpecificBuildOptions, targets)
+    await this.doPack({
+      outDir,
+      appOutDir,
+      platformName: this.platform.nodeName as ElectronPlatformName,
+      arch,
+      platformSpecificBuildOptions: this.platformSpecificBuildOptions,
+      targets,
+    })
+    // test-only early exit (see PackagerOptions.afterPackTestHook); a no-op unless the option is set
+    if (await this.info.shouldSkipTargetsAfterPack({ appOutDir, outDir, arch, targets, packager: this, electronPlatformName: this.platform.nodeName })) {
+      return
+    }
     this.packageInDistributableFormat(appOutDir, arch, targets, taskManager)
   }
 
+  // the targets built from each pack (app dir and arch): they ship its single app-update.yml, so a target that writes
+  // that file itself (AppImage, deb/rpm/pacman) resolves it for all of them - see getPackAppUpdatePublishConfiguration.
+  // Keyed by arch too: a prepackaged app dir is the same for every arch, and each arch may have other targets, whose
+  // builds can still be running when the next arch is packaged.
+  private readonly packToTargets = new Map<string, ReadonlyArray<Target>>()
+
+  /**
+   * @internal queued work still reading an app dir (e.g. zip/7z archiving it), by the resolved dir - see trackPackWork.
+   * Kept apart from `Target.buildQueueManager`, which `finishBuild()` may drain before that work is done.
+   */
+  readonly pendingPackWork = new Map<string, Set<Promise<any>>>()
+
+  /** @internal the targets packaged from `appOutDir` for `arch`, as passed to their `build()` */
+  getPackTargets(appOutDir: string, arch: Arch): ReadonlyArray<Target> | undefined {
+    return this.packToTargets.get(packKey(appOutDir, arch))
+  }
+
   protected packageInDistributableFormat(appOutDir: string, arch: Arch, targets: Array<Target>, taskManager: AsyncTaskManager): void {
+    this.packToTargets.set(packKey(appOutDir, arch), targets)
     if (targets.find(it => !it.isAsyncSupported) == null) {
       PlatformPackager.buildAsyncTargets(targets, taskManager, appOutDir, arch)
       return
@@ -150,7 +436,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
       await subTaskManager.awaitTasks()
 
       for (const target of targets) {
-        if (!target.isAsyncSupported) {
+        if (!target.isAsyncSupported && !this.info.cancellationToken.cancelled) {
           await target.build(appOutDir, arch)
         }
       }
@@ -166,11 +452,8 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
   }
 
   private getExtraFileMatchers(isResources: boolean, appOutDir: string, options: GetFileMatchersOptions): Array<FileMatcher> | null {
-    const base = isResources
-      ? this.getResourcesDir(appOutDir)
-      : this.platform === Platform.MAC
-      ? path.join(appOutDir, `${this.appInfo.productFilename}.app`, "Contents")
-      : appOutDir
+    const outDir = this.platform === Platform.MAC ? path.join(appOutDir, `${this.appInfo.productFilename}.app`, "Contents") : appOutDir
+    const base = isResources ? this.getResourcesDir(appOutDir) : outDir
     return getFileMatchers(this.config, isResources ? "extraResources" : "extraFiles", base, options)
   }
 
@@ -183,16 +466,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     }
   }
 
-  protected async doPack(
-    outDir: string,
-    appOutDir: string,
-    platformName: ElectronPlatformName,
-    arch: Arch,
-    platformSpecificBuildOptions: DC,
-    targets: Array<Target>,
-    sign = true,
-    disableAsarIntegrity = false
-  ) {
+  protected async doPack(packOptions: DoPackOptions<DC>) {
     if (this.packagerOptions.prepackaged != null) {
       return
     }
@@ -200,6 +474,20 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     if (this.info.cancellationToken.cancelled) {
       return
     }
+
+    // Due to node-gyp rewriting GYP_MSVS_VERSION when reused across the same session, we must reset the env var: https://github.com/electron-userland/electron-builder/issues/7256
+    delete process.env.GYP_MSVS_VERSION
+
+    const { outDir, appOutDir, platformName, platformType, arch, platformSpecificBuildOptions, targets, options } = packOptions
+
+    await this.info.emitBeforePack({
+      appOutDir,
+      outDir,
+      arch,
+      targets,
+      packager: this,
+      electronPlatformName: platformName,
+    })
 
     await this.info.installAppDependencies(this.platform, arch)
 
@@ -224,6 +512,15 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
       platformName,
       arch: Arch[arch],
       version: framework.version,
+    })
+
+    await this.info.emitAfterExtract({
+      appOutDir,
+      outDir,
+      arch,
+      targets,
+      packager: this,
+      electronPlatformName: platformName,
     })
 
     const excludePatterns: Array<Minimatch> = []
@@ -257,10 +554,20 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
       this.platform === Platform.MAC
         ? path.join(appOutDir, framework.distMacOsAppName, "Contents", "Resources")
         : isElectronBased(framework)
-        ? path.join(appOutDir, "resources")
-        : appOutDir
+          ? path.join(appOutDir, "resources")
+          : appOutDir
     const taskManager = new AsyncTaskManager(this.info.cancellationToken)
-    this.copyAppFiles(taskManager, asarOptions, resourcesPath, path.join(resourcesPath, "app"), packContext, platformSpecificBuildOptions, excludePatterns, macroExpander)
+    this.copyAppFiles(
+      taskManager,
+      asarOptions,
+      resourcesPath,
+      path.join(resourcesPath, "app"),
+      packContext,
+      platformSpecificBuildOptions,
+      excludePatterns,
+      macroExpander,
+      options?.disableArchFilter ?? false
+    )
     await taskManager.awaitTasks()
 
     if (this.info.cancellationToken.cancelled) {
@@ -268,11 +575,19 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     }
 
     if (framework.beforeCopyExtraFiles != null) {
+      const resourcesRelativePath = this.platform === Platform.MAC ? "Resources" : isElectronBased(framework) ? "resources" : ""
+
+      let asarIntegrity: AsarIntegrity | null = null
+      if (!(asarOptions == null || options?.disableAsarIntegrity || asarOptions.disableIntegrity)) {
+        asarIntegrity = await computeData({ resourcesPath, resourcesRelativePath, resourcesDestinationPath: this.getResourcesDir(appOutDir), extraResourceMatchers })
+      }
+
       await framework.beforeCopyExtraFiles({
         packager: this,
         appOutDir,
-        asarIntegrity: asarOptions == null || disableAsarIntegrity ? null : await computeData(resourcesPath, asarOptions.externalAllowed ? { externalAllowed: true } : null),
+        asarIntegrity,
         platformName,
+        platformType,
       })
     }
 
@@ -281,27 +596,132 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     }
 
     const transformerForExtraFiles = this.createTransformerForExtraFiles(packContext)
-    await copyFiles(extraResourceMatchers, transformerForExtraFiles)
-    await copyFiles(extraFileMatchers, transformerForExtraFiles)
+    // confined, by real path, to the app output directory (or the output directory, for a "to" that leaves it); a copied symlink may lead into the workspace or the package-manager store
+    const extraFilesContainment = { roots: [appOutDir, outDir], allowedSymlinkRoots: await getTrustedSourceRoots(this), externalLinks: await this.getExternalLinkPolicy() }
+    await copyFiles(extraResourceMatchers, transformerForExtraFiles, undefined, extraFilesContainment)
+    await copyFiles(extraFileMatchers, transformerForExtraFiles, undefined, extraFilesContainment)
 
     if (this.info.cancellationToken.cancelled) {
       return
     }
 
-    await this.info.afterPack(packContext)
+    await this.info.emitAfterPack(packContext)
 
     if (framework.afterPack != null) {
       await framework.afterPack(packContext)
     }
 
     const isAsar = asarOptions != null
-    await this.sanityCheckPackage(appOutDir, isAsar, framework)
-    if (sign) {
-      await this.doSignAfterPack(outDir, appOutDir, platformName, arch, platformSpecificBuildOptions, targets)
+    await this.sanityCheckPackage(appOutDir, isAsar, framework, !!asarOptions?.disableSanityCheck)
+    // before fuses/signing and, for a macOS universal build, before the per-arch slices are merged
+    await verifyNativeBinaries({
+      resourcesDir: this.getResourcesDir(appOutDir),
+      platform: this.platform.nodeName,
+      arch,
+      mode: this.config.nativeModules?.verifyNativeBinaries,
+    })
+
+    if (!options?.disableAsarIntegrity) {
+      await this.doAddAsarIntegrityDigest(packContext, platformSpecificBuildOptions, asarOptions)
+    }
+    if (!options?.disableFuses) {
+      await this.doAddElectronFuses(packContext)
+    }
+    if (options?.sign ?? true) {
+      await this.doSignAfterPack(outDir, appOutDir, platformName, platformType, arch, platformSpecificBuildOptions, targets)
     }
   }
 
-  protected async doSignAfterPack(outDir: string, appOutDir: string, platformName: ElectronPlatformName, arch: Arch, platformSpecificBuildOptions: DC, targets: Array<Target>) {
+  // macOS only (see MacPackager). It writes into the binary the fuses patch too, so it runs before them and, like them, before signing.
+  protected async doAddAsarIntegrityDigest(_packContext: AfterPackContext, _platformSpecificBuildOptions: DC, _asarOptions: AsarOptions | null): Promise<void> {
+    // only Electron's macOS framework has an ASAR integrity digest slot
+  }
+
+  // the fuses MUST be flipped right before signing
+  protected async doAddElectronFuses(packContext: AfterPackContext) {
+    if (this.config.electronFuses == null) {
+      return
+    }
+    const fuseConfig = await this.generateFuseConfig(this.config.electronFuses)
+    await this.addElectronFuses(packContext, fuseConfig)
+  }
+
+  private async generateFuseConfig(fuses: FuseOptionsV1): Promise<FuseV1Config> {
+    const { FuseVersion, FuseV1Options } = await dynamicImport<typeof import("@electron/fuses")>("@electron/fuses")
+    const config: FuseV1Config = {
+      version: FuseVersion.V1,
+      resetAdHocDarwinSignature: fuses.resetAdHocDarwinSignature,
+    }
+    // this is annoying, but we must filter out undefined entries because some older electron versions will receive `the fuse wire in this version of Electron is not long enough` even if entry is set undefined
+    if (fuses.runAsNode != null) {
+      config[FuseV1Options.RunAsNode] = fuses.runAsNode
+    }
+    if (fuses.enableCookieEncryption != null) {
+      config[FuseV1Options.EnableCookieEncryption] = fuses.enableCookieEncryption
+    }
+    if (fuses.enableNodeOptionsEnvironmentVariable != null) {
+      config[FuseV1Options.EnableNodeOptionsEnvironmentVariable] = fuses.enableNodeOptionsEnvironmentVariable
+    }
+    if (fuses.enableNodeCliInspectArguments != null) {
+      config[FuseV1Options.EnableNodeCliInspectArguments] = fuses.enableNodeCliInspectArguments
+    }
+    if (fuses.enableEmbeddedAsarIntegrityValidation != null) {
+      config[FuseV1Options.EnableEmbeddedAsarIntegrityValidation] = fuses.enableEmbeddedAsarIntegrityValidation
+    }
+    if (fuses.onlyLoadAppFromAsar != null) {
+      config[FuseV1Options.OnlyLoadAppFromAsar] = fuses.onlyLoadAppFromAsar
+    }
+    if (fuses.loadBrowserProcessSpecificV8Snapshot != null) {
+      config[FuseV1Options.LoadBrowserProcessSpecificV8Snapshot] = fuses.loadBrowserProcessSpecificV8Snapshot
+    }
+    if (fuses.grantFileProtocolExtraPrivileges != null) {
+      config[FuseV1Options.GrantFileProtocolExtraPrivileges] = fuses.grantFileProtocolExtraPrivileges
+    }
+    if (fuses.wasmTrapHandlers != null) {
+      config[FuseV1Options.WasmTrapHandlers] = fuses.wasmTrapHandlers
+    }
+    return config
+  }
+
+  /**
+   * Use `AfterPackContext` here to keep available for public API
+   * @param {AfterPackContext} context
+   * @param {FuseConfig} fuses
+   *
+   * Can be used in `afterPack` hook for custom fuse logic like below. It's an alternative approach if one wants to override electron-builder's @electron/fuses version
+   * ```
+   * await context.packager.addElectronFuses(context, { ... })
+   * ```
+   */
+  public async addElectronFuses(context: AfterPackContext, fuses: FuseConfig) {
+    const { appOutDir, electronPlatformName } = context
+
+    const ext = {
+      darwin: ".app",
+      mas: ".app",
+      win32: ".exe",
+      linux: "",
+    }[electronPlatformName]
+
+    // `"executableName" in this` instead of `instanceof LinuxPackager` keeps LinuxPackager a
+    // type-only import, avoiding the index.ts → linuxPackager.ts → platformPackager.ts runtime cycle.
+    const executableName = "executableName" in this ? (this as LinuxPackager).executableName : this.appInfo.productFilename
+    const electronBinaryPath = path.join(appOutDir, `${executableName}${ext}`)
+
+    log.info({ electronPath: log.filePath(electronBinaryPath) }, "executing @electron/fuses")
+    const { flipFuses } = await dynamicImport<typeof import("@electron/fuses")>("@electron/fuses")
+    return flipFuses(electronBinaryPath, fuses)
+  }
+
+  protected async doSignAfterPack(
+    outDir: string,
+    appOutDir: string,
+    platformName: ElectronPlatformName,
+    platformType: PlatformType | undefined,
+    arch: Arch,
+    platformSpecificBuildOptions: DC,
+    targets: Array<Target>
+  ) {
     const asarOptions = await this.computeAsarOptions(platformSpecificBuildOptions)
     const isAsar = asarOptions != null
     const packContext = {
@@ -312,10 +732,11 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
       packager: this,
       electronPlatformName: platformName,
     }
-    await this.signApp(packContext, isAsar)
-    const afterSign = resolveFunction(this.config.afterSign, "afterSign")
-    if (afterSign != null) {
-      await Promise.resolve(afterSign(packContext))
+    const signResult = await this.signApp(packContext, isAsar, platformType)
+    if (isSignResultSigned(signResult)) {
+      await this.info.emitAfterSign(packContext)
+    } else if (this.info.filterPackagerEventListeners("afterSign", "user").length) {
+      log.warn(null, `skipping "afterSign" hook as no signing occurred, perhaps you intended "afterPack"?`)
     }
   }
 
@@ -332,13 +753,13 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     packContext: AfterPackContext,
     platformSpecificBuildOptions: DC,
     excludePatterns: Array<Minimatch>,
-    macroExpander: (it: string) => string
+    macroExpander: (it: string) => string,
+    disableArchFilter: boolean
   ) {
     const appDir = this.info.appDir
     const config = this.config
-    const isElectronCompile = asarOptions != null && isElectronCompileUsed(this.info)
 
-    const mainMatchers = getMainFileMatchers(appDir, defaultDestination, macroExpander, platformSpecificBuildOptions, this, packContext.outDir, isElectronCompile)
+    const mainMatchers = getMainFileMatchers(appDir, defaultDestination, macroExpander, platformSpecificBuildOptions, this, packContext.outDir)
     if (excludePatterns.length > 0) {
       for (const matcher of mainMatchers) {
         matcher.excludePatterns = excludePatterns
@@ -346,31 +767,25 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     }
 
     const framework = this.info.framework
-    const transformer = createTransformer(
-      appDir,
-      config,
-      isElectronCompile
-        ? {
-            originalMain: this.info.metadata.main,
-            main: ELECTRON_COMPILE_SHIM_FILENAME,
-            ...config.extraMetadata,
-          }
-        : config.extraMetadata,
-      framework.createTransformer == null ? null : framework.createTransformer()
-    )
+    const transformer = createTransformer(appDir, config, config.extraMetadata, framework.createTransformer == null ? null : framework.createTransformer())
 
     const _computeFileSets = (matchers: Array<FileMatcher>) => {
-      return computeFileSets(matchers, this.info.isPrepackedAppAsar ? null : transformer, this, isElectronCompile).then(async result => {
+      return computeFileSets(matchers, this.info.isPrepackedAppAsar ? null : transformer, this).then(async result => {
         if (!this.info.isPrepackedAppAsar && !this.info.areNodeModulesHandledExternally) {
           const moduleFileMatcher = getNodeModuleFileMatcher(appDir, defaultDestination, macroExpander, platformSpecificBuildOptions, this.info)
-          result = result.concat(await computeNodeModuleFileSets(this, moduleFileMatcher))
+          result = result.concat(await computeNodeModuleFileSets(this, platformSpecificBuildOptions, moduleFileMatcher, packContext.arch, !disableArchFilter))
         }
         return result.filter(it => it.files.length > 0)
       })
     }
 
     if (this.info.isPrepackedAppAsar) {
-      taskManager.addTask(BluebirdPromise.each(_computeFileSets([new FileMatcher(appDir, resourcePath, macroExpander)]), it => copyAppFiles(it, this.info, transformer)))
+      taskManager.add(async () => {
+        const fileSets = await _computeFileSets([new FileMatcher(appDir, resourcePath, macroExpander)])
+        const copyOptions = { containmentRoot: resourcePath, trustedSourceRoots: await getTrustedSourceRoots(this), externalLinks: await this.getExternalLinkPolicy() }
+        fileSets.forEach(it => taskManager.addTask(copyAppFiles(it, this.info, transformer, copyOptions)))
+        await taskManager.awaitTasks()
+      })
     } else if (asarOptions == null) {
       // for ASAR all asar unpacked files will be extra transformed (e.g. sign of EXE and DLL) later,
       // for prepackaged asar extra transformation not supported yet,
@@ -385,52 +800,53 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
         }
         return transformer(file)
       }
-
-      taskManager.addTask(BluebirdPromise.each(_computeFileSets(mainMatchers), it => copyAppFiles(it, this.info, combinedTransformer)))
-    } else {
-      const unpackPattern = getFileMatchers(config, "asarUnpack", defaultDestination, {
-        macroExpander,
-        customBuildOptions: platformSpecificBuildOptions,
-        globalOutDir: packContext.outDir,
-        defaultSrc: appDir,
+      taskManager.add(async () => {
+        const fileSets = await _computeFileSets(mainMatchers)
+        const copyOptions = { containmentRoot: resourcePath, trustedSourceRoots: await getTrustedSourceRoots(this), externalLinks: await this.getExternalLinkPolicy() }
+        fileSets.forEach(it => taskManager.addTask(copyAppFiles(it, this.info, combinedTransformer, copyOptions)))
+        await taskManager.awaitTasks()
       })
-      const fileMatcher = unpackPattern == null ? null : unpackPattern[0]
+    } else {
+      const unpackPatterns = asarOptions.unpack
+      let fileMatcher: FileMatcher | null = null
+      if (unpackPatterns != null) {
+        fileMatcher = new FileMatcher(appDir, defaultDestination, macroExpander)
+        const pats = Array.isArray(unpackPatterns) ? unpackPatterns : [unpackPatterns]
+        pats.forEach(p => fileMatcher!.addPattern(p))
+        if (fileMatcher.isEmpty()) {
+          fileMatcher = null
+        }
+      }
       taskManager.addTask(
         _computeFileSets(mainMatchers).then(async fileSets => {
           for (const fileSet of fileSets) {
             await transformFiles(transformer, fileSet)
           }
 
-          await new AsarPackager(appDir, resourcePath, asarOptions, fileMatcher == null ? null : fileMatcher.createFilter()).pack(fileSets, this)
+          await new AsarPackager(this, {
+            defaultDestination,
+            resourcePath,
+            options: asarOptions,
+            unpackPattern: fileMatcher?.createFilter(),
+          }).pack(fileSets)
         })
       )
     }
   }
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  protected signApp(packContext: AfterPackContext, isAsar: boolean): Promise<any> {
-    return Promise.resolve()
+  protected signApp(packContext: AfterPackContext, isAsar: boolean, _platformType?: PlatformType): Promise<SigningResult> {
+    // the base packager implements no signing (e.g. Linux) — WinPackager and MacPackager override this
+    return Promise.resolve("skipped:unsupported")
   }
 
   getIconPath(): Promise<string | null> {
     return Promise.resolve(null)
   }
 
-  private async computeAsarOptions(customBuildOptions: DC): Promise<AsarOptions | null> {
+  protected async computeAsarOptions(customBuildOptions: DC): Promise<AsarOptions | null> {
     if (!isElectronBased(this.info.framework)) {
       return null
-    }
-
-    function errorMessage(name: string) {
-      return `${name} is deprecated is deprecated and not supported — please use asarUnpack`
-    }
-
-    const buildMetadata = this.config as any
-    if (buildMetadata["asar-unpack"] != null) {
-      throw new Error(errorMessage("asar-unpack"))
-    }
-    if (buildMetadata["asar-unpack-dir"] != null) {
-      throw new Error(errorMessage("asar-unpack-dir"))
     }
 
     const platformSpecific = customBuildOptions.asar
@@ -441,7 +857,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
       if (appAsarStat == null || !appAsarStat.isFile()) {
         log.warn(
           {
-            solution: "enable asar and use asarUnpack to unpack files that must be externally available",
+            solution: "enable asar and use asar.unpack to unpack files that must be externally available",
           },
           "asar usage is disabled — this is strongly not recommended"
         )
@@ -449,16 +865,23 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
       return null
     }
 
-    if (result == null || result === true) {
+    if (result == null || (result as unknown) === true) {
       return {}
     }
 
-    for (const name of ["unpackDir", "unpack"]) {
-      if ((result as any)[name] != null) {
-        throw new Error(errorMessage(`asar.${name}`))
+    const asarOptions: AsarOptions = deepAssign({}, result)
+    const alignment = asarOptions.contentAlignment
+    if (alignment != null && alignment !== 0) {
+      // fail before anything is packed, not after @electron/asar has written the archive
+      validateContentAlignment(alignment)
+      if (alignment > CONTENT_ALIGNMENT_WARN_THRESHOLD) {
+        log.warn(
+          { contentAlignment: alignment, threshold: CONTENT_ALIGNMENT_WARN_THRESHOLD },
+          "asar.contentAlignment pads every packed file up to the next boundary; such a large alignment makes app.asar much bigger"
+        )
       }
     }
-    return deepAssign({}, result)
+    return asarOptions
   }
 
   public getElectronSrcDir(dist: string): string {
@@ -472,21 +895,28 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
   getResourcesDir(appOutDir: string): string {
     if (this.platform === Platform.MAC) {
       return this.getMacOsResourcesDir(appOutDir)
-    } else if (isElectronBased(this.info.framework)) {
-      return path.join(appOutDir, "resources")
-    } else {
-      return appOutDir
     }
+    if (isElectronBased(this.info.framework)) {
+      return path.join(appOutDir, "resources")
+    }
+    return appOutDir
   }
 
+  public getMacOsElectronFrameworkResourcesDir(appOutDir: string): string {
+    const electronFrameworkName = path.basename(this.info.framework.distMacOsAppName, ".app") + " " + "Framework.framework"
+    return path.join(appOutDir, `${this.appInfo.productFilename}.app`, "Contents", "Frameworks", electronFrameworkName, "Versions", "A", "Resources")
+  }
   public getMacOsResourcesDir(appOutDir: string): string {
     return path.join(appOutDir, `${this.appInfo.productFilename}.app`, "Contents", "Resources")
   }
 
-  private async checkFileInPackage(resourcesDir: string, file: string, messagePrefix: string, isAsar: boolean) {
+  private async checkFileInPackage(resourcesDir: string, file: string, messagePrefix: string, isAsar: boolean, disableSanityCheckAsar: boolean) {
+    if (isAsar && disableSanityCheckAsar) {
+      return
+    }
     const relativeFile = path.relative(this.info.appDir, path.resolve(this.info.appDir, file))
     if (isAsar) {
-      await checkFileInArchive(path.join(resourcesDir, "app.asar"), relativeFile, messagePrefix)
+      checkFileInArchive(path.join(resourcesDir, "app.asar"), relativeFile, messagePrefix)
       return
     }
 
@@ -506,7 +936,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
       const asarPath = path.join(...pathSplit.slice(0, partWithAsarIndex + 1))
       let mainPath = pathSplit.length > partWithAsarIndex + 1 ? path.join.apply(pathSplit.slice(partWithAsarIndex + 1)) : ""
       mainPath += path.join(mainPath, pathParsed.base)
-      await checkFileInArchive(path.join(resourcesDir, "app", asarPath), mainPath, messagePrefix)
+      checkFileInArchive(path.join(resourcesDir, "app", asarPath), mainPath, messagePrefix)
     } else {
       const fullPath = path.join(resourcesDir, "app", relativeFile)
       const outStat = await statOrNull(fullPath)
@@ -521,7 +951,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     }
   }
 
-  private async sanityCheckPackage(appOutDir: string, isAsar: boolean, framework: Framework): Promise<any> {
+  private async sanityCheckPackage(appOutDir: string, isAsar: boolean, framework: Framework, disableSanityCheckAsar: boolean): Promise<any> {
     const outStat = await statOrNull(appOutDir)
     if (outStat == null) {
       throw new Error(`Output directory "${appOutDir}" does not exist. Seems like a wrong configuration.`)
@@ -534,8 +964,8 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
 
     const resourcesDir = this.getResourcesDir(appOutDir)
     const mainFile = (framework.getMainFile == null ? null : framework.getMainFile(this.platform)) || this.info.metadata.main || "index.js"
-    await this.checkFileInPackage(resourcesDir, mainFile, "Application entry file", isAsar)
-    await this.checkFileInPackage(resourcesDir, "package.json", "Application", isAsar)
+    await this.checkFileInPackage(resourcesDir, mainFile, "Application entry file", isAsar, disableSanityCheckAsar)
+    await this.checkFileInPackage(resourcesDir, "package.json", "Application", isAsar, disableSanityCheckAsar)
   }
 
   // tslint:disable-next-line:no-invalid-template-strings
@@ -553,7 +983,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
   }
 
   expandArtifactNamePattern(
-    targetSpecificOptions: TargetSpecificOptions | null | undefined,
+    targetSpecificOptions: TargetSpecificOptions | Nullish,
     ext: string,
     arch?: Arch | null,
     defaultPattern?: string,
@@ -564,7 +994,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     return this.computeArtifactName(pattern, ext, !isUserForced && skipDefaultArch && arch === defaultArchFromString(defaultArch) ? null : arch)
   }
 
-  artifactPatternConfig(targetSpecificOptions: TargetSpecificOptions | null | undefined, defaultPattern: string | undefined) {
+  artifactPatternConfig(targetSpecificOptions: TargetSpecificOptions | Nullish, defaultPattern: string | undefined) {
     const userSpecifiedPattern = targetSpecificOptions?.artifactName || this.platformSpecificBuildOptions.artifactName || this.config.artifactName
     return {
       isUserForced: !!userSpecifiedPattern,
@@ -572,12 +1002,12 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     }
   }
 
-  expandArtifactBeautyNamePattern(targetSpecificOptions: TargetSpecificOptions | null | undefined, ext: string, arch?: Arch | null): string {
+  expandArtifactBeautyNamePattern(targetSpecificOptions: TargetSpecificOptions | Nullish, ext: string, arch?: Arch | null): string {
     // tslint:disable-next-line:no-invalid-template-strings
     return this.expandArtifactNamePattern(targetSpecificOptions, ext, arch, "${productName} ${version} ${arch}.${ext}", true)
   }
 
-  private computeArtifactName(pattern: any, ext: string, arch: Arch | null | undefined): string {
+  private computeArtifactName(pattern: any, ext: string, arch: Arch | Nullish): string {
     const archName = arch == null ? null : getArtifactArchName(arch, ext)
     return this.expandMacro(pattern, archName, {
       ext,
@@ -588,7 +1018,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     return doExpandMacro(pattern, arch, this.appInfo, { os: this.platform.buildConfigurationKey, ...extra }, isProductNameSanitized)
   }
 
-  generateName2(ext: string | null, classifier: string | null | undefined, deployment: boolean): string {
+  generateName2(ext: string | null, classifier: string | Nullish, deployment: boolean): string {
     const dotExt = ext == null ? "" : `.${ext}`
     const separator = ext === "deb" ? "_" : "-"
     return `${deployment ? this.appInfo.name : this.appInfo.productFilename}${separator}${this.appInfo.version}${classifier == null ? "" : `${separator}${classifier}`}${dotExt}`
@@ -602,21 +1032,23 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     return asArray(this.config.fileAssociations).concat(asArray(this.platformSpecificBuildOptions.fileAssociations))
   }
 
-  async getResource(custom: string | null | undefined, ...names: Array<string>): Promise<string | null> {
+  async getResource(custom: string | Nullish, ...names: Array<string>): Promise<string | null> {
     const resourcesDir = this.info.buildResourcesDir
     if (custom === undefined) {
       const resourceList = await this.resourceList
       for (const name of names) {
         if (resourceList.includes(name)) {
-          return path.join(resourcesDir, name)
+          // sanitizeDirPath with resourcesDir base enforces containment — CodeQL recognises the startsWith check inside as a path-traversal sanitizer
+          return sanitizeDirPath(path.join(resourcesDir, path.basename(name)), resourcesDir)
         }
       }
     } else if (custom != null && !isEmptyOrSpaces(custom)) {
       const resourceList = await this.resourceList
       if (resourceList.includes(custom)) {
-        return path.join(resourcesDir, custom)
+        return sanitizeDirPath(path.join(resourcesDir, path.basename(custom)), resourcesDir)
       }
 
+      // codeql[js/shell-command-constructed-from-input] - intentional: custom may be an absolute path outside the build resources dir; existence is verified below via statOrNull
       let p = path.resolve(resourcesDir, custom)
       if ((await statOrNull(p)) == null) {
         p = path.resolve(this.projectDir, custom)
@@ -636,7 +1068,53 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     return (forceCodeSigningPlatform == null ? this.config.forceCodeSigning : forceCodeSigningPlatform) || false
   }
 
+  private assetCatalogResults = new Map<string, Promise<AssetCatalogResult>>()
+  protected generateAssetCatalogData(iconPath: string): Promise<AssetCatalogResult> {
+    // Cache results
+    const cachedPromise = this.assetCatalogResults.get(iconPath)
+    if (cachedPromise) {
+      return cachedPromise
+    }
+
+    const promise = generateAssetCatalogForIcon(this.tempDirManager, iconPath)
+    this.assetCatalogResults.set(iconPath, promise)
+    return promise
+  }
+
+  private cachedIcnsFromIconFile = new Map<string, Promise<string>>()
+  async generateIcnsFromIcon(iconPath: string): Promise<string> {
+    const cachedPromise = this.cachedIcnsFromIconFile.get(iconPath)
+    if (cachedPromise) {
+      return cachedPromise
+    }
+
+    const runner = async () => {
+      const { icnsFile } = await this.generateAssetCatalogData(iconPath)
+
+      // Generate icns file
+      const tempDir = await this.tempDirManager.createTempDir({ prefix: "icns-from-icon" })
+      const tempIcnsPath = path.resolve(tempDir, "Icon.icns")
+      await fs.writeFile(tempIcnsPath, icnsFile)
+
+      return tempIcnsPath
+    }
+    const promise = runner()
+    this.cachedIcnsFromIconFile.set(iconPath, promise)
+    return promise
+  }
+
   protected async getOrConvertIcon(format: IconFormat): Promise<string | null> {
+    if (format === "icns") {
+      const configuredIcon = this.platformSpecificBuildOptions.icon
+      // If it is a .icon file, generate the icns file and return the path to the icns file
+      if (configuredIcon?.endsWith(".icon")) {
+        const iconPath = await this.getResource(configuredIcon)
+        if (iconPath) {
+          return this.generateIcnsFromIcon(iconPath)
+        }
+      }
+    }
+
     const result = await this.resolveIcon(asArray(this.platformSpecificBuildOptions.icon || this.config.icon), [], format)
     if (result.length === 0) {
       const framework = this.info.framework
@@ -658,52 +1136,34 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
 
   // convert if need, validate size (it is a reason why tool is called even if file has target extension (already specified as foo.icns for example))
   async resolveIcon(sources: Array<string>, fallbackSources: Array<string>, outputFormat: IconFormat): Promise<Array<IconInfo>> {
-    const args = [
-      "icon",
-      "--format",
-      outputFormat,
-      "--root",
-      this.buildResourcesDir,
-      "--root",
-      this.projectDir,
-      "--out",
-      path.resolve(this.projectDir, this.config.directories!.output!, `.icon-${outputFormat}`),
-    ]
-    for (const source of sources) {
-      args.push("--input", source)
-    }
-    for (const source of fallbackSources) {
-      args.push("--fallback-input", source)
-    }
+    const output = this.expandMacro(this.config.directories!.output!)
+    const outDir = sanitizeDirPath(path.resolve(this.projectDir, output, `.icon-${outputFormat}`))
+    const roots = [this.buildResourcesDir, this.projectDir]
 
-    const result: IconConvertResult = await executeAppBuilderAsJson(args)
-    const errorMessage = result.error
-    if (errorMessage != null) {
-      throw new InvalidConfigurationError(errorMessage, result.errorCode)
+    const filteredSources = sources.filter(s => !s.endsWith(".icon"))
+    const filteredFallbacks = fallbackSources.filter(s => !s.endsWith(".icon"))
+
+    const result = await convertIcon({
+      sources: filteredSources,
+      fallbackSources: filteredFallbacks,
+      roots,
+      format: outputFormat,
+      outDir,
+      iconsToolset: this.info.config.toolsets?.icons,
+      resourcesDir: this.buildResourcesDir,
+    })
+
+    if (result.error != null) {
+      throw new InvalidConfigurationError(result.error, result.errorCode)
     }
 
     if (result.isFallback) {
       log.warn({ reason: "application icon is not set" }, `default ${capitalizeFirstLetter(this.info.framework.name)} icon is used`)
     }
 
-    return result.icons || []
+    return result.icons
   }
 }
-
-export interface IconInfo {
-  file: string
-  size: number
-}
-
-interface IconConvertResult {
-  icons?: Array<IconInfo>
-
-  error?: string
-  errorCode?: string
-  isFallback?: boolean
-}
-
-export type IconFormat = "icns" | "ico" | "set"
 
 export function isSafeGithubName(name: string) {
   return /^[0-9A-Za-z._-]+$/.test(name)
@@ -731,34 +1191,7 @@ export function normalizeExt(ext: string) {
   return ext.startsWith(".") ? ext.substring(1) : ext
 }
 
-export function resolveFunction<T>(executor: T | string, name: string): T {
-  if (executor == null || typeof executor !== "string") {
-    return executor
-  }
-
-  let p = executor as string
-  if (p.startsWith(".")) {
-    p = path.resolve(p)
-  }
-
-  try {
-    p = require.resolve(p)
-  } catch (e) {
-    debug(e)
-    p = path.resolve(p)
-  }
-
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const m = require(p)
-  const namedExport = m[name]
-  if (namedExport == null) {
-    return m.default || m
-  } else {
-    return namedExport
-  }
-}
-
-export function chooseNotNull(v1: string | null | undefined, v2: string | null | undefined): string | null | undefined {
+export function chooseNotNull<T>(v1: T | Nullish, v2: T | Nullish): T | Nullish {
   return v1 == null ? v2 : v1
 }
 
@@ -766,13 +1199,25 @@ function capitalizeFirstLetter(text: string) {
   return text.charAt(0).toUpperCase() + text.slice(1)
 }
 
-export function isSafeToUnpackElectronOnRemoteBuildServer(packager: PlatformPackager<any>) {
-  if (packager.platform !== Platform.LINUX || packager.config.remoteBuild === false) {
-    return false
-  }
+/** Registers queued `work` that still reads `appOutDir`, see waitForPackWork */
+export function trackPackWork(packager: PlatformPackager<any>, appOutDir: string, work: Promise<any>): void {
+  const key = path.resolve(appOutDir)
+  const pending = packager.pendingPackWork.get(key) ?? new Set<Promise<any>>()
+  packager.pendingPackWork.set(key, pending)
+  pending.add(work)
+  const settle = () => pending.delete(work)
+  void work.then(settle, settle)
+}
 
-  if (process.platform === "win32" || isEnvTrue(process.env._REMOTE_BUILD)) {
-    return packager.config.electronDist == null && packager.config.electronDownload == null
-  }
-  return false
+/**
+ * Waits for the work tracked so far on `appOutDir`, so the caller can then write into it. Keyed by the dir alone, not by
+ * `_arch` (the pack the caller writes for): a prepackaged dir is shared by every arch, any other arch has its own dir.
+ * A failure of that work is left to its target's `finishBuild()` to report.
+ */
+export async function waitForPackWork(packager: PlatformPackager<any>, appOutDir: string, _arch: Arch): Promise<void> {
+  await Promise.allSettled(Array.from(packager.pendingPackWork.get(path.resolve(appOutDir)) ?? []))
+}
+
+function packKey(appOutDir: string, arch: Arch) {
+  return `${Arch[arch]}:${appOutDir}`
 }

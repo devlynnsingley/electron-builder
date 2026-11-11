@@ -1,0 +1,144 @@
+import { copyOrLinkFile, ensureDir, ensureNotBusy, walk, WalkSource } from "builder-util/src/fs"
+import type { Stats } from "fs"
+import { vi } from "vitest"
+import * as fs from "fs/promises"
+import * as path from "path"
+
+const codeError = (code: string) => Object.assign(new Error(`${code}: simulated`), { code })
+
+describe("copyOrLinkFile permissions", () => {
+  for (const [sourceMode, expectedMode] of [
+    [0o640, 0o644],
+    [0o740, 0o755],
+    [0o6750, 0o755],
+    [0o1710, 0o1755],
+    [0o620, 0o664],
+    [0o644, 0o644],
+    [0o755, 0o755],
+  ]) {
+    test.ifNotWindows(`${sourceMode.toString(8)} → ${expectedMode.toString(8)}`, async ({ expect, tmpDir }) => {
+      const dir = await tmpDir.createTempDir()
+      const source = path.join(dir, "source")
+      const destination = path.join(dir, "destination")
+      await fs.writeFile(source, "contents")
+      await fs.chmod(source, sourceMode)
+      const stats = await fs.stat(source)
+
+      await copyOrLinkFile(source, destination, stats, true)
+
+      const sourceStats = await fs.stat(source)
+      const destinationStats = await fs.stat(destination)
+      expect(destinationStats.mode & 0o7777).toBe(expectedMode)
+      expect(sourceStats.mode & 0o7777).toBe(sourceMode)
+      expect(stats.mode).toBe(destinationStats.mode)
+      expect(destinationStats.ino === sourceStats.ino).toBe(sourceMode === expectedMode)
+      expect(await fs.readFile(destination, "utf8")).toBe("contents")
+    })
+  }
+})
+
+describe("ensureDir", () => {
+  test("creates the directory (recursive) on the happy path", async ({ expect, tmpDir }) => {
+    const base = await tmpDir.createTempDir()
+    const nested = path.join(base, "a", "b", "c")
+    await ensureDir(nested)
+    expect((await fs.stat(nested)).isDirectory()).toBe(true)
+  })
+
+  test("retries through the spurious ENOENT thrown by concurrent recursive mkdir", async ({ expect }) => {
+    // nodejs/node#27293: a peer is mid-creating a shared ancestor, so the first two recursive
+    // mkdir calls fail with ENOENT before the tree settles and the third succeeds.
+    const mkdir = vi.fn().mockRejectedValueOnce(codeError("ENOENT")).mockRejectedValueOnce(codeError("ENOENT")).mockResolvedValueOnce(undefined)
+    await expect(ensureDir("/cold/cache/path", 8, mkdir)).resolves.toBeUndefined()
+    expect(mkdir).toHaveBeenCalledTimes(3)
+  })
+
+  test("treats a spurious EEXIST as success when the path is already a directory", async ({ expect, tmpDir }) => {
+    const base = await tmpDir.createTempDir()
+    // The dir genuinely exists (real fs.stat → directory); the race makes mkdir throw EEXIST.
+    const mkdir = vi.fn().mockRejectedValue(codeError("EEXIST"))
+    await expect(ensureDir(base, 8, mkdir)).resolves.toBeUndefined()
+  })
+
+  test("gives up after maxAttempts so a persistent ENOENT is not masked forever", async ({ expect }) => {
+    const mkdir = vi.fn().mockRejectedValue(codeError("ENOENT"))
+    await expect(ensureDir("/persistently/missing", 2, mkdir)).rejects.toThrow("ENOENT")
+    expect(mkdir).toHaveBeenCalledTimes(3) // initial attempt + 2 retries
+  })
+
+  test("does not retry on a non-transient error (e.g. EACCES)", async ({ expect }) => {
+    const mkdir = vi.fn().mockRejectedValue(codeError("EACCES"))
+    await expect(ensureDir("/no/permission", 8, mkdir)).rejects.toThrow("EACCES")
+    expect(mkdir).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("ensureNotBusy", () => {
+  const handle = () => ({ close: vi.fn().mockResolvedValue(undefined) })
+
+  test("opens the file once and returns when it is not locked", async ({ expect }) => {
+    const h = handle()
+    const open = vi.fn().mockResolvedValue(h)
+    await expect(ensureNotBusy("C:/kit/makeappx.exe", 1, 60, open)).resolves.toBeUndefined()
+    expect(open).toHaveBeenCalledTimes(1)
+    expect(open).toHaveBeenCalledWith("C:/kit/makeappx.exe", "r+")
+    expect(h.close).toHaveBeenCalledTimes(1)
+  })
+
+  test("waits while the file is EBUSY-locked, then proceeds once it clears", async ({ expect }) => {
+    const h = handle()
+    const open = vi.fn().mockRejectedValueOnce(codeError("EBUSY")).mockRejectedValueOnce(codeError("EBUSY")).mockResolvedValueOnce(h)
+    await expect(ensureNotBusy("C:/kit/makeappx.exe", 1, 60, open)).resolves.toBeUndefined()
+    expect(open).toHaveBeenCalledTimes(3)
+    expect(h.close).toHaveBeenCalledTimes(1)
+  })
+
+  test("returns without waiting on a non-EBUSY open error (lets caller surface it)", async ({ expect }) => {
+    const open = vi.fn().mockRejectedValue(codeError("ENOENT"))
+    await expect(ensureNotBusy("C:/kit/missing.exe", 1, 60, open)).resolves.toBeUndefined()
+    expect(open).toHaveBeenCalledTimes(1)
+  })
+
+  test("is bounded — gives up after maxAttempts when the lock never clears", async ({ expect }) => {
+    const open = vi.fn().mockRejectedValue(codeError("EBUSY"))
+    await expect(ensureNotBusy("C:/kit/forever-locked.exe", 1, 3, open)).resolves.toBeUndefined()
+    expect(open).toHaveBeenCalledTimes(3)
+  })
+})
+
+describe("walk", () => {
+  /** A source over an in-memory tree: a string is a file with that content, an object a directory. */
+  function treeSource(root: string, tree: Record<string, any>): WalkSource {
+    const entryOf = (file: string) =>
+      path
+        .relative(root, file)
+        .split(path.sep)
+        .filter(it => it !== "")
+        .reduce((dir, name) => dir?.[name], tree)
+    return {
+      readdir: async dir => Object.keys(entryOf(dir) ?? {}),
+      lstat: async file => {
+        const entry = entryOf(file)
+        return { isDirectory: () => typeof entry === "object", isFile: () => typeof entry === "string", isSymbolicLink: () => false, size: entry?.length ?? 0 } as Stats
+      },
+    }
+  }
+
+  test("reads the tree from the given source, with the filter and the consumer", async ({ expect }) => {
+    const root = path.join(path.sep, "virtual")
+    const source = treeSource(root, { "b.js": "b", "a.js": "a", lib: { "c.js": "c" }, skipped: { "d.js": "d" } })
+    const consumed: Array<string> = []
+    const files = await walk(root, (file, stat) => !stat.isDirectory() || path.basename(file) !== "skipped", { consume: file => void consumed.push(file) }, source)
+    expect(files).toEqual([path.join(root, "a.js"), path.join(root, "b.js"), path.join(root, "lib", "c.js")])
+    expect(consumed.sort()).toEqual([path.join(root, "a.js"), path.join(root, "b.js"), path.join(root, "lib"), path.join(root, "lib", "c.js")])
+  })
+
+  test("reads the file system without a source", async ({ expect, tmpDir }) => {
+    const dir = await tmpDir.createTempDir({ prefix: "walk" })
+    await fs.mkdir(path.join(dir, "lib"))
+    await fs.writeFile(path.join(dir, "a.js"), "a")
+    await fs.writeFile(path.join(dir, "lib", "b.js"), "b")
+    expect(await walk(dir)).toEqual([path.join(dir, "a.js"), path.join(dir, "lib", "b.js")])
+    expect(await walk(path.join(dir, "missing"))).toEqual([])
+  })
+})

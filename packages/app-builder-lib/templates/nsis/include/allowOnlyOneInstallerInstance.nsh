@@ -1,4 +1,8 @@
-!include "nsProcess.nsh"
+!ifndef nsProcess::FindProcess
+    !include "nsProcess.nsh"
+!endif
+
+!include "WordFunc.nsh"
 
 !ifmacrondef customCheckAppRunning
   !include "getProcessInfo.nsh"
@@ -27,15 +31,164 @@
   launch:
 !macroend
 
-!macro CHECK_APP_RUNNING
-    !ifmacrodef customCheckAppRunning
-      !insertmacro customCheckAppRunning
-    !else
-      !insertmacro _CHECK_APP_RUNNING
-    !endif
+# strips trailing backslashes from the path in register _VAR (_TEMP is scratch), so that the
+# single separator the caller appends cannot become a double backslash that never matches
+!macro TRIM_TRAILING_BACKSLASHES _VAR _TEMP
+  ${Do}
+    StrCpy ${_TEMP} ${_VAR} 1 -1
+    ${if} ${_TEMP} != "\"
+      ${Break}
+    ${endIf}
+    StrCpy ${_VAR} ${_VAR} -1
+  ${Loop}
 !macroend
 
+# appends "-or <path>.StartsWith(...)" to $processPathFilter for the InstallLocation stored in
+# the given registry root (if any); expects $R8 to hold the escaped, normalized $INSTDIR prefix
+# already in the filter (used to skip duplicates)
+!macro APPEND_INSTALL_LOCATION_TO_PROCESS_PATH_FILTER _ROOT_KEY
+  ReadRegStr $R9 ${_ROOT_KEY} "${INSTALL_REGISTRY_KEY}" InstallLocation
+  # a registry value may carry a trailing backslash (e.g. written by an installer run with
+  # /D=C:\path\), which would defeat the StartsWith prefix built below
+  !insertmacro TRIM_TRAILING_BACKSLASHES $R9 $R7
+  # $R7 = $R9 with all double quotes removed; a double quote is invalid in a Windows path
+  # and would break out of the double-quoted PowerShell -Command argument built in
+  # FIND_PROCESS/KILL_PROCESS, so any value containing one is skipped below
+  ${WordReplace} $R9 '"' "" "+" $R7
+  ${if} $R9 != ""
+  ${andIf} $R9 == $R7
+    # escape single quotes for the single-quoted PowerShell string literal, so a quote in the
+    # registry value can neither break the expression nor inject PowerShell into the
+    # (possibly elevated) installer
+    ${WordReplace} $R9 "'" "''" "+" $R7
+    ${if} $R7 != $R8
+      StrCpy $processPathFilter "$processPathFilter -or $$_.Path.StartsWith('$R7\', 'CurrentCultureIgnoreCase')"
+    ${endIf}
+  ${endIf}
+!macroend
+
+!macro CHECK_APP_RUNNING
+  Var /GLOBAL CmdPath
+  Var /GLOBAL PowerShellPath
+  Var /GLOBAL processPathFilter
+  StrCpy $CmdPath "$SYSDIR\cmd.exe"
+  StrCpy $PowerShellPath "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe"
+  Push $R8
+  Push $R9
+  # PowerShell filter matching processes running from the installation directory
+  # (trailing backslash so that a sibling directory with the same prefix is not matched).
+  # $R8 = $INSTDIR with any trailing backslashes stripped ($INSTDIR can carry one, e.g. from
+  # /D=C:\path\ or a registry-restored install location, and the appended separator below
+  # would then become a never-matching double backslash) and with single quotes escaped ('')
+  # for the single-quoted PowerShell string literal, so a quote in the path can neither break
+  # the expression nor inject PowerShell; a double quote needs no handling here because it is
+  # invalid in a Windows path and NSIS never lets $INSTDIR contain one
+  StrCpy $R8 $INSTDIR
+  !insertmacro TRIM_TRAILING_BACKSLASHES $R8 $R9
+  ${WordReplace} $R8 "'" "''" "+" $R8
+  StrCpy $processPathFilter "$$_.Path.StartsWith('$R8\', 'CurrentCultureIgnoreCase')"
+  !ifndef BUILD_UNINSTALLER
+    # also match processes running from the previous per-user and per-machine installation directories,
+    # because the previous installation is uninstalled during install
+    # https://github.com/electron-userland/electron-builder/issues/10022
+    Push $R7
+    !insertmacro APPEND_INSTALL_LOCATION_TO_PROCESS_PATH_FILTER HKCU
+    !insertmacro APPEND_INSTALL_LOCATION_TO_PROCESS_PATH_FILTER HKLM
+    Pop $R7
+  !endif
+  Pop $R9
+  Pop $R8
+  !ifmacrodef customCheckAppRunning
+    !insertmacro customCheckAppRunning
+  !else
+    !insertmacro IS_POWERSHELL_AVAILABLE
+    !insertmacro _CHECK_APP_RUNNING
+  !endif
+!macroend
+
+!macro IS_POWERSHELL_AVAILABLE
+  Var /GLOBAL IsPowerShellAvailable ; 0 = available, 1 = not available
+  # Require a sentinel exit code to ensure PowerShell actually executes the command.
+  # Wine's PowerShell stub ignores the command and exits with 0.
+  nsExec::Exec `"$PowerShellPath" -NoProfile -NonInteractive -C "if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) { exit 37 } else { exit 1 }"`
+  Pop $0  # Return code (37 = command executed successfully)
+
+  ${if} $0 == 37
+    # PowerShell is available, check if it's not blocked by policies
+    nsExec::Exec `"$PowerShellPath" -NoProfile -NonInteractive -C "if ((Get-ExecutionPolicy -Scope Process) -eq 'Restricted') { exit 1 } else { exit 0 }"`
+    Pop $0
+  ${else}
+    StrCpy $0 1
+  ${endIf}
+
+  ${if} $0 != 0
+    StrCpy $0 1
+  ${endIf}
+
+  StrCpy $IsPowerShellAvailable $0
+!macroend
+
+!macro FIND_PROCESS _FILE _RETURN
+  ${if} $IsPowerShellAvailable == 0
+    nsExec::Exec `"$PowerShellPath" -NoProfile -NonInteractive -C "if ((Get-CimInstance -ClassName Win32_Process | ? {$$_.Path -and ($processPathFilter)}).Count -gt 0) { exit 0 } else { exit 1 }"`
+    Pop ${_RETURN}
+  ${else}
+    !ifdef INSTALL_MODE_PER_ALL_USERS
+      # exact match via findstr anchored to the start of each CSV line. tasklist by absolute path: cmd.exe would look for a bare name in
+      # the current directory first. /S: cmd.exe removes only the outer quotes, so the quoted program paths stay intact
+      nsExec::Exec `"$CmdPath" /S /C ""$SYSDIR\tasklist.exe" /FI "IMAGENAME eq ${_FILE}" /FO CSV /NH | "$SYSDIR\findstr.exe" /B /I /C:"\"${_FILE}\"""`
+      Pop ${_RETURN}
+    !else
+      # find process owned by current user — anchored exact match
+      nsExec::Exec `"$CmdPath" /S /C ""$SYSDIR\tasklist.exe" /FI "USERNAME eq %USERNAME%" /FI "IMAGENAME eq ${_FILE}" /FO CSV /NH | "$SYSDIR\findstr.exe" /B /I /C:"\"${_FILE}\"""`
+      Pop ${_RETURN}
+    !endif
+  ${endIf}
+!macroend
+
+!macro KILL_PROCESS _FILE _FORCE
+  Push $0
+  ${if} ${_FORCE} == 1
+    ${if} $IsPowerShellAvailable == 0
+      StrCpy $0 "-Force"
+    ${else}
+      StrCpy $0 "/F"
+    ${endIf}
+  ${else}
+    StrCpy $0 ""
+  ${endIf}
+
+  ${if} $IsPowerShellAvailable == 0
+    nsExec::Exec `"$PowerShellPath" -NoProfile -NonInteractive -C "Get-CimInstance -ClassName Win32_Process | ? {$$_.Path -and ($processPathFilter)} | % { Stop-Process -Id $$_.ProcessId $0 }"`
+  ${else}
+    # taskkill by absolute path: a bare name is looked up in the installer's directory and the current directory first
+    !ifdef INSTALL_MODE_PER_ALL_USERS
+      nsExec::Exec `"$SYSDIR\taskkill.exe" $0 /IM "${_FILE}" /FI "PID ne $pid"`
+    !else
+      nsExec::Exec `"$CmdPath" /S /C ""$SYSDIR\taskkill.exe" $0 /IM "${_FILE}" /FI "PID ne $pid" /FI "USERNAME eq %USERNAME%""`
+    !endif
+  ${endIf}
+  Pop $0
+!macroend 
+
 !macro _CHECK_APP_RUNNING
+  !insertmacro _CHECK_APP_RUNNING_BODY ""
+!macroend
+
+# nsis-web: prepareWebPackage can download the app package (and wait on its retry prompt) after CHECK_APP_RUNNING, so the app may have
+# been started again by then. installSection.nsh checks again right before the installed version is uninstalled (its uninstaller closes
+# the app without asking), with the same prompt: Cancel aborts with exit code 2, OK closes the app. An update (--updated) is not checked
+# again (the app is closed without asking, as before), and neither is a custom customCheckAppRunning, which may not be inserted twice.
+!macro CHECK_APP_RUNNING_AGAIN
+  !ifmacrondef customCheckAppRunning
+    ${ifNot} ${isUpdated}
+      !insertmacro _CHECK_APP_RUNNING_BODY "_again"
+    ${endIf}
+  !endif
+!macroend
+
+# LABEL_SUFFIX keeps the labels unique when the check is inserted a second time in the same section (CHECK_APP_RUNNING_AGAIN)
+!macro _CHECK_APP_RUNNING_BODY LABEL_SUFFIX
   ${GetProcessInfo} 0 $pid $1 $2 $3 $4
   ${if} $3 != "${APP_EXECUTABLE_FILENAME}"
     ${if} ${isUpdated}
@@ -43,55 +196,57 @@
       Sleep 300
     ${endIf}
 
-    ${nsProcess::FindProcess} "${APP_EXECUTABLE_FILENAME}" $R0
+    !insertmacro FIND_PROCESS "${APP_EXECUTABLE_FILENAME}" $R0
     ${if} $R0 == 0
       ${if} ${isUpdated}
         # allow app to exit without explicit kill
         Sleep 1000
-        Goto doStopProcess
+        Goto doStopProcess${LABEL_SUFFIX}
       ${endIf}
-      MessageBox MB_OKCANCEL|MB_ICONEXCLAMATION "$(appRunning)" /SD IDOK IDOK doStopProcess
+      MessageBox MB_OKCANCEL|MB_ICONEXCLAMATION "$(appRunning)" /SD IDOK IDOK doStopProcess${LABEL_SUFFIX}
+      SetErrorLevel 2
       Quit
 
-      doStopProcess:
+      doStopProcess${LABEL_SUFFIX}:
 
-      DetailPrint `Closing running "${PRODUCT_NAME}"...`
+      DetailPrint "$(appClosing)"
 
-      # https://github.com/electron-userland/electron-builder/issues/2516#issuecomment-372009092
-      nsExec::Exec `taskkill /im "${APP_EXECUTABLE_FILENAME}" /fi "PID ne $pid"` $R0
+      !insertmacro KILL_PROCESS "${APP_EXECUTABLE_FILENAME}" 0
       # to ensure that files are not "in-use"
       Sleep 300
 
       # Retry counter
       StrCpy $R1 0
 
-      loop:
+      loop${LABEL_SUFFIX}:
         IntOp $R1 $R1 + 1
 
-        ${nsProcess::FindProcess} "${APP_EXECUTABLE_FILENAME}" $R0
+        !insertmacro FIND_PROCESS "${APP_EXECUTABLE_FILENAME}" $R0
         ${if} $R0 == 0
           # wait to give a chance to exit gracefully
           Sleep 1000
-          nsExec::Exec `taskkill /f /im "${APP_EXECUTABLE_FILENAME}" /fi "PID ne $pid"` $R0
-          ${If} $R0 != 0
-            DetailPrint `Waiting for "${PRODUCT_NAME}" to close (taskkill exit code $R0).`
+          !insertmacro KILL_PROCESS "${APP_EXECUTABLE_FILENAME}" 1 # 1 = force kill
+          !insertmacro FIND_PROCESS "${APP_EXECUTABLE_FILENAME}" $R0
+          ${if} $R0 == 0
+            DetailPrint `Waiting for "${PRODUCT_NAME}" to close.`
             Sleep 2000
           ${else}
-            Goto not_running
+            Goto not_running${LABEL_SUFFIX}
           ${endIf}
         ${else}
-          Goto not_running
+          Goto not_running${LABEL_SUFFIX}
         ${endIf}
 
         # App likely running with elevated permissions.
         # Ask user to close it manually
         ${if} $R1 > 1
-          MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "$(appCannotBeClosed)" /SD IDCANCEL IDRETRY loop
+          MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "$(appCannotBeClosed)" /SD IDCANCEL IDRETRY loop${LABEL_SUFFIX}
+          SetErrorLevel 2
           Quit
         ${else}
-          Goto loop
+          Goto loop${LABEL_SUFFIX}
         ${endIf}
-      not_running:
+      not_running${LABEL_SUFFIX}:
     ${endIf}
   ${endIf}
 !macroend

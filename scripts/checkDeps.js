@@ -1,0 +1,122 @@
+const chalk = require("chalk")
+const depCheck = require("depcheck")
+const fs = require("fs-extra")
+const path = require("path")
+const knownUnusedDevDependencies = new Set([
+  "@babel/plugin-transform-modules-commonjs", // Not sure what this is used for, but keeping just in case (for now)
+  "changesets-changelog-clean", // Used in package.json CI/CD logic
+  // Spawned by `oxlint --type-aware`, never invoked directly
+  "oxlint-tsgolint",
+  // Used in test/vitest-scripts/ (test dir is ignored by depcheck) or via pnpm workspace scripts
+  "vitest",
+  "tsx",
+  // Used at runtime by the `vitest --merge-reports` CLI in the merge-smart-cache job (HTML reporter +
+  // coverage provider), not statically imported, so depcheck can't see them.
+  "@vitest/ui",
+  "@vitest/coverage-v8",
+])
+const knownMissedDependencies = new Set(["babel-core", "babel-preset-env", "babel-preset-stage-0", "babel-preset-react"])
+
+const rootDir = path.join(__dirname, "..")
+const packageDir = path.join(rootDir, "packages")
+
+async function check(projectDir, devPackageData) {
+  const packageName = path.basename(projectDir)
+  // console.log(`Checking ${projectDir}`)
+
+  /**
+   * @type {Results}
+   */
+  const result = await new Promise(resolve => {
+    depCheck(projectDir, { ignoreDirs: ["out", "dist", "test", "pages", "typings", "docker", "certs", "templates", "vendor"] }, resolve)
+  })
+
+  let unusedDependencies = result.dependencies
+  if (unusedDependencies.length > 0) {
+    if (packageName === "electron-builder") {
+      unusedDependencies = unusedDependencies.filter(it => it !== "dmg-builder")
+    }
+    if (packageName === "app-builder-lib") {
+      // @electron/universal is loaded via dynamicImport() which depcheck cannot statically detect
+      unusedDependencies = unusedDependencies.filter(it => it !== "@electron/universal")
+    }
+    if (unusedDependencies.length > 0) {
+      console.error(`${chalk.bold(packageName)} Unused dependencies: ${JSON.stringify(unusedDependencies, null, 2)}`)
+      return false
+    }
+  }
+
+  let unusedDevDependencies = result.devDependencies.filter(it => !it.startsWith("@types/") && !knownUnusedDevDependencies.has(it))
+  if (packageName === "electron-builder") {
+    unusedDevDependencies = unusedDevDependencies.filter(it => it !== "vitest")
+  }
+  if (packageName === "dmg-builder") {
+    unusedDevDependencies = unusedDevDependencies.filter(it => it !== "temp-file")
+  }
+  if (unusedDevDependencies.length > 0) {
+    console.error(`${chalk.bold(packageName)} Unused devDependencies: ${JSON.stringify(unusedDevDependencies, null, 2)}`)
+    return false
+  }
+
+  delete result.missing.electron
+const toml = result.missing.toml
+  if (toml != null && toml.length === 1 && toml[0].endsWith("config.js")) {
+    delete result.missing.toml
+  }
+
+  if (packageName === "electron-builder") {
+    delete result.missing["electron-publish"]
+  }
+
+  for (const name of Object.keys(result.missing)) {
+    if (
+      name === "electron-builder-squirrel-windows" ||
+      name === "electron-webpack" ||
+      // electron-updater is resolved from the user's projectDir at runtime (require.resolve with paths), not a package dependency
+      (packageName === "app-builder-lib" && (name === "dmg-builder" || name === "electron-updater" || knownMissedDependencies.has(name) || name.startsWith("@babel/")))
+    ) {
+      delete result.missing[name]
+    }
+  }
+
+  if (Object.keys(result.missing).length > 0) {
+    console.error(`${chalk.bold(packageName)} Missing dependencies: ${JSON.stringify(result.missing, null, 2)}`)
+    return false
+  }
+
+  const packageData = await fs.readJson(path.join(projectDir, "package.json"))
+  for (const name of devPackageData.devDependencies == null ? [] : Object.keys(devPackageData.devDependencies)) {
+    if (packageData.dependencies != null && packageData.dependencies[name] != null) {
+      continue
+    }
+
+    const usages = result.using[name]
+    if (usages == null || usages.length === 0) {
+      continue
+    }
+
+    for (const file of usages) {
+      if (file.startsWith(path.join(projectDir, "src") + path.sep)) {
+        console.error(`${chalk.bold(packageName)} Dev dependency ${name} is used in the sources`)
+        return false
+      }
+    }
+  }
+
+  return true
+}
+
+async function main() {
+  const packages = (await fs.readdir(packageDir)).filter(it => !it.includes(".")).sort()
+  const devPackageData = await fs.readJson(path.join(rootDir, "package.json"))
+  const checkRoot = await check(process.cwd(), devPackageData)
+  const checkPackages = await Promise.all(packages.map(it => check(path.join(packageDir, it), devPackageData)))
+  if (checkRoot === false || checkPackages.includes(false)) {
+    process.exitCode = 1
+  }
+}
+
+main().catch(error => {
+  console.error(chalk.red((error.stack || error).toString()))
+  process.exit(1)
+})
